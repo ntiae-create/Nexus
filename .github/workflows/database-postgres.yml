@@ -1,0 +1,69 @@
+name: PostgreSQL database validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/database-postgres.yml"
+      - "packages/database/**"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    paths:
+      - ".github/workflows/database-postgres.yml"
+      - "packages/database/**"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL 17 integration tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_DB: nexus_test
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nexus_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked workspace dependencies
+        run: npm ci
+
+      - name: Run static database tests
+        run: npm test --workspace @nexus/database
+
+      - name: Apply migration and run PostgreSQL integration tests
+        env:
+          NEXUS_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: npm run test:integration --workspace @nexus/database
+
+      - name: Stop temporary PostgreSQL service
+        if: always()
+        env:
+          NEXUS_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          if [ -n "$NEXUS_TEST_POSTGRES_CONTAINER_ID" ] && docker inspect "$NEXUS_TEST_POSTGRES_CONTAINER_ID" >/dev/null 2>&1; then
+            docker stop "$NEXUS_TEST_POSTGRES_CONTAINER_ID" >/dev/null
+          fi

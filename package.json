@@ -1,0 +1,25 @@
+{
+  "name": "nexus-apk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo do aplicativo NEXUS.apk e do backend hospedado.",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=11"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently --names server,mobile --prefix-colors blue,green \"npm:dev:server\" \"npm:dev:mobile\"",
+    "dev:mobile": "npm run dev --workspace @nexus/mobile",
+    "dev:server": "npm run dev --workspace @nexus/server",
+    "build": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/server && npm run build --workspace @nexus/mobile",
+    "test": "npm run build --workspace @nexus/shared && vitest run"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "vitest": "^5.1.0"
+  }
+}
