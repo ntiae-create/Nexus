@@ -510,13 +510,13 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT provider.cost_status, provider.availability, model.availability, authorization.authorized, authorization.paid_use_authorized
+  SELECT provider.cost_status, provider.availability, model.availability, provider_auth.authorized, provider_auth.paid_use_authorized
   INTO provider_cost, provider_availability, model_availability, allowed, paid_authorized
   FROM nexus.providers AS provider
   JOIN nexus.models AS model
     ON model.provider_id = provider.id AND model.id = NEW.model_id
-  JOIN nexus.provider_authorizations AS authorization
-    ON authorization.provider_id = provider.id AND authorization.owner_id = NEW.owner_id
+  JOIN nexus.provider_authorizations AS provider_auth
+    ON provider_auth.provider_id = provider.id AND provider_auth.owner_id = NEW.owner_id
   WHERE provider.id = NEW.provider_id;
 
   IF NOT FOUND OR NOT allowed OR provider_availability <> 'available' OR model_availability <> 'available' THEN
