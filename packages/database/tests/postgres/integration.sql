@@ -90,7 +90,7 @@ BEGIN
 
   -- A run's message reference must belong to the same conversation.
   BEGIN
-    SET CONSTRAINTS nexus.core_runs_conversation_id_input_message_id_fkey IMMEDIATE;
+    EXECUTE 'SET CONSTRAINTS nexus.core_runs_conversation_id_input_message_id_fkey IMMEDIATE';
     INSERT INTO nexus.core_runs (
       id, owner_id, conversation_id, request_id, idempotency_key, status, input_message_id, format_version
     ) VALUES (
