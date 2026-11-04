@@ -13,7 +13,15 @@ export class BootstrapError extends Error {
     message: string,
     options?: { cause?: unknown },
   ) {
-    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    super(message);
+
+    if (options?.cause !== undefined) {
+      Object.defineProperty(this, "cause", {
+        value: options.cause,
+        configurable: true,
+        writable: true,
+      });
+    }
     this.name = "BootstrapError";
     this.code = code;
   }
