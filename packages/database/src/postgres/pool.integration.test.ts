@@ -7,6 +7,7 @@
  * - rollback leaves no partial data
  * - close() ends the pool cleanly
  * - owner identity is readable under RLS context
+ * - public surface does not expose pool / query
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createPostgresDatabase } from "./index.js";
@@ -28,6 +29,13 @@ describeIf("postgres pool + transaction integration", () => {
 
   afterAll(async () => {
     await db.close();
+  });
+
+  it("does not expose pool or query on the public database handle", () => {
+    expect((db as any).pool).toBeUndefined();
+    expect((db as any).query).toBeUndefined();
+    expect(typeof db.withOwnerTransaction).toBe("function");
+    expect(typeof db.close).toBe("function");
   });
 
   it("reads owner identity inside a transaction", async () => {

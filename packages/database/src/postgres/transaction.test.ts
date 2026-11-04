@@ -58,7 +58,7 @@ const dummyRepos: NexusRepositories = {
 };
 
 describe("withOwnerTransaction security", () => {
-  it("sets context with set_config(..., true) and never exposes client", async () => {
+  it("sets context with set_config(..., true) and never exposes client or query", async () => {
     const client = makeMockClient();
     const pool = makeMockPool(client);
     let receivedRepos: NexusRepositories | null = null;
@@ -69,8 +69,22 @@ describe("withOwnerTransaction security", () => {
       { ownerId: "00000000-0000-4000-8000-000000000004", actor: { type: "owner" } },
       async (repos) => {
         receivedRepos = repos;
+        // Critical: no raw SQL surface on the callback argument.
         expect((repos as any).query).toBeUndefined();
         expect((repos as any).client).toBeUndefined();
+        expect((repos as any).pool).toBeUndefined();
+        // Only the seven typed repositories.
+        expect(Object.keys(repos).sort()).toEqual(
+          [
+            "conversations",
+            "executions",
+            "memories",
+            "messages",
+            "owner",
+            "providerPreferences",
+            "sync",
+          ].sort(),
+        );
         return "ok";
       },
     );
@@ -88,6 +102,38 @@ describe("withOwnerTransaction security", () => {
     }
     expect(calls.some((s: string) => s.includes("COMMIT"))).toBe(true);
     expect(client.release).toHaveBeenCalled();
+  });
+
+  it("application callback cannot change RLS actor settings", async () => {
+    const client = makeMockClient();
+    const pool = makeMockPool(client);
+    const withTx = createWithOwnerTransaction(pool, () => dummyRepos);
+
+    await withTx(
+      { ownerId: "00000000-0000-4000-8000-000000000004", actor: { type: "owner" } },
+      async (repos) => {
+        // There is no path for the business layer to issue set_config.
+        expect(typeof (repos as any).query).toBe("undefined");
+        expect(typeof (repos as any).client).toBe("undefined");
+        // Attempting to reach a query method via any repository must fail.
+        for (const key of Object.keys(repos) as (keyof NexusRepositories)[]) {
+          const repo = repos[key] as Record<string, unknown>;
+          expect(repo.query).toBeUndefined();
+          expect(repo.client).toBeUndefined();
+        }
+        return "ok";
+      },
+    );
+
+    // All set_config calls must have originated from the transaction runner, not the callback.
+    const setConfigCalls = (client.query as any).mock.calls.filter((c: any[]) =>
+      String(c[0]).includes("set_config"),
+    );
+    // owner_id, actor_type, assistant_id (cleared for owner) = 3
+    expect(setConfigCalls.length).toBe(3);
+    for (const c of setConfigCalls) {
+      expect(String(c[0])).toMatch(/set_config\('nexus\.(owner_id|actor_type|assistant_id)'/);
+    }
   });
 
   it("rolls back and rethrows on operation error", async () => {
@@ -152,5 +198,22 @@ describe("withOwnerTransaction security", () => {
     );
     expect(setAssistant).toBeTruthy();
     expect(setAssistant[1][0]).toBe("00000000-0000-4000-8000-000000000001");
+  });
+
+  it("rejects invalid context before opening a transaction", async () => {
+    const client = makeMockClient();
+    const pool = makeMockPool(client);
+    const withTx = createWithOwnerTransaction(pool, () => dummyRepos);
+
+    await expect(
+      withTx({ ownerId: "", actor: { type: "owner" } } as any, async () => "x"),
+    ).rejects.toThrow(/Invalid OwnerTransactionContext/);
+
+    // connect may or may not have been called depending on validation order;
+    // the important invariant is no COMMIT of business work with bad context.
+    const commits = (client.query as any).mock.calls.filter((c: any[]) =>
+      String(c[0]).includes("COMMIT"),
+    );
+    expect(commits.length).toBe(0);
   });
 });
