@@ -22,6 +22,10 @@ export function createPool(options: PostgresDatabaseOptions): pg.Pool {
   return pool;
 }
 
+/**
+ * Ends the pool. Callers that need single-flight / retry semantics must layer
+ * that above this helper (see createPostgresDatabase.close).
+ */
 export async function closePool(pool: pg.Pool): Promise<void> {
   await pool.end();
 }

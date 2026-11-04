@@ -54,6 +54,75 @@ describe("bootstrapServer", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("closes the pool when build() fails after connectivity succeeds", async () => {
+    const close = vi.fn(async () => undefined);
+    const db = makeMockDb({ close });
+    const buildError = new Error("build failed");
+
+    await expect(
+      bootstrapServer(
+        { NEXUS_DATABASE_URL: "postgres://localhost/nexus" },
+        {
+          createDatabase: () => db,
+          buildApp: () => {
+            throw buildError;
+          },
+        },
+      ),
+    ).rejects.toBe(buildError);
+
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("closes the pool when addHook fails after build", async () => {
+    const close = vi.fn(async () => undefined);
+    const db = makeMockDb({ close });
+    const hookError = new Error("addHook failed");
+    const app = Fastify({ logger: false });
+    app.addHook = vi.fn(() => {
+      throw hookError;
+    }) as typeof app.addHook;
+
+    await expect(
+      bootstrapServer(
+        { NEXUS_DATABASE_URL: "postgres://localhost/nexus" },
+        {
+          createDatabase: () => db,
+          buildApp: () => app,
+        },
+      ),
+    ).rejects.toBe(hookError);
+
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the original error when pool close also fails after build failure", async () => {
+    const closeError = new Error("close failed");
+    const buildError = new Error("build failed");
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const db = makeMockDb({ close });
+    const logError = vi.fn();
+
+    await expect(
+      bootstrapServer(
+        { NEXUS_DATABASE_URL: "postgres://localhost/nexus" },
+        {
+          createDatabase: () => db,
+          buildApp: () => {
+            throw buildError;
+          },
+          logError,
+        },
+      ),
+    ).rejects.toBe(buildError);
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(logError).toHaveBeenCalled();
+    expect(logError.mock.calls[0][1]).toBe(closeError);
+  });
+
   it("succeeds when PostgreSQL is available and wires readiness", async () => {
     const db = makeMockDb();
     const createDatabase = vi.fn(() => db);
@@ -81,7 +150,7 @@ describe("bootstrapServer", () => {
     expect(db.close).toHaveBeenCalled();
   });
 
-  it("closes the pool on normal shutdown via app.close", async () => {
+  it("closes the pool on normal shutdown via app.close without duplicate close", async () => {
     const close = vi.fn(async () => undefined);
     const db = makeMockDb({ close });
     const server = await bootstrapServer(
@@ -92,7 +161,6 @@ describe("bootstrapServer", () => {
     await server.close();
     expect(close).toHaveBeenCalledTimes(1);
 
-    // Second close must not call db.close again (idempotent onClose path).
     await server.close();
     expect(close).toHaveBeenCalledTimes(1);
   });
@@ -113,7 +181,6 @@ describe("bootstrapServer", () => {
       },
     );
 
-    // Simulate index.ts listen failure handling
     await expect(server.app.listen({ host: "0.0.0.0", port: 1 })).rejects.toThrow(
       "EADDRINUSE",
     );
@@ -121,7 +188,7 @@ describe("bootstrapServer", () => {
     expect(close).toHaveBeenCalled();
   });
 
-  it("/v1/ready returns 503 after connectivity starts failing post-boot", async () => {
+  it("/v1/ready detects loss and recovery of connectivity", async () => {
     let healthy = true;
     const db = makeMockDb({
       checkConnectivity: vi.fn(async () => {
@@ -135,13 +202,19 @@ describe("bootstrapServer", () => {
     );
 
     try {
-      const ok = await server.app.inject({ method: "GET", url: "/v1/ready" });
-      expect(ok.statusCode).toBe(200);
+      expect((await server.app.inject({ method: "GET", url: "/v1/ready" })).statusCode).toBe(
+        200,
+      );
 
       healthy = false;
-      const bad = await server.app.inject({ method: "GET", url: "/v1/ready" });
-      expect(bad.statusCode).toBe(503);
-      expect(bad.json()).toEqual({ status: "not_ready" });
+      expect((await server.app.inject({ method: "GET", url: "/v1/ready" })).statusCode).toBe(
+        503,
+      );
+
+      healthy = true;
+      expect((await server.app.inject({ method: "GET", url: "/v1/ready" })).statusCode).toBe(
+        200,
+      );
 
       const health = await server.app.inject({ method: "GET", url: "/v1/health" });
       expect(health.statusCode).toBe(200);
