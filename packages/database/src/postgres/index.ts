@@ -15,8 +15,13 @@ export type { PostgresDatabaseOptions, OwnerTransactionContext };
 export const INTERNAL_POOL = Symbol.for("nexus.database.internalPool");
 
 export interface PostgresNexusDatabase extends NexusDatabase {
-  /** Graceful shutdown of the underlying pool. */
+  /** Graceful shutdown of the underlying pool. Safe to call more than once. */
   close(): Promise<void>;
+  /**
+   * Verifies the pool can obtain a connection and run a trivial query.
+   * Used only for process readiness / bootstrap — not a business SQL surface.
+   */
+  checkConnectivity(): Promise<void>;
 }
 
 /**
@@ -34,10 +39,30 @@ export function createPostgresDatabase(
 ): PostgresNexusDatabase {
   const pool = createPool(options);
   const withOwnerTransaction = createWithOwnerTransaction(pool, createRepositories);
+  let closed = false;
+
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await closePool(pool);
+  };
+
+  const checkConnectivity = async (): Promise<void> => {
+    if (closed) {
+      throw new Error("PostgreSQL pool is closed");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("SELECT 1");
+    } finally {
+      client.release();
+    }
+  };
 
   const db: PostgresNexusDatabase & { [INTERNAL_POOL]: Pool } = {
     withOwnerTransaction,
-    close: () => closePool(pool),
+    close,
+    checkConnectivity,
     [INTERNAL_POOL]: pool,
   };
 

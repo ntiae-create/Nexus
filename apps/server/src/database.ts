@@ -9,7 +9,8 @@ import {
  * Connection string must come from environment / secret manager — never hardcoded.
  *
  * Lifecycle:
- * - Call createServerDatabase() during app bootstrap when NEXUS_DATABASE_URL is set.
+ * - Call createServerDatabase() during app bootstrap (NEXUS_DATABASE_URL is required).
+ * - Validate connectivity with db.checkConnectivity() before opening the API.
  * - Register app.addHook("onClose", () => db.close()) so the pool is drained cleanly.
  * - Do not open the pool on every request; keep a single instance per process.
  *

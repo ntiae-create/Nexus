@@ -1,34 +1,34 @@
-import { buildApp } from "./app.js";
-import { createServerDatabase, type PostgresNexusDatabase } from "./database.js";
+import { bootstrapServer, BootstrapError } from "./bootstrap.js";
 
-const app = buildApp();
-const port = Number(process.env.PORT ?? 3000);
+async function main(): Promise<void> {
+  let server: Awaited<ReturnType<typeof bootstrapServer>> | undefined;
 
-let db: PostgresNexusDatabase | undefined;
-
-if (process.env.NEXUS_DATABASE_URL) {
   try {
-    db = createServerDatabase();
-    app.addHook("onClose", async () => {
-      if (db) {
-        await db.close();
-        app.log.info("PostgreSQL pool closed");
-      }
-    });
-    app.log.info("PostgreSQL database pool initialized");
+    server = await bootstrapServer();
   } catch (error) {
-    app.log.error({ err: error }, "Failed to initialize PostgreSQL pool");
+    if (error instanceof BootstrapError) {
+      console.error(`[nexus-server] ${error.message}`);
+    } else {
+      console.error("[nexus-server] Startup failed", error);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const { app, port } = server;
+
+  try {
+    await app.listen({ host: "0.0.0.0", port });
+    app.log.info({ port }, "NEXUS server listening");
+  } catch (error) {
+    app.log.error({ err: error }, "Failed to bind HTTP server");
+    try {
+      await server.close();
+    } catch (closeError) {
+      app.log.error({ err: closeError }, "Failed to close after listen error");
+    }
     process.exitCode = 1;
   }
-} else {
-  app.log.warn(
-    "NEXUS_DATABASE_URL is not set; PostgreSQL persistence is disabled for this process",
-  );
 }
 
-try {
-  await app.listen({ host: "0.0.0.0", port });
-} catch (error) {
-  app.log.error(error);
-  process.exitCode = 1;
-}
+await main();
