@@ -126,17 +126,19 @@ export async function bootstrapServer(
     );
   }
 
-  let app: FastifyInstance;
-  try {
-    app = build({
-      checkDatabase: () => db!.checkConnectivity(),
-    });
-    app.addHook("onClose", async () => {
-      await closePool();
-    });
-  } catch (error) {
-    await closePoolSafely(closePool, error, logError);
-  }
+  const app = await (async (): Promise<FastifyInstance> => {
+    try {
+      const builtApp = build({
+        checkDatabase: () => db!.checkConnectivity(),
+      });
+      builtApp.addHook("onClose", async () => {
+        await closePool();
+      });
+      return builtApp;
+    } catch (error) {
+      return await closePoolSafely(closePool, error, logError);
+    }
+  })();
 
   const port = Number(env.PORT ?? 3000);
 

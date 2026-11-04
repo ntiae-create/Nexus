@@ -16,7 +16,7 @@
     "dev:mobile": "npm run dev --workspace @nexus/mobile",
     "dev:server": "npm run dev --workspace @nexus/server",
     "build": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/database && npm run build --workspace @nexus/server && npm run build --workspace @nexus/mobile",
-    "test": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/database && vitest run",
+    "test": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/assistant-profiles && npm run build --workspace @nexus/database && vitest run",
     "test:database": "npm run test --workspace @nexus/database"
   },
   "devDependencies": {

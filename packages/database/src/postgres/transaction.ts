@@ -24,7 +24,12 @@ export function createWithOwnerTransaction(
     operation: (repositories: NexusRepositories) => Promise<T>,
   ): Promise<T> {
     // Validate context shape early (trusted backend only; still defensive).
-    if (!context || typeof context.ownerId !== "string" || !context.actor) {
+    if (
+      !context ||
+      typeof context.ownerId !== "string" ||
+      context.ownerId.trim().length === 0 ||
+      !context.actor
+    ) {
       throw new Error("Invalid OwnerTransactionContext: missing ownerId or actor");
     }
     if (context.actor.type === "assistant" && !context.actor.assistantId) {

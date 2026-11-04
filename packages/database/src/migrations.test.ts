@@ -60,7 +60,7 @@ describe("SINGLE-USER PostgreSQL migration", () => {
       expect(sql).toContain(`ALTER TABLE nexus.${table} FORCE ROW LEVEL SECURITY;`);
     }
     expect(readme).toContain("não protege contra SQL arbitrário usando a própria credencial confiável do backend");
-    expect(readme).toContain("set_config('nexus.owner_id', $1, true)");
+    expect(readme).toContain("O terceiro argumento `true` de `set_config` torna o valor local à transação");
   });
 
   it("keeps per-assistant memory separate and shared memory explicitly permissioned and audited", async () => {
