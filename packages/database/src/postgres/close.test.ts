@@ -1,82 +1,95 @@
-import { describe, expect, it, vi } from "vitest";
 
-// Test close() single-flight and failure retry without a real PostgreSQL.
-// We exercise the same control-flow pattern used by createPostgresDatabase.
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Pool } from "pg";
+import { createPostgresDatabase, INTERNAL_POOL } from "./index.js";
+import { createPool } from "./pool.js";
 
-function createCloseable(endImpl: () => Promise<void>) {
-  let closedSuccessfully = false;
-  let closeInFlight: Promise<void> | undefined;
-  let endCalls = 0;
+vi.mock("./pool.js", () => ({
+  createPool: vi.fn(),
+  closePool: vi.fn(async (pool: { end: () => Promise<void> }) => {
+    await pool.end();
+  }),
+}));
 
-  const end = async () => {
-    endCalls += 1;
-    await endImpl();
-  };
-
-  const close = async (): Promise<void> => {
-    if (closedSuccessfully) return;
-    if (closeInFlight) return closeInFlight;
-
-    closeInFlight = (async () => {
-      try {
-        await end();
-        closedSuccessfully = true;
-      } catch (error) {
-        closeInFlight = undefined;
-        throw error;
-      }
-    })();
-
-    return closeInFlight;
-  };
-
+function makePool(end: () => Promise<void>): Pool {
   return {
-    close,
-    get endCalls() {
-      return endCalls;
-    },
-    get closedSuccessfully() {
-      return closedSuccessfully;
-    },
-  };
+    end: vi.fn(end),
+    connect: vi.fn(),
+    on: vi.fn(),
+  } as unknown as Pool;
 }
 
-describe("postgres close semantics", () => {
-  it("concurrent close() calls await the same in-flight end", async () => {
+describe("PostgreSQL database close()", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("concurrent close() calls await the same real pool shutdown", async () => {
     let release!: () => void;
+
     const barrier = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const handle = createCloseable(async () => {
-      await barrier;
+
+    const pool = makePool(() => barrier);
+
+    vi.mocked(createPool).mockReturnValue(pool);
+
+    const db = createPostgresDatabase({
+      connectionString: "postgres://test:test@localhost:5432/test",
     });
 
-    const first = handle.close();
-    const second = handle.close();
-    expect(handle.endCalls).toBe(1);
+    const first = db.close();
+    const second = db.close();
+
+    expect(pool.end).toHaveBeenCalledTimes(1);
 
     release();
-    await Promise.all([first, second]);
-    expect(handle.endCalls).toBe(1);
-    expect(handle.closedSuccessfully).toBe(true);
 
-    await handle.close();
-    expect(handle.endCalls).toBe(1);
+    await Promise.all([first, second]);
+
+    expect(pool.end).toHaveBeenCalledTimes(1);
+
+    await db.close();
+
+    expect(pool.end).toHaveBeenCalledTimes(1);
   });
 
-  it("does not mark closed when end fails and allows retry", async () => {
-    let shouldFail = true;
-    const handle = createCloseable(async () => {
-      if (shouldFail) throw new Error("end failed");
+  it("allows retry when the real pool shutdown fails", async () => {
+    const pool = makePool(
+      vi.fn()
+        .mockRejectedValueOnce(new Error("end failed"))
+        .mockResolvedValueOnce(undefined),
+    );
+
+    vi.mocked(createPool).mockReturnValue(pool);
+
+    const db = createPostgresDatabase({
+      connectionString: "postgres://test:test@localhost:5432/test",
     });
 
-    await expect(handle.close()).rejects.toThrow("end failed");
-    expect(handle.closedSuccessfully).toBe(false);
-    expect(handle.endCalls).toBe(1);
+    await expect(db.close()).rejects.toThrow("end failed");
 
-    shouldFail = false;
-    await handle.close();
-    expect(handle.closedSuccessfully).toBe(true);
-    expect(handle.endCalls).toBe(2);
+    expect(pool.end).toHaveBeenCalledTimes(1);
+
+    await db.close();
+
+    expect(pool.end).toHaveBeenCalledTimes(2);
+
+    await db.close();
+
+    expect(pool.end).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the actual pool instance created by the database factory", () => {
+    const pool = makePool(async () => {});
+
+    vi.mocked(createPool).mockReturnValue(pool);
+
+    const db = createPostgresDatabase({
+      connectionString: "postgres://test:test@localhost:5432/test",
+    });
+
+    expect(db[INTERNAL_POOL]).toBe(pool);
   });
 });
