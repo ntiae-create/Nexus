@@ -15,8 +15,9 @@
     "dev": "concurrently --names server,mobile --prefix-colors blue,green \"npm:dev:server\" \"npm:dev:mobile\"",
     "dev:mobile": "npm run dev --workspace @nexus/mobile",
     "dev:server": "npm run dev --workspace @nexus/server",
-    "build": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/server && npm run build --workspace @nexus/mobile",
-    "test": "npm run build --workspace @nexus/shared && vitest run"
+    "build": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/database && npm run build --workspace @nexus/server && npm run build --workspace @nexus/mobile",
+    "test": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/database && vitest run",
+    "test:database": "npm run test --workspace @nexus/database"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
