@@ -16,7 +16,7 @@ function mapMessage(row: {
   format_version: number;
   created_at: Date;
   updated_at: Date | null;
-  metadata: Record<string, unknown> | null;
+  metadata: Message["metadata"] | null;
 }): Message {
   return {
     id: row.id,
