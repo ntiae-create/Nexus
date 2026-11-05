@@ -61,6 +61,14 @@ jobs:
           NEXUS_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         run: npm run test:integration --workspace @nexus/database
 
+      - name: Test repositories against isolated PostgreSQL
+        env:
+          NEXUS_DATABASE_URL: postgres://nexus_app@127.0.0.1:5432/nexus_test
+        run: >-
+          npx vitest run
+          packages/database/src/postgres/pool.integration.test.ts
+          packages/database/src/postgres/repositories.integration.test.ts
+
       - name: Test auth store against isolated PostgreSQL
         env:
           NEXUS_TEST_AUTH_DATABASE_URL: postgres://postgres@127.0.0.1:5432/nexus_test
