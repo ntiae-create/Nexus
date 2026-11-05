@@ -30,18 +30,25 @@ A implementação vive em `src/postgres/`:
 | Repositório | Status |
 |---|---|
 | `owner` | completo |
-| `conversations` | completo |
-| `messages` | completo |
-| `executions` | parcial — mapeamento de `assistantIds`/`trace` documentado como limitado pelo schema atual |
+| `conversations` | completo — assistentes e preferência de conversa recuperados da tabela canônica |
+| `messages` | completo — autoria explícita, idempotência por conversa, sequência serializada e histórico ordenado |
+| `executions` | completo — criar, atualizar, concluir, falhar e recuperar participantes, trace, passos, eventos e resultados |
 | `memories` | completo (listOwned, listForCurrentAssistant, delete, grant, revoke, listPermissionAudit) |
-| `providerPreferences` | **não implementado** — tabelas ausentes na migração; métodos lançam erro explícito |
+| `providerPreferences` | completo — escopos global/assistente/conversa, precedência e escritas atômicas por escopo |
 | `sync` | **não implementado** — protocolo de cursor/tombstone não finalizado; `pullIncremental` lança erro explícito |
 
 Quando uma funcionalidade depende de decisão de produto ou nova migração, o método documenta e falha de forma explícita em vez de retornar dados vazios silenciosos.
 
+### Invariantes da Etapa 2B
+
+- `messages.append` grava somente autoria de usuário; `appendAssistant` é a operação confiável separada para respostas de assistentes. Um `assistantId` enviado à operação de usuário é rejeitado.
+- Toda escrita de mensagem bloqueia a conversa antes de calcular a próxima sequência. `(conversation_id, idempotency_key)` é único; reenvios idênticos retornam a mensagem original e reutilização da chave com payload diferente falha.
+- `core_run_assistants` preserva a ordem de `assistantIds`; `trace`, timestamps, mensagem final e vínculos de resultados são persistidos e lidos de volta. Execuções terminais são imutáveis.
+- Preferências de conversa ficam exclusivamente em `conversation_provider_preferences`, nunca em `conversations.metadata`. Setters por escopo usam upsert e lock transacional comum; `resolve` aplica conversa → assistente → global, inclusive quando a escolha mais específica é `automatic`.
+
 ## Migrações
 
-As migrações SQL sequenciais ficam em `migrations/`. A estrutura ainda não aplicada pode ser ajustada diretamente em `00001_initial_schema.sql`; depois de aplicada, a migração é imutável e mudanças futuras devem ser novas migrações.
+As migrações SQL sequenciais ficam em `migrations/`. Migrações versionadas são imutáveis, inclusive `00001_initial_schema.sql` e `00002_auth_security.sql`; mudanças futuras devem ser novas migrações. A `00003_persistence_integrity.sql` é aditiva e migra os dados legados disponíveis.
 
 **Recomendação para a futura ferramenta:** `postgres-migrations`. Não rodar migrações automaticamente no boot do backend.
 
@@ -56,8 +63,9 @@ O ator `assistant` só pode ler sua memória individual e itens compartilhados c
 ## Testes
 
 - **Unitários (mocks):** `src/postgres/transaction.test.ts` — impossibilidade de SQL arbitrário no callback, impossibilidade de alterar ator RLS, rollback, destroy on rollback failure.
-- **Integração (PostgreSQL real):** `src/postgres/pool.integration.test.ts` — exige `NEXUS_DATABASE_URL`; cobre pool max=1, rollback, leitura sob RLS. Pulados automaticamente sem a variável.
-- **SQL de integração:** `tests/postgres/` + `scripts/test-postgres-integration.sh` (CI com PostgreSQL 17).
+- **Integração (PostgreSQL real):** `src/postgres/pool.integration.test.ts` e `src/postgres/repositories.integration.test.ts` — exigem `NEXUS_DATABASE_URL`; cobrem pool, rollback, RLS, mensagens concorrentes/idempotentes, execuções completas e preferências. Pulados automaticamente sem a variável somente em execuções locais comuns.
+- **Workflow obrigatório:** `.github/workflows/database-postgres.yml` aplica todas as migrations em PostgreSQL 17 e executa os testes SQL, dos repositórios e do auth store com a variável de conexão configurada; portanto esses testes não são pulados no CI.
+- **SQL de integração e upgrade:** `tests/postgres/` + `scripts/test-postgres-integration.sh` (CI com PostgreSQL 17). O script insere dados no schema 2A antes da `00003` e comprova o backfill de mensagens, execuções e preferências após a migração.
 - Testes estáticos de migração em `src/migrations.test.ts` **não** substituem execução real no PostgreSQL.
 
 ## Integração no servidor

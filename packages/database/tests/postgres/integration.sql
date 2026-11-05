@@ -48,9 +48,11 @@ BEGIN
   VALUES (nexus.current_owner_id(), '20000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000001'),
          (nexus.current_owner_id(), '20000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'),
          (nexus.current_owner_id(), '20000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000003');
-  INSERT INTO nexus.messages (id, owner_id, conversation_id, sequence, role, status, content, format_version)
-  VALUES ('30000000-0000-4000-8000-000000000001', nexus.current_owner_id(), '20000000-0000-4000-8000-000000000001', 1, 'user', 'complete', '[{"type":"text","text":"Hello"}]', 1),
-         ('30000000-0000-4000-8000-000000000002', nexus.current_owner_id(), '20000000-0000-4000-8000-000000000002', 1, 'user', 'complete', '[{"type":"text","text":"Other conversation"}]', 1);
+  INSERT INTO nexus.messages (
+    id, owner_id, conversation_id, sequence, role, status, content, format_version, request_id, idempotency_key
+  ) VALUES
+    ('30000000-0000-4000-8000-000000000001', nexus.current_owner_id(), '20000000-0000-4000-8000-000000000001', 1, 'user', 'complete', '[{"type":"text","text":"Hello"}]', 1, '30000000-0000-4000-8000-000000000001', 'legacy-message-one'),
+    ('30000000-0000-4000-8000-000000000002', nexus.current_owner_id(), '20000000-0000-4000-8000-000000000002', 1, 'user', 'complete', '[{"type":"text","text":"Other conversation"}]', 1, '30000000-0000-4000-8000-000000000002', 'legacy-message-two');
   INSERT INTO nexus.core_runs (
     id, owner_id, conversation_id, request_id, idempotency_key, status, input_message_id, format_version
   ) VALUES
@@ -85,7 +87,7 @@ BEGIN
     RAISE EXCEPTION 'Application created a second owner';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
-  IF (SELECT count(*) FROM nexus.conversations) <> 2 THEN RAISE EXCEPTION 'Owner history was not readable'; END IF;
+  IF (SELECT count(*) FROM nexus.conversations) <> 4 THEN RAISE EXCEPTION 'Owner history was not readable after legacy upgrade'; END IF;
   IF (SELECT count(*) FROM nexus.messages WHERE conversation_id='20000000-0000-4000-8000-000000000001') <> 1 THEN RAISE EXCEPTION 'Conversation history missing'; END IF;
 
   -- A run's message reference must belong to the same conversation.
@@ -173,7 +175,12 @@ BEGIN
   INSERT INTO nexus.memory_permissions (id, owner_id, memory_id, assistant_id, status, granted_by_owner_id, granted_at)
   VALUES ('41000000-0000-4000-8000-000000000001', nexus.current_owner_id(), '40000000-0000-4000-8000-000000000002', '00000000-0000-4000-8000-000000000002', 'granted', nexus.current_owner_id(), now());
   INSERT INTO nexus.global_provider_preferences (owner_id, selection_mode, provider_id, model_id)
-  VALUES (nexus.current_owner_id(), 'manual', '50000000-0000-4000-8000-000000000001', '60000000-0000-4000-8000-000000000001');
+  VALUES (nexus.current_owner_id(), 'manual', '50000000-0000-4000-8000-000000000001', '60000000-0000-4000-8000-000000000001')
+  ON CONFLICT (owner_id) DO UPDATE SET
+    selection_mode = EXCLUDED.selection_mode,
+    provider_id = EXCLUDED.provider_id,
+    model_id = EXCLUDED.model_id,
+    updated_at = now();
   INSERT INTO nexus.assistant_provider_preferences (owner_id, assistant_id, selection_mode, provider_id, model_id)
   VALUES (nexus.current_owner_id(), '00000000-0000-4000-8000-000000000001', 'manual', '50000000-0000-4000-8000-000000000001', '60000000-0000-4000-8000-000000000002');
   INSERT INTO nexus.conversation_provider_preferences (owner_id, conversation_id, selection_mode, provider_id, model_id)
@@ -199,8 +206,9 @@ BEGIN
       WHERE gp.owner_id=nexus.current_owner_id()) <> '60000000-0000-4000-8000-000000000001'::uuid
   THEN RAISE EXCEPTION 'Global preference fallback failed'; END IF;
   BEGIN
-    INSERT INTO nexus.global_provider_preferences (owner_id, selection_mode, provider_id, model_id)
-    VALUES (nexus.current_owner_id(), 'manual', '50000000-0000-4000-8000-000000000002', '60000000-0000-4000-8000-000000000004');
+    UPDATE nexus.global_provider_preferences
+    SET provider_id='50000000-0000-4000-8000-000000000002', model_id='60000000-0000-4000-8000-000000000004'
+    WHERE owner_id=nexus.current_owner_id();
     RAISE EXCEPTION 'Unknown paid provider was implicitly authorized';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;

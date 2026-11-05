@@ -9,6 +9,7 @@
  * - owner identity is readable under RLS context
  * - public surface does not expose pool / query
  */
+import { randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createPostgresDatabase } from "./index.js";
 import type { PostgresNexusDatabase } from "./index.js";
@@ -73,13 +74,8 @@ describeIf("postgres pool + transaction integration", () => {
   });
 
   it("rolls back on error and does not leave partial conversation", async () => {
-    const before = await db.withOwnerTransaction(
-      {
-        ownerId: "00000000-0000-4000-8000-000000000004",
-        actor: { type: "owner" },
-      },
-      async (repos) => (await repos.conversations.list()).length,
-    );
+    const rollbackTitle = `should-rollback-integration-${randomUUID()}`;
+    let rolledBackId: string | undefined;
 
     await expect(
       db.withOwnerTransaction(
@@ -88,19 +84,28 @@ describeIf("postgres pool + transaction integration", () => {
           actor: { type: "owner" },
         },
         async (repos) => {
-          await repos.conversations.create({ title: "should-rollback-integration" });
+          const created = await repos.conversations.create({ title: rollbackTitle });
+          rolledBackId = created.id;
           throw new Error("force rollback");
         },
       ),
     ).rejects.toThrow("force rollback");
 
-    const after = await db.withOwnerTransaction(
+    expect(rolledBackId).toBeDefined();
+
+    const persisted = await db.withOwnerTransaction(
       {
         ownerId: "00000000-0000-4000-8000-000000000004",
         actor: { type: "owner" },
       },
-      async (repos) => (await repos.conversations.list()).length,
+      async (repos) => ({
+        byId: await repos.conversations.getById(rolledBackId!),
+        byTitle: (await repos.conversations.list()).some(
+          (conversation) =>
+            conversation.id === rolledBackId || conversation.title === rollbackTitle,
+        ),
+      }),
     );
-    expect(after).toBe(before);
+    expect(persisted).toEqual({ byId: null, byTitle: false });
   });
 });
