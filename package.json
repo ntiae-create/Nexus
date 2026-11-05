@@ -12,15 +12,21 @@
     "packages/*"
   ],
   "scripts": {
+    "build:packages": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/assistant-profiles && npm run build --workspace @nexus/database && npm run build --workspace @nexus/tools",
+    "prepare": "npm run build:packages",
+    "predev": "npm run build:packages",
     "dev": "concurrently --names server,mobile --prefix-colors blue,green \"npm:dev:server\" \"npm:dev:mobile\"",
+    "predev:mobile": "npm run build:packages",
     "dev:mobile": "npm run dev --workspace @nexus/mobile",
+    "predev:server": "npm run build:packages",
     "dev:server": "npm run dev --workspace @nexus/server",
-    "build": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/database && npm run build --workspace @nexus/server && npm run build --workspace @nexus/mobile",
-    "test": "npm run build --workspace @nexus/shared && npm run build --workspace @nexus/assistant-profiles && npm run build --workspace @nexus/database && vitest run",
+    "build": "npm run build:packages && npm run build --workspace @nexus/server && npm run build --workspace @nexus/mobile",
+    "test": "npm run build:packages && vitest run",
     "test:database": "npm run test --workspace @nexus/database"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
+    "vite": "^7.3.7",
     "vitest": "^5.1.0"
   }
 }
