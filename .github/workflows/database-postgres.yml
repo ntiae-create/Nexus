@@ -65,7 +65,7 @@ jobs:
         env:
           NEXUS_DATABASE_URL: postgres://nexus_app@127.0.0.1:5432/nexus_test
         run: >-
-          npx vitest run
+          npx vitest run --no-file-parallelism
           packages/database/src/postgres/pool.integration.test.ts
           packages/database/src/postgres/repositories.integration.test.ts
 
