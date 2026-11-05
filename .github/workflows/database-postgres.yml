@@ -31,6 +31,8 @@ jobs:
           POSTGRES_DB: nexus_test
           POSTGRES_USER: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d nexus_test"
           --health-interval 5s
@@ -54,10 +56,15 @@ jobs:
       - name: Run static database tests
         run: npm test --workspace @nexus/database
 
-      - name: Apply migration and run PostgreSQL integration tests
+      - name: Apply migrations and run PostgreSQL integration tests
         env:
           NEXUS_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         run: npm run test:integration --workspace @nexus/database
+
+      - name: Test auth store against isolated PostgreSQL
+        env:
+          NEXUS_TEST_AUTH_DATABASE_URL: postgres://postgres@127.0.0.1:5432/nexus_test
+        run: npx vitest run apps/server/src/auth/postgres-store.integration.test.ts
 
       - name: Stop temporary PostgreSQL service
         if: always()

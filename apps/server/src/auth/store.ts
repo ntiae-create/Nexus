@@ -1,8 +1,7 @@
 export interface AuthStore {
   isRevoked(jti: string): Promise<boolean>;
   revoke(jti: string, expiresAt: number): Promise<void>;
-  isLoginLocked(): Promise<boolean>;
-  /** Returns true only while this failed attempt remains below the lock threshold. */
+  /** Atomically records a bad password and returns false when that attempt triggers/is under lock. */
   recordFailure(): Promise<boolean>;
   clearFailures(): Promise<void>;
 }

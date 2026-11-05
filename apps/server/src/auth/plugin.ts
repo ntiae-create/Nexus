@@ -11,7 +11,6 @@ export async function authPlugin(app:FastifyInstance, options:AuthPluginOptions=
  app.post("/v1/auth/login",async(request,reply)=>{if(!config)return reply.code(503).send({error:{code:"AUTH_NOT_CONFIGURED",message:"Authentication is not configured",retryable:false},timestamp:new Date().toISOString()});
  const body=request.body as {password?:unknown}|null;const password=typeof body?.password==="string"?body.password:"";
  if(!password||password.length>1024)return reply.code(400).send({error:{code:"INVALID_REQUEST",message:"password is required",retryable:false},timestamp:new Date().toISOString()});
- if(await store.isLoginLocked())return reply.code(429).send({error:{code:"LOGIN_LOCKED",message:"Login temporarily locked",retryable:true},timestamp:new Date().toISOString()});
  if(!verifyOwnerPassword(password,config)){const allowed=await store.recordFailure();return reply.code(allowed?401:429).send({error:{code:allowed?"UNAUTHORIZED":"LOGIN_LOCKED",message:allowed?"Invalid credentials":"Login temporarily locked",retryable:!allowed},timestamp:new Date().toISOString()});}
  await store.clearFailures();const {token,payload}=issueSessionToken(config);return{token,tokenType:"Bearer",expiresAt:new Date(payload.expiresAt*1000).toISOString(),owner:{userId:OWNER_ID}};});
  app.get("/v1/auth/me",{preHandler:requireAuth},async(req)=>({owner:{userId:req.session!.ownerId},session:{issuedAt:new Date(req.session!.issuedAt*1000).toISOString(),expiresAt:new Date(req.session!.expiresAt*1000).toISOString()}}));
