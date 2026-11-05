@@ -1,6 +1,5 @@
-import Fastify from "fastify";
-import { bootstrapServer } from "./apps/server/src/bootstrap.js";
+import { createServerlessApp } from "./apps/server/src/bootstrap.js";
 
-const { app }: { app: ReturnType<typeof Fastify> } = await bootstrapServer();
+const app = createServerlessApp();
 
 export default app;

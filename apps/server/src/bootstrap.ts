@@ -47,6 +47,43 @@ export interface BootstrappedServer {
   close(): Promise<void>;
 }
 
+/**
+ * Builds the Fastify application for a serverless runtime. PostgreSQL is
+ * created and checked only when /v1/ready is requested, so app initialization
+ * and /v1/health do not depend on Neon availability.
+ */
+export function createServerlessApp(
+  env: BootstrapEnv = process.env,
+  deps: BootstrapDependencies = {},
+): FastifyInstance {
+  const createDatabase =
+    deps.createDatabase ??
+    ((url: string) => createServerDatabase({ connectionString: url }));
+  const build =
+    deps.buildApp ?? ((options?: BuildAppOptions) => buildApp(options));
+  let db: PostgresNexusDatabase | undefined;
+
+  const app = build({
+    checkDatabase: async () => {
+      const connectionString = env.NEXUS_DATABASE_URL?.trim();
+      if (!connectionString) {
+        throw new BootstrapError(
+          "MISSING_DATABASE_URL",
+          "NEXUS_DATABASE_URL is required to connect to PostgreSQL",
+        );
+      }
+      db ??= createDatabase(connectionString);
+      await db.checkConnectivity();
+    },
+  });
+
+  app.addHook("onClose", async () => {
+    await db?.close();
+  });
+
+  return app;
+}
+
 async function closePoolSafely(
   closePool: () => Promise<void>,
   primaryError: unknown,
