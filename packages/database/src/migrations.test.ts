@@ -109,4 +109,16 @@ describe("SINGLE-USER PostgreSQL migration", () => {
     expect(sql).toContain("assistant_memories_content_no_credentials");
     expect(sql).toContain("tool_events_payload_no_credentials");
   });
+
+  it("adds stage 2B integrity without rewriting earlier migrations", async () => {
+    const sql = await readFile(
+      join(migrationsDirectory, "00003_persistence_integrity.sql"),
+      "utf8",
+    );
+    expect(sql).toContain("UNIQUE (conversation_id, idempotency_key)");
+    expect(sql).toContain("CREATE TABLE nexus.core_run_assistants");
+    expect(sql).toContain("ALTER TABLE nexus.core_run_assistants FORCE ROW LEVEL SECURITY");
+    expect(sql).toContain("metadata = metadata - 'providerPreference'");
+    expect(sql).not.toMatch(/DROP TABLE|ALTER TABLE nexus\.(messages|core_runs)\s+DROP/i);
+  });
 });
