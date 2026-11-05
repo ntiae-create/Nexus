@@ -18,9 +18,9 @@ BEGIN
     RAISE EXCEPTION 'Expected PostgreSQL 17, got %', current_setting('server_version');
   END IF;
   SELECT count(*) INTO table_count FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND c.relkind='r';
-  IF table_count <> 21 THEN RAISE EXCEPTION 'Expected 21 tables, found %', table_count; END IF;
+  IF table_count <> 23 THEN RAISE EXCEPTION 'Expected 23 tables after auth migration, found %', table_count; END IF;
   SELECT count(DISTINCT i.indrelid) INTO primary_key_table_count FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND i.indisprimary;
-  IF primary_key_table_count <> 21 THEN RAISE EXCEPTION 'Expected primary keys on all 21 tables, found %', primary_key_table_count; END IF;
+  IF primary_key_table_count <> 23 THEN RAISE EXCEPTION 'Expected primary keys on all 23 tables, found %', primary_key_table_count; END IF;
   SELECT count(*) INTO protected_table_count FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity;
   IF protected_table_count <> 16 THEN RAISE EXCEPTION 'Expected RLS on 16 personal-data tables, found %', protected_table_count; END IF;
   SELECT count(*) INTO policy_count FROM pg_policies WHERE schemaname='nexus';
@@ -60,6 +60,7 @@ CREATE ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT;
 CREATE ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT;
 GRANT CONNECT ON DATABASE nexus_test TO nexus_app;
 GRANT USAGE ON SCHEMA nexus TO nexus_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON nexus.auth_login_state, nexus.revoked_sessions TO nexus_app;
 GRANT SELECT ON nexus.owner_identity, nexus.assistants, nexus.assistant_config_versions, nexus.providers, nexus.models TO nexus_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   nexus.conversations, nexus.conversation_assistants, nexus.messages, nexus.core_runs,
