@@ -1177,15 +1177,45 @@ describeIfPostgres("PostgreSQL 17 repositories: persistence and integrity", () =
       }),
     );
 
+    const barrierOutcomesPromise = Promise.allSettled([
+      closingPromise,
+      contendingStepPromise,
+      contendingEventPromise,
+      contendingResultPromise,
+    ]);
+
     // Give the three contending transactions time to reach SELECT ... FOR UPDATE on PostgreSQL.
     await new Promise((resolve) => setTimeout(resolve, 60));
     allowCloseCommit();
 
-    const closedBarrierRun = await closingPromise;
-    expect(closedBarrierRun.status).toBe("succeeded");
-    await expect(contendingStepPromise).rejects.toThrow(/Terminal executions are immutable/);
-    await expect(contendingEventPromise).rejects.toThrow(/Terminal executions are immutable/);
-    await expect(contendingResultPromise).rejects.toThrow(/Terminal executions are immutable/);
+    const [
+      closedBarrierOutcome,
+      contendingStepOutcome,
+      contendingEventOutcome,
+      contendingResultOutcome,
+    ] = await barrierOutcomesPromise;
+    expect(closedBarrierOutcome.status).toBe("fulfilled");
+    if (closedBarrierOutcome.status === "fulfilled") {
+      expect(closedBarrierOutcome.value.status).toBe("succeeded");
+    }
+    expect(contendingStepOutcome).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({
+        message: expect.stringMatching(/Terminal executions are immutable/),
+      }),
+    });
+    expect(contendingEventOutcome).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({
+        message: expect.stringMatching(/Terminal executions are immutable/),
+      }),
+    });
+    expect(contendingResultOutcome).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({
+        message: expect.stringMatching(/Terminal executions are immutable/),
+      }),
+    });
 
     const barrierPersisted = await transact(async (repos) => ({
       run: await repos.executions.getById(barrierSetup.targetRun.id),
