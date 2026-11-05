@@ -154,7 +154,31 @@ function mapToolEvent(row: ToolEventRow): ToolEvent {
   };
 }
 
+const terminalRunStatuses: ReadonlySet<CoreRun["status"]> = new Set([
+  "succeeded",
+  "partial",
+  "failed",
+  "cancelled",
+]);
+
 export function createExecutionRepository(client: PoolClient): ExecutionRepository {
+  let savepointSequence = 0;
+
+  const withStatementSavepoint = async <T>(operation: () => Promise<T>): Promise<T> => {
+    savepointSequence += 1;
+    const savepoint = `nexus_execution_sp_${savepointSequence}`;
+    await client.query(`SAVEPOINT ${savepoint}`);
+    try {
+      const value = await operation();
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      return value;
+    } catch (error) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      throw error;
+    }
+  };
+
   const getRunRow = async (runId: string, forUpdate = false): Promise<CoreRunRow | null> => {
     const result = await client.query<CoreRunRow>(
       `SELECT ${runColumns} FROM nexus.core_runs WHERE id = $1${forUpdate ? " FOR UPDATE" : ""}`,
@@ -177,14 +201,32 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
     return row ? mapRun(row, await getAssistantIds(runId)) : null;
   };
 
-  const requireRun = async (runId: string, userId: string): Promise<void> => {
-    const result = await client.query<{ owner_id: string }>(
-      `SELECT owner_id FROM nexus.core_runs WHERE id = $1`,
+  const lockMutableRun = async (runId: string, userId: string): Promise<CoreRunRow> => {
+    const result = await client.query<
+      CoreRunRow & { authenticated_owner_id: string | null }
+    >(
+      `SELECT ${runColumns},
+              CASE
+                WHEN nexus.current_owner_id() = nexus.configured_owner_id()
+                  AND nexus.current_actor_type() = 'owner'
+                  THEN nexus.current_owner_id()
+              END AS authenticated_owner_id
+       FROM nexus.core_runs
+       WHERE id = $1
+       FOR UPDATE`,
       [runId],
     );
-    const ownerId = result.rows[0]?.owner_id;
-    if (!ownerId) throw new Error("Execution not found or not accessible");
-    if (ownerId !== userId) throw new Error("Execution owner does not match the payload");
+    const row = result.rows[0];
+    if (!row || !row.authenticated_owner_id || row.owner_id !== row.authenticated_owner_id) {
+      throw new Error("Execution not found or not accessible");
+    }
+    if (row.owner_id !== userId) {
+      throw new Error("Execution owner does not match the payload");
+    }
+    if (terminalRunStatuses.has(row.status)) {
+      throw new Error(`Terminal executions are immutable (status: ${row.status})`);
+    }
+    return row;
   };
 
   const replaceAssistants = async (run: CoreRun): Promise<void> => {
@@ -200,8 +242,28 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
 
   const updateInternal = async (rawRun: CoreRun): Promise<CoreRun> => {
     const run = coreRunSchema.parse(rawRun);
-    const existingRow = await getRunRow(run.id, true);
-    if (!existingRow) throw new Error("Execution not found or not accessible");
+    const existingResult = await client.query<
+      CoreRunRow & { authenticated_owner_id: string | null }
+    >(
+      `SELECT ${runColumns},
+              CASE
+                WHEN nexus.current_owner_id() = nexus.configured_owner_id()
+                  AND nexus.current_actor_type() = 'owner'
+                  THEN nexus.current_owner_id()
+              END AS authenticated_owner_id
+       FROM nexus.core_runs
+       WHERE id = $1
+       FOR UPDATE`,
+      [run.id],
+    );
+    const existingRow = existingResult.rows[0];
+    if (
+      !existingRow ||
+      !existingRow.authenticated_owner_id ||
+      existingRow.owner_id !== existingRow.authenticated_owner_id
+    ) {
+      throw new Error("Execution not found or not accessible");
+    }
     const existing = mapRun(existingRow, await getAssistantIds(run.id));
 
     const sameIdentity =
@@ -214,10 +276,10 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
       Date.parse(existing.createdAt) === Date.parse(run.createdAt);
     if (!sameIdentity) throw new Error("Execution identity fields are immutable");
 
-    if (isDeepStrictEqual(existing, run)) return existing;
-    if (["succeeded", "partial", "failed", "cancelled"].includes(existing.status)) {
-      throw new Error("Terminal executions are immutable");
+    if (terminalRunStatuses.has(existing.status)) {
+      throw new Error(`Terminal executions are immutable (status: ${existing.status})`);
     }
+    if (isDeepStrictEqual(existing, run)) return existing;
     if (existing.status !== run.status) {
       runTransitionSchema.parse({ from: existing.status, to: run.status });
     }
@@ -331,8 +393,9 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
     update: updateInternal,
 
     async complete(runId, completion): Promise<CoreRun> {
-      const existing = await getById(runId);
-      if (!existing) throw new Error("Execution not found or not accessible");
+      const existingRow = await getRunRow(runId, true);
+      if (!existingRow) throw new Error("Execution not found or not accessible");
+      const existing = mapRun(existingRow, await getAssistantIds(runId));
       const finishedAt = completion.finishedAt ?? new Date().toISOString();
       return updateInternal({
         ...existing,
@@ -344,8 +407,9 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
     },
 
     async fail(runId, failure = {}): Promise<CoreRun> {
-      const existing = await getById(runId);
-      if (!existing) throw new Error("Execution not found or not accessible");
+      const existingRow = await getRunRow(runId, true);
+      if (!existingRow) throw new Error("Execution not found or not accessible");
+      const existing = mapRun(existingRow, await getAssistantIds(runId));
       const finishedAt = failure.finishedAt ?? new Date().toISOString();
       return updateInternal({
         ...existing,
@@ -358,122 +422,191 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
 
     async appendStep(rawStep: RunStep): Promise<RunStep> {
       const step = runStepSchema.parse(rawStep);
-      await requireRun(step.runId, step.userId);
-      const assistant = await client.query(
-        `SELECT assistant.id
-         FROM nexus.assistants AS assistant
-         JOIN nexus.assistant_config_versions AS version
-           ON version.assistant_id = assistant.id
-         WHERE assistant.id = $1
-           AND assistant.assistant_key = $2
-           AND version.config_version = $3`,
-        [step.assistant.assistantId, step.assistant.assistantKey, step.assistant.configVersion],
-      );
-      if (!assistant.rows[0]) {
-        throw new Error("RunStep assistant reference does not match the assistant catalog");
-      }
-      await client.query(
-        `INSERT INTO nexus.run_steps (
-           id, owner_id, run_id, step_order, assistant_id, assistant_config_version,
-           status, objective, input_reference_ids, result_id, started_at, finished_at, metadata
-         ) VALUES (
-           $1, nexus.current_owner_id(), $2, $3, $4, $5,
-           $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb
-         )`,
-        [
-          step.id,
-          step.runId,
-          step.order,
-          step.assistant.assistantId,
-          step.assistant.configVersion,
-          step.status,
-          step.objective,
-          JSON.stringify(step.inputReferenceIds),
-          step.resultId ?? null,
-          step.startedAt ?? null,
-          step.finishedAt ?? null,
-          JSON.stringify(step.metadata ?? {}),
-        ],
-      );
-      const persisted = (await listSteps(step.runId)).find((item) => item.id === step.id);
-      if (!persisted) throw new Error("Failed to load execution step after append");
-      return persisted;
+      await lockMutableRun(step.runId, step.userId);
+      return withStatementSavepoint(async () => {
+        const assistant = await client.query(
+          `SELECT assistant.id
+           FROM nexus.assistants AS assistant
+           JOIN nexus.assistant_config_versions AS version
+             ON version.assistant_id = assistant.id
+           WHERE assistant.id = $1
+             AND assistant.assistant_key = $2
+             AND version.config_version = $3`,
+          [step.assistant.assistantId, step.assistant.assistantKey, step.assistant.configVersion],
+        );
+        if (!assistant.rows[0]) {
+          throw new Error("RunStep assistant reference does not match the assistant catalog");
+        }
+        await client.query(
+          `INSERT INTO nexus.run_steps (
+             id, owner_id, run_id, step_order, assistant_id, assistant_config_version,
+             status, objective, input_reference_ids, result_id, started_at, finished_at, metadata
+           ) VALUES (
+             $1, nexus.current_owner_id(), $2, $3, $4, $5,
+             $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb
+           )`,
+          [
+            step.id,
+            step.runId,
+            step.order,
+            step.assistant.assistantId,
+            step.assistant.configVersion,
+            step.status,
+            step.objective,
+            JSON.stringify(step.inputReferenceIds),
+            step.resultId ?? null,
+            step.startedAt ?? null,
+            step.finishedAt ?? null,
+            JSON.stringify(step.metadata ?? {}),
+          ],
+        );
+        const persisted = (await listSteps(step.runId)).find((item) => item.id === step.id);
+        if (!persisted) throw new Error("Failed to load execution step after append");
+        return persisted;
+      });
     },
 
     listSteps,
 
     async recordToolEvent(rawEvent: ToolEvent): Promise<ToolEvent> {
       const event = toolEventSchema.parse(rawEvent);
-      await requireRun(event.runId, event.userId);
-      await client.query(
-        `INSERT INTO nexus.tool_events (
-           id, owner_id, run_id, step_id, tool_id, tool_version, event_type, status,
-           normalized_data, references_data, origin, occurred_at, format_version, metadata
-         ) VALUES (
-           $1, nexus.current_owner_id(), $2, $3, $4, '1', $5, $6,
-           $7::jsonb, $8::jsonb, $9, $10, $11, $12::jsonb
-         )`,
-        [
-          event.id,
-          event.runId,
-          event.stepId ?? null,
-          event.tool,
-          event.eventType,
-          event.status,
-          JSON.stringify(event.normalizedData),
-          JSON.stringify(event.references),
-          event.origin,
-          event.occurredAt,
-          event.formatVersion,
-          JSON.stringify(event.metadata ?? {}),
-        ],
-      );
-      const persisted = (await listToolEvents(event.runId)).find((item) => item.id === event.id);
-      if (!persisted) throw new Error("Failed to load tool event after append");
-      return persisted;
+      await lockMutableRun(event.runId, event.userId);
+      return withStatementSavepoint(async () => {
+        await client.query(
+          `INSERT INTO nexus.tool_events (
+             id, owner_id, run_id, step_id, tool_id, tool_version, event_type, status,
+             normalized_data, references_data, origin, occurred_at, format_version, metadata
+           ) VALUES (
+             $1, nexus.current_owner_id(), $2, $3, $4, '1', $5, $6,
+             $7::jsonb, $8::jsonb, $9, $10, $11, $12::jsonb
+           )`,
+          [
+            event.id,
+            event.runId,
+            event.stepId ?? null,
+            event.tool,
+            event.eventType,
+            event.status,
+            JSON.stringify(event.normalizedData),
+            JSON.stringify(event.references),
+            event.origin,
+            event.occurredAt,
+            event.formatVersion,
+            JSON.stringify(event.metadata ?? {}),
+          ],
+        );
+        const persisted = (await listToolEvents(event.runId)).find((item) => item.id === event.id);
+        if (!persisted) throw new Error("Failed to load tool event after append");
+        return persisted;
+      });
     },
 
     listToolEvents,
 
     async recordResult(rawResult: RunResult): Promise<RunResult> {
       const result = runResultSchema.parse(rawResult);
-      await requireRun(result.runId, result.userId);
-      await client.query(
-        `INSERT INTO nexus.run_results (
-           id, owner_id, run_id, step_id, status, content, references_data,
-           format_version, created_at, metadata
-         ) VALUES (
-           $1, nexus.current_owner_id(), $2, $3, $4, $5::jsonb, $6::jsonb,
-           $7, $8, $9::jsonb
-         )`,
-        [
-          result.id,
-          result.runId,
-          result.stepId ?? null,
-          result.status,
-          JSON.stringify(result.content),
-          JSON.stringify(result.references),
-          result.formatVersion,
-          result.createdAt,
-          JSON.stringify(result.metadata ?? {}),
-        ],
-      );
+      await lockMutableRun(result.runId, result.userId);
 
-      if (result.stepId) {
-        const linked = await client.query(
-          `UPDATE nexus.run_steps SET result_id = $3
-           WHERE run_id = $1 AND id = $2 AND (result_id IS NULL OR result_id = $3)
-           RETURNING id`,
-          [result.runId, result.stepId, result.id],
+      return withStatementSavepoint(async () => {
+        if (!result.stepId) {
+          const inserted = await client.query<RunResultRow>(
+            `INSERT INTO nexus.run_results (
+               id, owner_id, run_id, step_id, status, content, references_data,
+               format_version, created_at, metadata
+             ) VALUES (
+               $1, nexus.current_owner_id(), $2, NULL, $3, $4::jsonb, $5::jsonb,
+               $6, $7, $8::jsonb
+             )
+             RETURNING id, owner_id, run_id, step_id, status, content, references_data,
+                       format_version, created_at, metadata`,
+            [
+              result.id,
+              result.runId,
+              result.status,
+              JSON.stringify(result.content),
+              JSON.stringify(result.references),
+              result.formatVersion,
+              result.createdAt,
+              JSON.stringify(result.metadata ?? {}),
+            ],
+          );
+          const row = inserted.rows[0];
+          if (!row) throw new Error("Failed to load execution result after append");
+          return mapResult(row);
+        }
+
+        const linkedInsert = await client.query<
+          Partial<RunResultRow> & {
+            matched_steps: number;
+            linked_steps: number;
+          }
+        >(
+          `WITH target_step AS (
+             SELECT id, result_id
+             FROM nexus.run_steps
+             WHERE run_id = $2
+               AND id = $3
+               AND owner_id = nexus.current_owner_id()
+             FOR UPDATE
+           ),
+           linked_step AS (
+             UPDATE nexus.run_steps AS step
+             SET result_id = $1
+             FROM target_step
+             WHERE step.run_id = $2
+               AND step.id = target_step.id
+               AND target_step.result_id IS NULL
+             RETURNING step.id
+           ),
+           inserted_result AS (
+             INSERT INTO nexus.run_results (
+               id, owner_id, run_id, step_id, status, content, references_data,
+               format_version, created_at, metadata
+             )
+             SELECT
+               $1, nexus.current_owner_id(), $2, linked_step.id, $4, $5::jsonb, $6::jsonb,
+               $7, $8, $9::jsonb
+             FROM linked_step
+             RETURNING id, owner_id, run_id, step_id, status, content, references_data,
+                       format_version, created_at, metadata
+           )
+           SELECT
+             (SELECT count(*)::int FROM target_step) AS matched_steps,
+             (SELECT count(*)::int FROM linked_step) AS linked_steps,
+             inserted_result.id,
+             inserted_result.owner_id,
+             inserted_result.run_id,
+             inserted_result.step_id,
+             inserted_result.status,
+             inserted_result.content,
+             inserted_result.references_data,
+             inserted_result.format_version,
+             inserted_result.created_at,
+             inserted_result.metadata
+           FROM (SELECT 1) AS anchor
+           LEFT JOIN inserted_result ON true`,
+          [
+            result.id,
+            result.runId,
+            result.stepId,
+            result.status,
+            JSON.stringify(result.content),
+            JSON.stringify(result.references),
+            result.formatVersion,
+            result.createdAt,
+            JSON.stringify(result.metadata ?? {}),
+          ],
         );
-        if (!linked.rows[0]) {
+
+        const outcome = linkedInsert.rows[0];
+        if (!outcome || outcome.matched_steps === 0) {
+          throw new Error("Execution step not found in this execution");
+        }
+        if (outcome.linked_steps === 0 || !outcome.id) {
           throw new Error("Execution step is already linked to a different result");
         }
-      }
-
-      const persisted = (await listResults(result.runId)).find((item) => item.id === result.id);
-      if (!persisted) throw new Error("Failed to load execution result after append");
-      return persisted;
+        return mapResult(outcome as RunResultRow);
+      });
     },
 
     listResults,
