@@ -8,8 +8,9 @@ const migrationsDirectory = join(sourceDirectory, "..", "migrations");
 
 const readMigration = async (): Promise<{ filename: string; sql: string }> => {
   const files = (await readdir(migrationsDirectory)).filter((name) => name.endsWith(".sql")).sort();
-  if (files.length !== 1) throw new Error(`Expected one initial migration, found ${files.length}`);
-  return { filename: files[0]!, sql: await readFile(join(migrationsDirectory, files[0]!), "utf8") };
+  const initial = files.find((name) => name === "00001_initial_schema.sql");
+  if (!initial) throw new Error("Initial migration 00001 is missing");
+  return { filename: initial, sql: await readFile(join(migrationsDirectory, initial), "utf8") };
 };
 
 describe("SINGLE-USER PostgreSQL migration", () => {

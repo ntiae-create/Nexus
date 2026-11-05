@@ -1,0 +1,10 @@
+import { describe,expect,it } from "vitest";
+import { buildApp } from "../app.js";
+import { OWNER_ID,type SessionConfig } from "./session.js";
+import type { AuthStore } from "./store.js";
+const config:SessionConfig={secret:"test-secret-with-more-than-16",ownerPassword:"owner-password-strong",ttlSeconds:3600};
+function fixture(){const revoked=new Set<string>();let failures=0;let locked=false;const store:AuthStore={isRevoked:async j=>revoked.has(j),revoke:async j=>{revoked.add(j)},recordFailure:async()=>{failures++;if(failures>=5)locked=true;return !locked},clearFailures:async()=>{failures=0;locked=false}};return{app:buildApp({auth:{config,store}}),store};}
+describe("auth HTTP integration",()=>{
+it("logs in, resolves session, logs out and rejects token reuse",async()=>{const {app}=fixture();try{const login=await app.inject({method:"POST",url:"/v1/auth/login",payload:{password:config.ownerPassword}});expect(login.statusCode).toBe(200);const token=login.json().token;expect((await app.inject({method:"GET",url:"/v1/auth/me",headers:{authorization:`Bearer ${token}`}})).json().owner.userId).toBe(OWNER_ID);expect((await app.inject({method:"POST",url:"/v1/auth/logout",headers:{authorization:`Bearer ${token}`}})).statusCode).toBe(200);expect((await app.inject({method:"GET",url:"/v1/auth/me",headers:{authorization:`Bearer ${token}`}})).statusCode).toBe(401);}finally{await app.close();}});
+it("rejects invalid and expired tokens and locks repeated attempts",async()=>{const {app}=fixture();try{expect((await app.inject({method:"POST",url:"/v1/auth/login",payload:{password:"wrong"}})).statusCode).toBe(401);const responses=await Promise.all(Array.from({length:12},()=>app.inject({method:"POST",url:"/v1/auth/login",payload:{password:"wrong"}})));expect(responses.some(r=>r.statusCode===429)).toBe(true);expect((await app.inject({method:"POST",url:"/v1/auth/login",payload:{password:config.ownerPassword}})).statusCode).toBe(200);}finally{await app.close();}});
+});

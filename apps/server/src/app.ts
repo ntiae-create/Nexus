@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { healthResponseSchema } from "@nexus/shared";
+import { authPlugin, type AuthPluginOptions } from "./auth/plugin.js";
 
 export type DatabaseReadinessProbe = () => Promise<void>;
 
@@ -10,10 +11,12 @@ export interface BuildAppOptions {
    * Must not leak connection strings or credentials in thrown errors that reach clients.
    */
   checkDatabase?: DatabaseReadinessProbe;
+  auth?: AuthPluginOptions;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: true });
+  void app.register(authPlugin, options.auth ?? {});
 
   app.get("/v1/health", async () =>
     healthResponseSchema.parse({ status: "ok" }),
