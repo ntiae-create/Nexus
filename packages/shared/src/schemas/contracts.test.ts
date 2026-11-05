@@ -67,7 +67,9 @@ describe("messages and executions", () => {
       formatVersion: 1, createdAt: now,
     };
     expect(messageSchema.safeParse(message).success).toBe(true);
-    expect(messageSchema.safeParse({ ...message, assistantId: ids.assistant, updatedAt: now }).success).toBe(true);
+    expect(messageSchema.safeParse({ ...message, assistantId: ids.assistant, updatedAt: now }).success).toBe(false);
+    expect(messageSchema.safeParse({ ...message, role: "assistant", assistantId: ids.assistant, updatedAt: now }).success).toBe(true);
+    expect(messageSchema.safeParse({ ...message, role: "assistant" }).success).toBe(false);
     expect(messageSchema.safeParse({ ...message, sequence: -1 }).success).toBe(false);
     expect(messageSchema.safeParse({ ...message, createdAt: "yesterday" }).success).toBe(false);
     expect(messageSchema.safeParse({ ...message, role: "provider-message" }).success).toBe(false);

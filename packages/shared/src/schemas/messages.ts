@@ -24,6 +24,21 @@ export const messageSchema = z.object({
   createdAt: timestampSchema,
   updatedAt: timestampSchema.optional(),
   metadata: jsonObjectSchema.optional(),
+}).superRefine((message, ctx) => {
+  if (message.role === "assistant" && !message.assistantId) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["assistantId"],
+      message: "Assistant messages require their author's assistantId",
+    });
+  }
+  if (message.role !== "assistant" && message.assistantId) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["assistantId"],
+      message: "Only assistant messages may have an assistant author",
+    });
+  }
 });
 
 export const sendMessageSchema = z.object({
@@ -34,8 +49,14 @@ export const sendMessageSchema = z.object({
   metadata: jsonObjectSchema.optional(),
 });
 
+export const appendAssistantMessageSchema = sendMessageSchema.extend({
+  assistantId: uuidSchema,
+  runId: uuidSchema.optional(),
+});
+
 export type MessageRole = z.infer<typeof messageRoleSchema>;
 export type MessageStatus = z.infer<typeof messageStatusSchema>;
 export type MessageContentPart = z.infer<typeof messageContentPartSchema>;
 export type Message = z.infer<typeof messageSchema>;
 export type SendMessage = z.infer<typeof sendMessageSchema>;
+export type AppendAssistantMessage = z.infer<typeof appendAssistantMessageSchema>;

@@ -1,4 +1,5 @@
 import type {
+  AppendAssistantMessage,
   AssistantMemory,
   AssistantReference,
   CoreRun,
@@ -9,6 +10,7 @@ import type {
   MemoryPermission,
   Message,
   ProviderPreferenceSet,
+  ProviderSelection,
   RunResult,
   RunStep,
   SendMessage,
@@ -40,14 +42,36 @@ export interface ConversationRepository {
 
 export interface MessageRepository {
   list(conversationId: Conversation["id"], afterSequence?: number): Promise<readonly Message[]>;
+  /** Appends a user-authored message. Client-supplied assistant authorship is rejected. */
   append(conversationId: Conversation["id"], input: SendMessage): Promise<Message>;
+  /** Appends an assistant-authored message through a trusted backend operation. */
+  appendAssistant(
+    conversationId: Conversation["id"],
+    input: AppendAssistantMessage,
+  ): Promise<Message>;
+}
+
+export interface CompleteExecution {
+  readonly finalMessageId: Message["id"];
+  readonly finishedAt?: string;
+}
+
+export interface FailExecution {
+  readonly finalMessageId?: Message["id"];
+  readonly finishedAt?: string;
 }
 
 export interface ExecutionRepository {
   getById(runId: CoreRun["id"]): Promise<CoreRun | null>;
   create(run: CoreRun): Promise<CoreRun>;
+  /** Updates mutable execution data while preserving its immutable identity. */
+  update(run: CoreRun): Promise<CoreRun>;
+  complete(runId: CoreRun["id"], completion: CompleteExecution): Promise<CoreRun>;
+  fail(runId: CoreRun["id"], failure?: FailExecution): Promise<CoreRun>;
   appendStep(step: RunStep): Promise<RunStep>;
+  listSteps(runId: CoreRun["id"]): Promise<readonly RunStep[]>;
   recordToolEvent(event: ToolEvent): Promise<ToolEvent>;
+  listToolEvents(runId: CoreRun["id"]): Promise<readonly ToolEvent[]>;
   recordResult(result: RunResult): Promise<RunResult>;
   listResults(runId: CoreRun["id"]): Promise<readonly RunResult[]>;
 }
@@ -72,8 +96,26 @@ export interface MemoryRepository {
   listPermissionAudit(memoryId: AssistantMemory["id"]): Promise<readonly MemoryPermissionAuditEvent[]>;
 }
 
+export interface ResolveProviderPreference {
+  readonly assistantId: AssistantReference["assistantId"];
+  readonly conversationId?: Conversation["id"];
+}
+
 export interface ProviderPreferenceRepository {
   getAll(): Promise<ProviderPreferenceSet>;
+  resolve(context: ResolveProviderPreference): Promise<ProviderSelection>;
+  setGlobal(selection: ProviderSelection): Promise<ProviderPreferenceSet["global"]>;
+  setAssistant(
+    assistantId: AssistantReference["assistantId"],
+    selection: ProviderSelection,
+  ): Promise<ProviderPreferenceSet["byAssistant"][number]>;
+  setConversation(
+    conversationId: Conversation["id"],
+    selection: ProviderSelection,
+  ): Promise<ProviderPreferenceSet["byConversation"][number]>;
+  clearAssistant(assistantId: AssistantReference["assistantId"]): Promise<void>;
+  clearConversation(conversationId: Conversation["id"]): Promise<void>;
+  /** Explicit full replacement. Prefer scoped setters for concurrent updates. */
   replaceAll(preferences: ProviderPreferenceSet): Promise<ProviderPreferenceSet>;
 }
 
@@ -92,8 +134,8 @@ export interface NexusRepositories {
 }
 
 /**
- * Contract for a future PostgreSQL transaction runner. An implementation must
- * bind RLS settings transaction-locally before constructing these repositories.
+ * PostgreSQL transaction runner. Implementations bind RLS settings
+ * transaction-locally before constructing these repositories.
  */
 export interface NexusDatabase {
   withOwnerTransaction<T>(
