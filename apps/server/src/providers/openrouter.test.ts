@@ -104,22 +104,65 @@ describe("OpenRouter free-eligibility & pricing verifier", () => {
   });
 
   it("verifies zero pricing fail-closed across prompt, completion, and auxiliary price fields", () => {
+    // Absent additional dimensions -> zero_confirmed
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+      }).status,
+    ).toBe("zero_confirmed");
+
+    // All dimensions present and equal to zero -> zero_confirmed
     expect(
       verifyOpenRouterPricing({
         prompt: "0",
         completion: "0",
         request: "0",
         image: "0.000000",
+        web_search: "0",
+        internal_reasoning: 0,
+        input_cache_read: "0",
+        input_cache_write: 0,
       }).status,
     ).toBe("zero_confirmed");
 
+    // Explicit null on any additional dimension -> unverifiable
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        image: null,
+      }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        web_search: null,
+      }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        internal_reasoning: null,
+      }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        request: null,
+      }).status,
+    ).toBe("unverifiable");
+
+    // Positive price on mandatory or additional dimensions -> paid
     expect(
       verifyOpenRouterPricing({
         prompt: "0",
         completion: "0.000001",
       }).status,
     ).toBe("paid");
-
     expect(
       verifyOpenRouterPricing({
         prompt: "0",
@@ -127,15 +170,74 @@ describe("OpenRouter free-eligibility & pricing verifier", () => {
         request: "0.01",
       }).status,
     ).toBe("paid");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        image: "0.002",
+      }).status,
+    ).toBe("paid");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        web_search: "0.005",
+      }).status,
+    ).toBe("paid");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        internal_reasoning: "0.0004",
+      }).status,
+    ).toBe("paid");
 
-    expect(verifyOpenRouterPricing(null).status).toBe("unverifiable");
-    expect(verifyOpenRouterPricing({}).status).toBe("unverifiable");
-    expect(verifyOpenRouterPricing({ prompt: "0" }).status).toBe("unverifiable");
+    // Negative values on mandatory or additional dimensions -> unverifiable
     expect(
       verifyOpenRouterPricing({ prompt: "-1", completion: "-1" }).status,
     ).toBe("unverifiable");
     expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        internal_reasoning: "-1",
+      }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        web_search: -0.001,
+      }).status,
+    ).toBe("unverifiable");
+
+    // Non-numeric / missing mandatory fields -> unverifiable
+    expect(verifyOpenRouterPricing(null).status).toBe("unverifiable");
+    expect(verifyOpenRouterPricing({}).status).toBe("unverifiable");
+    expect(verifyOpenRouterPricing({ prompt: "0" }).status).toBe("unverifiable");
+    expect(
       verifyOpenRouterPricing({ prompt: "free", completion: "0" }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        web_search: "TBD",
+      }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        image: "NaN",
+      }).status,
+    ).toBe("unverifiable");
+    expect(
+      verifyOpenRouterPricing({
+        prompt: "0",
+        completion: "0",
+        internal_reasoning: {},
+      }).status,
     ).toBe("unverifiable");
   });
 
@@ -372,6 +474,145 @@ describe("OpenRouterAdapter", () => {
     });
 
     expect(completionCalled).toBe(false);
+  });
+
+  it("blocks generation for auxiliary pricing dimensions that are null, negative, non-numeric, or positive, while allowing absent or all-zero dimensions", async () => {
+    const blockedModelsCatalog = [
+      {
+        id: "vendor/null-image:free",
+        pricing: { prompt: "0", completion: "0", image: null },
+      },
+      {
+        id: "vendor/null-web-search:free",
+        pricing: { prompt: "0", completion: "0", web_search: null },
+      },
+      {
+        id: "vendor/null-reasoning:free",
+        pricing: { prompt: "0", completion: "0", internal_reasoning: null },
+      },
+      {
+        id: "vendor/positive-aux:free",
+        pricing: { prompt: "0", completion: "0", web_search: "0.002" },
+      },
+      {
+        id: "vendor/negative-aux:free",
+        pricing: { prompt: "0", completion: "0", internal_reasoning: "-1" },
+      },
+      {
+        id: "vendor/non-numeric-aux:free",
+        pricing: { prompt: "0", completion: "0", image: "not-a-number" },
+      },
+      {
+        id: "vendor/absent-aux:free",
+        pricing: { prompt: "0", completion: "0" },
+      },
+      {
+        id: "vendor/all-zero-aux:free",
+        pricing: {
+          prompt: "0",
+          completion: "0",
+          request: "0",
+          image: "0",
+          web_search: "0",
+          internal_reasoning: "0",
+        },
+      },
+    ];
+
+    let completionCallModels: string[] = [];
+    const fetchFn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return jsonResponse({ data: blockedModelsCatalog });
+      }
+      if (url.endsWith("/chat/completions")) {
+        const parsedBody = JSON.parse(String(init?.body)) as { model: string };
+        completionCallModels.push(parsedBody.model);
+        return jsonResponse({
+          id: `gen-${parsedBody.model}`,
+          model: parsedBody.model,
+          choices: [
+            {
+              index: 0,
+              finish_reason: "stop",
+              message: { role: "assistant", content: "OK" },
+            },
+          ],
+          usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost: 0 },
+        });
+      }
+      return jsonResponse({ error: { message: "Unexpected" } }, 404);
+    }) as unknown as typeof fetch;
+
+    const adapter = createOpenRouterAdapter({
+      apiKey: FAKE_TEST_CREDENTIAL,
+      fetchFn,
+      now: () => FIXED_NOW_MS,
+    });
+
+    // 1–3. Null auxiliary dimensions -> UNVERIFIED_PRICING_BLOCKED, zero completion calls
+    for (const model of [
+      "vendor/null-image:free",
+      "vendor/null-web-search:free",
+      "vendor/null-reasoning:free",
+    ]) {
+      await expect(
+        adapter.generate({
+          model,
+          messages: [{ role: "user", content: "Ping" }],
+        }),
+      ).rejects.toMatchObject({
+        code: "UNVERIFIED_PRICING_BLOCKED",
+        statusCode: 403,
+      });
+    }
+
+    // 4. Positive auxiliary dimension -> PAID_MODEL_BLOCKED
+    await expect(
+      adapter.generate({
+        model: "vendor/positive-aux:free",
+        messages: [{ role: "user", content: "Ping" }],
+      }),
+    ).rejects.toMatchObject({
+      code: "PAID_MODEL_BLOCKED",
+      statusCode: 403,
+    });
+
+    // 5–6. Negative and non-numeric auxiliary dimensions -> UNVERIFIED_PRICING_BLOCKED
+    for (const model of [
+      "vendor/negative-aux:free",
+      "vendor/non-numeric-aux:free",
+    ]) {
+      await expect(
+        adapter.generate({
+          model,
+          messages: [{ role: "user", content: "Ping" }],
+        }),
+      ).rejects.toMatchObject({
+        code: "UNVERIFIED_PRICING_BLOCKED",
+        statusCode: 403,
+      });
+    }
+
+    expect(completionCallModels).toEqual([]);
+
+    // 7–8. Absent auxiliary dimensions and all-zero auxiliary dimensions -> allowed
+    const absentRes = await adapter.generate({
+      model: "vendor/absent-aux:free",
+      messages: [{ role: "user", content: "Ping" }],
+    });
+    expect(absentRes.content).toBe("OK");
+
+    const allZeroRes = await adapter.generate({
+      model: "vendor/all-zero-aux:free",
+      messages: [{ role: "user", content: "Ping" }],
+    });
+    expect(allZeroRes.content).toBe("OK");
+
+    expect(completionCallModels).toEqual([
+      "vendor/absent-aux:free",
+      "vendor/all-zero-aux:free",
+    ]);
   });
 
   it("fails explicitly when a ':free' model is unavailable or missing from live catalog", async () => {

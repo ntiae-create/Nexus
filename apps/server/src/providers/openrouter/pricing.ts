@@ -80,11 +80,14 @@ export type OpenRouterPricingVerification =
 /**
  * Verifies OpenRouter pricing fail-closed:
  * - Both `prompt` and `completion` MUST be present and strictly equal to 0.
- * - Every other present non-nullish pricing field (`request`, `image`,
- *   `web_search`, `internal_reasoning`, cache fees, etc.) MUST also parse as 0.
- * - Any positive price immediately classifies the model as `paid`.
- * - Missing, negative (e.g. "-1" dynamic pricing), NaN, or non-numeric fields
- *   classify the model as `unverifiable`.
+ * - Absent additional pricing dimensions (keys not present in `pricing`) are ignored.
+ * - Every additional dimension present in `pricing` (`request`, `image`,
+ *   `web_search`, `internal_reasoning`, cache fees, etc.) MUST be finite,
+ *   numeric, and strictly equal to 0.
+ * - Any present dimension with `null`, invalid string, non-numeric value,
+ *   NaN/Infinity, or negative value (e.g. "-1" dynamic pricing) classifies the
+ *   model as `unverifiable` and blocks eligibility.
+ * - Any positive price (> 0) immediately classifies the model as `paid`.
  */
 export function verifyOpenRouterPricing(
   pricing: Record<string, unknown> | null | undefined,
@@ -98,17 +101,30 @@ export function verifyOpenRouterPricing(
     };
   }
 
-  const promptParsed = parseNonNegativePrice(pricing.prompt);
-  const completionParsed = parseNonNegativePrice(pricing.completion);
-  const requestParsed =
-    pricing.request === undefined || pricing.request === null
-      ? { valid: true as const, value: 0 }
-      : parseNonNegativePrice(pricing.request);
+  const hasPrompt =
+    Object.prototype.hasOwnProperty.call(pricing, "prompt") &&
+    pricing.prompt !== undefined;
+  const hasCompletion =
+    Object.prototype.hasOwnProperty.call(pricing, "completion") &&
+    pricing.completion !== undefined;
+  const hasRequest =
+    Object.prototype.hasOwnProperty.call(pricing, "request") &&
+    pricing.request !== undefined;
+
+  const promptParsed = hasPrompt
+    ? parseNonNegativePrice(pricing.prompt)
+    : ({ valid: false } as const);
+  const completionParsed = hasCompletion
+    ? parseNonNegativePrice(pricing.completion)
+    : ({ valid: false } as const);
+  const requestParsed = hasRequest
+    ? parseNonNegativePrice(pricing.request)
+    : undefined;
 
   const promptSummary = promptParsed.valid ? promptParsed.value : null;
   const completionSummary = completionParsed.valid ? completionParsed.value : null;
   const requestSummary =
-    pricing.request === undefined || pricing.request === null
+    requestParsed === undefined
       ? null
       : requestParsed.valid
         ? requestParsed.value
@@ -117,9 +133,6 @@ export function verifyOpenRouterPricing(
   let sawUnparseable = false;
 
   for (const [, rawValue] of Object.entries(pricing)) {
-    if (rawValue === undefined || rawValue === null) {
-      continue;
-    }
     const parsed = parseNonNegativePrice(rawValue);
     if (!parsed.valid) {
       sawUnparseable = true;
