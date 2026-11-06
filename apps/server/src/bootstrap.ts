@@ -4,6 +4,11 @@ import {
   createServerDatabase,
   type PostgresNexusDatabase,
 } from "./database.js";
+import {
+  createDefaultProviderRuntime,
+  type ProviderRuntimeEnv,
+} from "./providers/index.js";
+import { createDatabasePreferenceReader } from "./routes/providers.js";
 
 export class BootstrapError extends Error {
   readonly code: "MISSING_DATABASE_URL" | "DATABASE_UNAVAILABLE" | "LISTEN_FAILED";
@@ -27,7 +32,7 @@ export class BootstrapError extends Error {
   }
 }
 
-export interface BootstrapEnv {
+export interface BootstrapEnv extends ProviderRuntimeEnv {
   NEXUS_DATABASE_URL?: string;
   PORT?: string;
 }
@@ -62,18 +67,28 @@ export function createServerlessApp(
   const build =
     deps.buildApp ?? ((options?: BuildAppOptions) => buildApp(options));
   let db: PostgresNexusDatabase | undefined;
+  const getOrCreateDb = (): PostgresNexusDatabase => {
+    const connectionString = env.NEXUS_DATABASE_URL?.trim();
+    if (!connectionString) {
+      throw new BootstrapError(
+        "MISSING_DATABASE_URL",
+        "NEXUS_DATABASE_URL is required to connect to PostgreSQL",
+      );
+    }
+    db ??= createDatabase(connectionString);
+    return db;
+  };
+
+  const providerRuntime = createDefaultProviderRuntime({ env });
 
   const app = build({
     checkDatabase: async () => {
-      const connectionString = env.NEXUS_DATABASE_URL?.trim();
-      if (!connectionString) {
-        throw new BootstrapError(
-          "MISSING_DATABASE_URL",
-          "NEXUS_DATABASE_URL is required to connect to PostgreSQL",
-        );
-      }
-      db ??= createDatabase(connectionString);
-      await db.checkConnectivity();
+      await getOrCreateDb().checkConnectivity();
+    },
+    providers: {
+      runtime: providerRuntime,
+      env,
+      readPreferences: createDatabasePreferenceReader(getOrCreateDb),
     },
   });
 
@@ -173,8 +188,14 @@ export async function bootstrapServer(
 
   const app = await (async (): Promise<FastifyInstance> => {
     try {
+      const providerRuntime = createDefaultProviderRuntime({ env });
       const builtApp = build({
         checkDatabase: () => db!.checkConnectivity(),
+        providers: {
+          runtime: providerRuntime,
+          env,
+          readPreferences: createDatabasePreferenceReader(() => db!),
+        },
       });
       builtApp.addHook("onClose", async () => {
         await closePool();

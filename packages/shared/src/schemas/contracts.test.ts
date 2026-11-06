@@ -5,6 +5,9 @@ import {
   assistantProviderPreferenceSchema,
   conversationProviderPreferenceSchema,
   coreRunSchema,
+  effectiveModelSelectionResponseSchema,
+  eligibleModelsResponseSchema,
+  freeEligibilitySchema,
   initialAssistantKeySchema,
   initialAssistantProfileSchema,
   incrementalSyncRequestSchema,
@@ -13,10 +16,15 @@ import {
   memoryAccessRequestSchema,
   memoryPermissionSchema,
   messageSchema,
+  modelGenerationRequestSchema,
+  modelGenerationResponseSchema,
   modelSchema,
   providerPreferencePolicySchema,
   providerSchema,
+  providersListResponseSchema,
+  publicCapabilitiesResponseSchema,
   resolveProviderSelection,
+  resolveProviderSelectionWithScope,
   runResultSchema,
   runTransitionSchema,
   syncCursorSchema,
@@ -198,5 +206,194 @@ describe("sync and API errors", () => {
       timestamp: now,
     }).success).toBe(true);
     expect(apiErrorSchema.safeParse({ error: { message: "missing fields" }, timestamp: now }).success).toBe(false);
+  });
+
+  it("enforces vendor-independent provider, free-eligibility, generation, and selection contracts", () => {
+    const validFree = {
+      eligible: true,
+      costStatus: "free_confirmed" as const,
+      verifiedAt: now,
+      requiresPreCallVerification: true as const,
+      reason: "verified_free" as const,
+      pricingSummary: {
+        promptPerToken: 0,
+        completionPerToken: 0,
+        requestFixed: 0,
+      },
+    };
+    expect(freeEligibilitySchema.safeParse(validFree).success).toBe(true);
+    expect(
+      freeEligibilitySchema.safeParse({
+        ...validFree,
+        costStatus: "paid",
+      }).success,
+    ).toBe(false);
+    expect(
+      freeEligibilitySchema.safeParse({
+        ...validFree,
+        reason: "paid_model",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      modelGenerationRequestSchema.safeParse({
+        model: "meta-llama/llama-3.3-70b-instruct:free",
+        messages: [{ role: "user", content: "Hello" }],
+        parameters: { temperature: 0.4, maxOutputTokens: 256 },
+      }).success,
+    ).toBe(true);
+
+    expect(
+      modelGenerationResponseSchema.safeParse({
+        id: "gen-123",
+        providerId: ids.provider,
+        providerKey: "openrouter",
+        modelId: ids.model,
+        modelKey: "meta-llama/llama-3.3-70b-instruct:free",
+        content: "Normalized answer",
+        finishReason: "stop",
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        createdAt: now,
+        freeEligibility: validFree,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      providersListResponseSchema.safeParse({
+        providers: [
+          {
+            id: ids.provider,
+            key: "openrouter",
+            name: "OpenRouter",
+            kind: "cloud",
+            configured: true,
+            availability: "available",
+            costPolicy: "free_only",
+            costStatus: "free_confirmed",
+            capabilities: ["chat", "system_prompt"],
+            supportedParameters: ["temperature", "maxOutputTokens"],
+            eligibleModelCount: 1,
+            verifiedAt: now,
+          },
+        ],
+        generatedAt: now,
+      }).success,
+    ).toBe(true);
+
+    const eligibleModel = {
+      id: ids.model,
+      providerId: ids.provider,
+      providerKey: "openrouter",
+      key: "meta-llama/llama-3.3-70b-instruct:free",
+      name: "Llama 3.3 70B Free",
+      availability: "available" as const,
+      capabilities: ["chat" as const, "system_prompt" as const],
+      supportedParameters: ["temperature" as const, "maxOutputTokens" as const],
+      contextWindow: 131072,
+      maxOutputTokens: 8192,
+      freeEligibility: validFree,
+    };
+
+    expect(
+      eligibleModelsResponseSchema.safeParse({
+        models: [eligibleModel],
+        unavailableModels: [],
+        summary: {
+          totalEvaluated: 3,
+          eligibleCount: 1,
+          unavailableFreeCount: 0,
+          blockedPaidCount: 1,
+          blockedUnverifiedCount: 1,
+        },
+        fetchedAt: now,
+        expiresAt: now,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      publicCapabilitiesResponseSchema.safeParse({
+        policy: {
+          costMode: "free_only",
+          paidModelsAllowed: false,
+          paidFallbackAllowed: false,
+          preCallPriceVerificationRequired: true,
+          openRouterFreeSuffix: ":free",
+        },
+        capabilities: [{ key: "chat", description: "Chat generation" }],
+        parameters: [{ key: "temperature", description: "Sampling temperature" }],
+        selectionScopes: ["conversation", "assistant", "global"],
+        selectionModes: ["manual", "automatic"],
+        providers: [
+          {
+            id: ids.provider,
+            key: "openrouter",
+            name: "OpenRouter",
+            kind: "cloud",
+            configured: true,
+            availability: "available",
+            capabilities: ["chat"],
+            supportedParameters: ["temperature"],
+          },
+        ],
+        generatedAt: now,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      effectiveModelSelectionResponseSchema.safeParse({
+        resolvedScope: "assistant",
+        preference: { mode: "automatic" },
+        context: { assistantId: ids.assistant },
+        selectedProvider: {
+          id: ids.provider,
+          key: "openrouter",
+          name: "OpenRouter",
+          kind: "cloud",
+        },
+        selectedModel: eligibleModel,
+        policy: {
+          freeVerified: true,
+          paidFallbackUsed: false,
+        },
+        evaluatedAt: now,
+      }).success,
+    ).toBe(true);
+
+    const prefs = {
+      global: {
+        id: ids.provider,
+        userId: ids.user,
+        selection: { mode: "automatic" as const },
+        updatedAt: now,
+      },
+      byAssistant: [
+        {
+          id: ids.model,
+          userId: ids.user,
+          assistantId: ids.assistant,
+          selection: {
+            mode: "manual" as const,
+            providerId: ids.provider,
+            modelId: ids.model,
+          },
+          updatedAt: now,
+        },
+      ],
+      byConversation: [],
+    };
+    expect(
+      resolveProviderSelectionWithScope(prefs, { assistantId: ids.assistant }),
+    ).toEqual({
+      scope: "assistant",
+      selection: {
+        mode: "manual",
+        providerId: ids.provider,
+        modelId: ids.model,
+      },
+    });
+    expect(resolveProviderSelectionWithScope(prefs, {})).toEqual({
+      scope: "global",
+      selection: { mode: "automatic" },
+    });
   });
 });

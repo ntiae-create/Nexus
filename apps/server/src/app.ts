@@ -1,6 +1,10 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { healthResponseSchema } from "@nexus/shared";
 import { authPlugin, type AuthPluginOptions } from "./auth/plugin.js";
+import {
+  registerProviderRoutes,
+  type ProviderRoutesOptions,
+} from "./routes/providers.js";
 
 export type DatabaseReadinessProbe = () => Promise<void>;
 
@@ -12,11 +16,31 @@ export interface BuildAppOptions {
    */
   checkDatabase?: DatabaseReadinessProbe;
   auth?: AuthPluginOptions;
+  providers?: ProviderRoutesOptions;
+  logger?: boolean;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
-  const app = Fastify({ logger: true });
+  const enableLogger = options.logger ?? true;
+  const app = Fastify({
+    logger: enableLogger
+      ? {
+          redact: {
+            paths: [
+              "req.headers.authorization",
+              "headers.authorization",
+              "*.apiKey",
+              "*.secret",
+              "*.password",
+              "*.token",
+            ],
+            censor: "[REDACTED]",
+          },
+        }
+      : false,
+  });
   void app.register(authPlugin, options.auth ?? {});
+  void registerProviderRoutes(app, options.providers ?? {});
 
   app.get("/v1/health", async () =>
     healthResponseSchema.parse({ status: "ok" }),
