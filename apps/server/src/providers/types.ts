@@ -150,6 +150,7 @@ export class ProviderError extends Error {
   readonly statusCode: number;
   readonly retryable: boolean;
   readonly details?: Record<string, JsonValue>;
+  declare readonly cause?: unknown;
 
   constructor(
     code: ProviderErrorCode,
@@ -159,7 +160,14 @@ export class ProviderError extends Error {
     const secrets = options.redactValues ?? [];
     const safeMessage = redactSecrets(message, secrets);
     const safeCause = sanitizeErrorCause(options.cause, secrets);
-    super(safeMessage, safeCause ? { cause: safeCause } : undefined);
+    super(safeMessage);
+    if (safeCause !== undefined) {
+      Object.defineProperty(this, "cause", {
+        value: safeCause,
+        configurable: true,
+        writable: true,
+      });
+    }
     this.name = "ProviderError";
     this.code = code;
     this.providerKey = options.providerKey;
