@@ -121,4 +121,19 @@ describe("SINGLE-USER PostgreSQL migration", () => {
     expect(sql).toContain("metadata = metadata - 'providerPreference'");
     expect(sql).not.toMatch(/DROP TABLE|ALTER TABLE nexus\.(messages|core_runs)\s+DROP/i);
   });
+
+  it("adds stage 3B parent-child execution hierarchy additively without rewriting earlier migrations", async () => {
+    const sql = await readFile(
+      join(migrationsDirectory, "00004_core_execution_hierarchy.sql"),
+      "utf8",
+    );
+    expect(sql).toContain("ADD COLUMN parent_run_id uuid");
+    expect(sql).toContain("ADD COLUMN parent_step_id uuid");
+    expect(sql).toContain("ADD COLUMN delegation_depth integer");
+    expect(sql).toContain("core_runs_parent_run_same_conversation_fk");
+    expect(sql).toContain("core_runs_parent_step_same_parent_run_fk");
+    expect(sql).toContain("core_runs_delegation_hierarchy_valid");
+    expect(sql).toContain("core_runs_identity_immutable");
+    expect(sql).not.toMatch(/DROP TABLE|ALTER TABLE nexus\.(messages|core_runs)\s+DROP/i);
+  });
 });

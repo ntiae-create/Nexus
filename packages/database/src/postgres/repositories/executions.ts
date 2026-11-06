@@ -22,11 +22,15 @@ interface CoreRunRow {
   status: CoreRun["status"];
   input_message_id: string;
   final_message_id: string | null;
+  parent_run_id: string | null;
+  parent_step_id: string | null;
+  delegation_depth: number;
   trace: CoreRun["trace"];
   format_version: number;
   created_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
+  metadata: CoreRun["metadata"] | null;
 }
 
 interface RunStepRow {
@@ -77,11 +81,16 @@ interface ToolEventRow {
 
 const runColumns = `
   id, owner_id, conversation_id, request_id, idempotency_key, status,
-  input_message_id, final_message_id, trace, format_version,
-  created_at, started_at, finished_at
+  input_message_id, final_message_id, parent_run_id, parent_step_id, delegation_depth,
+  trace, format_version, created_at, started_at, finished_at, metadata
 `;
 
 function mapRun(row: CoreRunRow, assistantIds: string[]): CoreRun {
+  const hasMetadata =
+    row.metadata !== null &&
+    typeof row.metadata === "object" &&
+    Object.keys(row.metadata).length > 0;
+
   return {
     id: row.id,
     userId: row.owner_id,
@@ -93,10 +102,16 @@ function mapRun(row: CoreRunRow, assistantIds: string[]): CoreRun {
     trace: row.trace ?? [],
     inputMessageId: row.input_message_id,
     finalMessageId: row.final_message_id ?? undefined,
+    ...(row.parent_run_id ? { parentRunId: row.parent_run_id } : {}),
+    ...(row.parent_step_id ? { parentStepId: row.parent_step_id } : {}),
+    ...(row.parent_run_id || row.delegation_depth > 0
+      ? { delegationDepth: row.delegation_depth }
+      : {}),
     startedAt: row.started_at?.toISOString(),
     finishedAt: row.finished_at?.toISOString(),
     createdAt: row.created_at.toISOString(),
     formatVersion: row.format_version,
+    ...(hasMetadata ? { metadata: row.metadata! } : {}),
   };
 }
 
@@ -161,6 +176,13 @@ const terminalRunStatuses: ReadonlySet<CoreRun["status"]> = new Set([
   "cancelled",
 ]);
 
+const terminalStepStatuses: ReadonlySet<RunStep["status"]> = new Set([
+  "succeeded",
+  "failed",
+  "skipped",
+  "cancelled",
+]);
+
 export function createExecutionRepository(client: PoolClient): ExecutionRepository {
   let savepointSequence = 0;
 
@@ -196,9 +218,62 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
     return result.rows.map((row) => row.assistant_id);
   };
 
+  const hydrateRows = async (rows: readonly CoreRunRow[]): Promise<readonly CoreRun[]> => {
+    if (rows.length === 0) return [];
+    const runIds = rows.map((row) => row.id);
+    const assistantsResult = await client.query<{ run_id: string; assistant_id: string }>(
+      `SELECT run_id, assistant_id
+       FROM nexus.core_run_assistants
+       WHERE run_id = ANY($1::uuid[])
+       ORDER BY run_id, position`,
+      [runIds],
+    );
+    const assistantsByRun = new Map<string, string[]>();
+    for (const item of assistantsResult.rows) {
+      const existing = assistantsByRun.get(item.run_id);
+      if (existing) {
+        existing.push(item.assistant_id);
+      } else {
+        assistantsByRun.set(item.run_id, [item.assistant_id]);
+      }
+    }
+    return rows.map((row) => mapRun(row, assistantsByRun.get(row.id) ?? []));
+  };
+
   const getById = async (runId: string): Promise<CoreRun | null> => {
     const row = await getRunRow(runId);
     return row ? mapRun(row, await getAssistantIds(runId)) : null;
+  };
+
+  const getByIdempotencyKey = async (idempotencyKey: string): Promise<CoreRun | null> => {
+    const result = await client.query<CoreRunRow>(
+      `SELECT ${runColumns} FROM nexus.core_runs WHERE idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    const row = result.rows[0];
+    return row ? mapRun(row, await getAssistantIds(row.id)) : null;
+  };
+
+  const listByConversation = async (conversationId: string): Promise<readonly CoreRun[]> => {
+    const result = await client.query<CoreRunRow>(
+      `SELECT ${runColumns}
+       FROM nexus.core_runs
+       WHERE conversation_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [conversationId],
+    );
+    return hydrateRows(result.rows);
+  };
+
+  const listChildRuns = async (parentRunId: string): Promise<readonly CoreRun[]> => {
+    const result = await client.query<CoreRunRow>(
+      `SELECT ${runColumns}
+       FROM nexus.core_runs
+       WHERE parent_run_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [parentRunId],
+    );
+    return hydrateRows(result.rows);
   };
 
   const lockMutableRun = async (runId: string, userId: string): Promise<CoreRunRow> => {
@@ -266,12 +341,18 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
     }
     const existing = mapRun(existingRow, await getAssistantIds(run.id));
 
+    const existingDepth = existing.delegationDepth ?? 0;
+    const incomingDepth = run.delegationDepth ?? 0;
+
     const sameIdentity =
       existing.userId === run.userId &&
       existing.conversationId === run.conversationId &&
       existing.requestId === run.requestId &&
       existing.idempotencyKey === run.idempotencyKey &&
       existing.inputMessageId === run.inputMessageId &&
+      existing.parentRunId === run.parentRunId &&
+      existing.parentStepId === run.parentStepId &&
+      existingDepth === incomingDepth &&
       existing.formatVersion === run.formatVersion &&
       Date.parse(existing.createdAt) === Date.parse(run.createdAt);
     if (!sameIdentity) throw new Error("Execution identity fields are immutable");
@@ -290,7 +371,8 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
            final_message_id = $3,
            trace = $4::jsonb,
            started_at = $5,
-           finished_at = $6
+           finished_at = $6,
+           metadata = $7::jsonb
        WHERE id = $1`,
       [
         run.id,
@@ -299,6 +381,7 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
         JSON.stringify(run.trace),
         run.startedAt ?? null,
         run.finishedAt ?? null,
+        JSON.stringify(run.metadata ?? existing.metadata ?? {}),
       ],
     );
     if (!isDeepStrictEqual(existing.assistantIds, run.assistantIds)) {
@@ -349,6 +432,9 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
 
   return {
     getById,
+    getByIdempotencyKey,
+    listByConversation,
+    listChildRuns,
 
     async create(rawRun: CoreRun): Promise<CoreRun> {
       const run = coreRunSchema.parse(rawRun);
@@ -359,14 +445,17 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
         throw new Error("Execution owner does not match the authenticated owner");
       }
 
+      const delegationDepth = run.parentRunId ? (run.delegationDepth ?? 1) : 0;
+
       await client.query(
         `INSERT INTO nexus.core_runs (
            id, owner_id, conversation_id, request_id, idempotency_key, status,
-           input_message_id, final_message_id, trace, format_version,
-           created_at, started_at, finished_at, metadata
+           input_message_id, final_message_id, parent_run_id, parent_step_id, delegation_depth,
+           trace, format_version, created_at, started_at, finished_at, metadata
          ) VALUES (
            $1, nexus.current_owner_id(), $2, $3, $4, $5,
-           $6, $7, $8::jsonb, $9, $10, $11, $12, '{}'::jsonb
+           $6, $7, $8, $9, $10,
+           $11::jsonb, $12, $13, $14, $15, $16::jsonb
          )`,
         [
           run.id,
@@ -376,11 +465,15 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
           run.status,
           run.inputMessageId,
           run.finalMessageId ?? null,
+          run.parentRunId ?? null,
+          run.parentStepId ?? null,
+          delegationDepth,
           JSON.stringify(run.trace),
           run.formatVersion,
           run.createdAt,
           run.startedAt ?? null,
           run.finishedAt ?? null,
+          JSON.stringify(run.metadata ?? {}),
         ],
       );
       await replaceAssistants(run);
@@ -411,12 +504,33 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
       if (!existingRow) throw new Error("Execution not found or not accessible");
       const existing = mapRun(existingRow, await getAssistantIds(runId));
       const finishedAt = failure.finishedAt ?? new Date().toISOString();
+      const mergedMetadata = failure.metadata
+        ? { ...(existing.metadata ?? {}), ...failure.metadata }
+        : existing.metadata;
       return updateInternal({
         ...existing,
         status: "failed",
         finalMessageId: failure.finalMessageId,
         startedAt: existing.startedAt ?? finishedAt,
         finishedAt,
+        ...(mergedMetadata ? { metadata: mergedMetadata } : {}),
+      });
+    },
+
+    async cancel(runId, cancellation = {}): Promise<CoreRun> {
+      const existingRow = await getRunRow(runId, true);
+      if (!existingRow) throw new Error("Execution not found or not accessible");
+      const existing = mapRun(existingRow, await getAssistantIds(runId));
+      const finishedAt = cancellation.finishedAt ?? new Date().toISOString();
+      const mergedMetadata = cancellation.metadata
+        ? { ...(existing.metadata ?? {}), ...cancellation.metadata }
+        : existing.metadata;
+      return updateInternal({
+        ...existing,
+        status: "cancelled",
+        startedAt: existing.startedAt ?? finishedAt,
+        finishedAt,
+        ...(mergedMetadata ? { metadata: mergedMetadata } : {}),
       });
     },
 
@@ -462,6 +576,63 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
         );
         const persisted = (await listSteps(step.runId)).find((item) => item.id === step.id);
         if (!persisted) throw new Error("Failed to load execution step after append");
+        return persisted;
+      });
+    },
+
+    async updateStep(rawStep: RunStep): Promise<RunStep> {
+      const step = runStepSchema.parse(rawStep);
+      await lockMutableRun(step.runId, step.userId);
+      return withStatementSavepoint(async () => {
+        const existingResult = await client.query<{
+          step_order: number;
+          assistant_id: string;
+          assistant_config_version: string;
+          status: RunStep["status"];
+          result_id: string | null;
+        }>(
+          `SELECT step_order, assistant_id, assistant_config_version, status, result_id
+           FROM nexus.run_steps
+           WHERE run_id = $1 AND id = $2
+           FOR UPDATE`,
+          [step.runId, step.id],
+        );
+        const existingStep = existingResult.rows[0];
+        if (!existingStep) {
+          throw new Error("Execution step not found in this execution");
+        }
+        if (
+          existingStep.step_order !== step.order ||
+          existingStep.assistant_id !== step.assistant.assistantId ||
+          existingStep.assistant_config_version !== step.assistant.configVersion
+        ) {
+          throw new Error("Execution step identity fields are immutable");
+        }
+        if (terminalStepStatuses.has(existingStep.status) && existingStep.status !== step.status) {
+          throw new Error(`Terminal execution steps are immutable (status: ${existingStep.status})`);
+        }
+        await client.query(
+          `UPDATE nexus.run_steps
+           SET status = $3,
+               objective = $4,
+               input_reference_ids = $5::jsonb,
+               started_at = $6,
+               finished_at = $7,
+               metadata = $8::jsonb
+           WHERE run_id = $1 AND id = $2`,
+          [
+            step.runId,
+            step.id,
+            step.status,
+            step.objective,
+            JSON.stringify(step.inputReferenceIds),
+            step.startedAt ?? null,
+            step.finishedAt ?? null,
+            JSON.stringify(step.metadata ?? {}),
+          ],
+        );
+        const persisted = (await listSteps(step.runId)).find((item) => item.id === step.id);
+        if (!persisted) throw new Error("Failed to load execution step after update");
         return persisted;
       });
     },

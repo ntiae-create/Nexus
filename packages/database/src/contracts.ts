@@ -59,16 +59,27 @@ export interface CompleteExecution {
 export interface FailExecution {
   readonly finalMessageId?: Message["id"];
   readonly finishedAt?: string;
+  readonly metadata?: CoreRun["metadata"];
+}
+
+export interface CancelExecution {
+  readonly finishedAt?: string;
+  readonly metadata?: CoreRun["metadata"];
 }
 
 export interface ExecutionRepository {
   getById(runId: CoreRun["id"]): Promise<CoreRun | null>;
+  getByIdempotencyKey(idempotencyKey: CoreRun["idempotencyKey"]): Promise<CoreRun | null>;
+  listByConversation(conversationId: Conversation["id"]): Promise<readonly CoreRun[]>;
+  listChildRuns(parentRunId: CoreRun["id"]): Promise<readonly CoreRun[]>;
   create(run: CoreRun): Promise<CoreRun>;
   /** Updates mutable execution data while preserving its immutable identity. */
   update(run: CoreRun): Promise<CoreRun>;
   complete(runId: CoreRun["id"], completion: CompleteExecution): Promise<CoreRun>;
   fail(runId: CoreRun["id"], failure?: FailExecution): Promise<CoreRun>;
+  cancel(runId: CoreRun["id"], cancellation?: CancelExecution): Promise<CoreRun>;
   appendStep(step: RunStep): Promise<RunStep>;
+  updateStep(step: RunStep): Promise<RunStep>;
   listSteps(runId: CoreRun["id"]): Promise<readonly RunStep[]>;
   recordToolEvent(event: ToolEvent): Promise<ToolEvent>;
   listToolEvents(runId: CoreRun["id"]): Promise<readonly ToolEvent[]>;

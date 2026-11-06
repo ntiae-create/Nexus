@@ -6,9 +6,11 @@ import {
 } from "./database.js";
 import {
   createDefaultProviderRuntime,
+  type ProviderRuntime,
   type ProviderRuntimeEnv,
 } from "./providers/index.js";
 import { createDatabasePreferenceReader } from "./routes/providers.js";
+import { NexusCoreEngine } from "./core/engine.js";
 
 export class BootstrapError extends Error {
   readonly code: "MISSING_DATABASE_URL" | "DATABASE_UNAVAILABLE" | "LISTEN_FAILED";
@@ -36,6 +38,30 @@ export interface BootstrapEnv extends ProviderRuntimeEnv {
   NEXUS_DATABASE_URL?: string;
   PORT?: string;
 }
+
+/**
+ * Builds the NEXUS CORE engine bound to the lazily-created PostgreSQL handle.
+ * A single engine instance per process keeps the cancellation registry coherent
+ * across requests (Vercel keeps warm instances, so this matters in practice).
+ */
+export function createCoreEngine(
+  getDb: () => PostgresNexusDatabase,
+  providers: ProviderRuntime,
+  logger?: CoreEngineLogger,
+): NexusCoreEngine {
+  return new NexusCoreEngine({
+    database: {
+      withOwnerTransaction: (context, operation) =>
+        getDb().withOwnerTransaction(context, operation),
+    },
+    providers,
+    ...(logger ? { logger } : {}),
+  });
+}
+
+export type CoreEngineLogger = NonNullable<
+  ConstructorParameters<typeof NexusCoreEngine>[0]["logger"]
+>;
 
 export interface BootstrapDependencies {
   createDatabase?: (connectionString: string) => PostgresNexusDatabase;
@@ -89,6 +115,13 @@ export function createServerlessApp(
       runtime: providerRuntime,
       env,
       readPreferences: createDatabasePreferenceReader(getOrCreateDb),
+    },
+    core: {
+      core: createCoreEngine(getOrCreateDb, providerRuntime, {
+        info: (payload, message) => app.log.info(payload, message),
+        warn: (payload, message) => app.log.warn(payload, message),
+        error: (payload, message) => app.log.error(payload, message),
+      }),
     },
   });
 
@@ -195,6 +228,13 @@ export async function bootstrapServer(
           runtime: providerRuntime,
           env,
           readPreferences: createDatabasePreferenceReader(() => db!),
+        },
+        core: {
+          core: createCoreEngine(() => db!, providerRuntime, {
+            info: (payload, message) => builtApp.log.info(payload, message),
+            warn: (payload, message) => builtApp.log.warn(payload, message),
+            error: (payload, message) => builtApp.log.error(payload, message),
+          }),
         },
       });
       builtApp.addHook("onClose", async () => {

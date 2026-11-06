@@ -9,8 +9,8 @@ fi
 database_package_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 migration_dir="$database_package_dir/migrations"
 migration_count=$(find "$migration_dir" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d ' ')
-if [ "$migration_count" -ne 3 ]; then
-  echo "Expected migrations 00001 through 00003 in the fresh test database; found $migration_count." >&2
+if [ "$migration_count" -ne 4 ]; then
+  echo "Expected migrations 00001 through 00004 in the fresh test database; found $migration_count." >&2
   exit 2
 fi
 

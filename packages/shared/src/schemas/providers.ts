@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { nonEmptyStringSchema, timestampSchema, uuidSchema } from "./common.js";
-import { normalizedDataSchema } from "./executions.js";
+import { normalizedDataSchema } from "./jsonb.js";
 
 export const providerAvailabilitySchema = z.enum(["available", "unavailable", "restricted"]);
 export const providerCostStatusSchema = z.enum(["free_confirmed", "paid", "unknown"]);

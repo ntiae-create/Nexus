@@ -69,6 +69,11 @@ jobs:
           packages/database/src/postgres/pool.integration.test.ts
           packages/database/src/postgres/repositories.integration.test.ts
 
+      - name: Test NEXUS CORE execution against isolated PostgreSQL
+        env:
+          NEXUS_DATABASE_URL: postgres://nexus_app@127.0.0.1:5432/nexus_test
+        run: npx vitest run apps/server/src/core/engine.postgres.integration.test.ts
+
       - name: Test auth store against isolated PostgreSQL
         env:
           NEXUS_TEST_AUTH_DATABASE_URL: postgres://postgres@127.0.0.1:5432/nexus_test
