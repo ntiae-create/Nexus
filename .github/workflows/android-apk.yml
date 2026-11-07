@@ -126,6 +126,9 @@ jobs:
           if [ -f "$report" ]; then
             echo "========== debug APK =========="
             cat "$report"
+            # Single-line annotation: the only channel guaranteed to be readable
+            # when the job log export is unavailable.
+            echo "::error title=debug APK network policy::$(head -1 "$report")"
             echo "## Debug APK network policy" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             cat "$report" >> "$GITHUB_STEP_SUMMARY"
@@ -144,6 +147,9 @@ jobs:
           if [ -f "$report" ]; then
             echo "========== release APK =========="
             cat "$report"
+            # Single-line annotation: the only channel guaranteed to be readable
+            # when the job log export is unavailable.
+            echo "::error title=release APK network policy::$(head -1 "$report")"
             echo "## Release APK network policy" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             cat "$report" >> "$GITHUB_STEP_SUMMARY"
