@@ -245,6 +245,22 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
     return row ? mapRun(row, await getAssistantIds(runId)) : null;
   };
 
+  const getStatus = async (runId: string): Promise<CoreRun["status"] | null> => {
+    const result = await client.query<{ status: CoreRun["status"] }>(
+      `SELECT status FROM nexus.core_runs WHERE id = $1`,
+      [runId],
+    );
+    return result.rows[0]?.status ?? null;
+  };
+
+  const getStatusForUpdate = async (runId: string): Promise<CoreRun["status"] | null> => {
+    const result = await client.query<{ status: CoreRun["status"] }>(
+      `SELECT status FROM nexus.core_runs WHERE id = $1 FOR UPDATE`,
+      [runId],
+    );
+    return result.rows[0]?.status ?? null;
+  };
+
   const getByIdempotencyKey = async (idempotencyKey: string): Promise<CoreRun | null> => {
     const result = await client.query<CoreRunRow>(
       `SELECT ${runColumns} FROM nexus.core_runs WHERE idempotency_key = $1`,
@@ -432,6 +448,8 @@ export function createExecutionRepository(client: PoolClient): ExecutionReposito
 
   return {
     getById,
+    getStatus,
+    getStatusForUpdate,
     getByIdempotencyKey,
     listByConversation,
     listChildRuns,

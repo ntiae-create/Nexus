@@ -303,6 +303,11 @@ export class InMemoryNexusDatabase implements NexusDatabase {
         const run = findRun(runId);
         return run ? structuredClone(run) : null;
       },
+      // Mirrors the PostgreSQL probe: a standalone read, never a row lock.
+      getStatus: async (runId) => findRun(runId)?.status ?? null,
+      // Mirrors SELECT ... FOR UPDATE: the status returned is the value the
+      // subsequent terminal write is serialized against.
+      getStatusForUpdate: async (runId) => findRun(runId)?.status ?? null,
       getByIdempotencyKey: async (idempotencyKey) => {
         const run = state.runs.find(
           (item) => item.userId === ownerId && item.idempotencyKey === idempotencyKey,

@@ -35,6 +35,7 @@ import type { ProviderRuntime, ResolvedModelExecutionTarget } from "../providers
 import { ProviderError } from "../providers/index.js";
 import { redactSecrets } from "../providers/redaction.js";
 import { ExecutionCancellationRegistry } from "./cancellation-registry.js";
+import { ExecutionCancellationWatcher } from "./cancellation-watcher.js";
 import { buildExecutionContext, renderMessagePartsToText } from "./context-builder.js";
 import {
   buildDelegationUserPrompt,
@@ -94,6 +95,13 @@ export interface NexusCoreEngineOptions {
   readonly providers: ProviderRuntime;
   readonly now?: () => Date;
   readonly registry?: ExecutionCancellationRegistry;
+  /**
+   * Out-of-process cancellation source. Defaults to a watcher bound to the same
+   * database, so persisted cancellations issued by another instance are observed.
+   */
+  readonly cancellationWatcher?: ExecutionCancellationWatcher;
+  /** Overrides the persisted-cancellation probe interval (tests only). */
+  readonly cancellationPollIntervalMs?: number;
   readonly logger?: CoreLogger;
   readonly limits?: Partial<CoreEngineLimits>;
 }
@@ -238,6 +246,7 @@ export class NexusCoreEngine {
   private readonly providers: ProviderRuntime;
   private readonly now: () => Date;
   private readonly registry: ExecutionCancellationRegistry;
+  private readonly watcher: ExecutionCancellationWatcher;
   private readonly logger?: CoreLogger;
   private readonly limits: CoreEngineLimits;
 
@@ -248,10 +257,41 @@ export class NexusCoreEngine {
     this.registry = options.registry ?? new ExecutionCancellationRegistry();
     this.logger = options.logger;
     this.limits = { ...DEFAULT_CORE_LIMITS, ...(options.limits ?? {}) };
+    this.watcher =
+      options.cancellationWatcher ??
+      new ExecutionCancellationWatcher({
+        database: options.database,
+        ...(options.logger ? { logger: options.logger } : {}),
+        ...(options.cancellationPollIntervalMs !== undefined
+          ? { pollIntervalMs: options.cancellationPollIntervalMs }
+          : {}),
+      });
   }
 
   get cancellationRegistry(): ExecutionCancellationRegistry {
     return this.registry;
+  }
+
+  get cancellationWatcher(): ExecutionCancellationWatcher {
+    return this.watcher;
+  }
+
+  /**
+   * Persisted, cross-instance authority for cancellation. The in-memory registry
+   * is only a same-instance fast path.
+   */
+  private async assertNotCancelled(ownerId: string, runId: string): Promise<void> {
+    const status = await this.tx(ownerId, (repos) => repos.executions.getStatus(runId));
+    if (status === null) {
+      throw new CoreExecutionError("EXECUTION_NOT_FOUND", "Execution not found");
+    }
+    if (status === "cancelled") {
+      throw new CoreExecutionError(
+        "EXECUTION_CANCELLED",
+        "Execution was cancelled by another request; no result was produced",
+        { statusCode: 409, details: { runId, status } },
+      );
+    }
   }
 
   private tx<T>(
@@ -410,17 +450,15 @@ export class NexusCoreEngine {
         },
       });
 
-      const children = await repos.executions.listChildRuns(run.id);
-      for (const child of children) {
-        if (
-          child.status === "queued" ||
-          child.status === "running"
-        ) {
-          await repos.executions.cancel(child.id, {
-            finishedAt,
-            metadata: { cancelledAt: finishedAt, cancellationSource: "parent" },
-          });
-        }
+      // Cascade to children in the same transaction so a cancellation issued by
+      // *any* instance reaches delegated runs (the executing instance observes the
+      // persisted child status and aborts its own provider call).
+      const cancelledChildIds = await this.cancelDescendants(repos, run.id, finishedAt);
+      if (cancelledChildIds.length > 0) {
+        this.logger?.info(
+          { runId: run.id, childRunIds: cancelledChildIds },
+          "parent cancellation cascaded to child executions",
+        );
       }
       return updated.status === "cancelled";
     });
@@ -431,6 +469,39 @@ export class NexusCoreEngine {
     }
 
     return this.inspect(ownerId, runId);
+  }
+
+  /**
+   * Recursively cancels descendants of a run. Traversal is breadth-first over
+   * persisted `parent_run_id` links, so grandchildren produced by deeper
+   * delegation are covered even when they belong to another instance.
+   */
+  private async cancelDescendants(
+    repos: NexusRepositories,
+    rootRunId: string,
+    finishedAt: string,
+  ): Promise<string[]> {
+    const cancelled: string[] = [];
+    const queue: string[] = [rootRunId];
+    const visited = new Set<string>([rootRunId]);
+
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
+      const children = await repos.executions.listChildRuns(parentId);
+      for (const child of children) {
+        if (visited.has(child.id)) continue;
+        visited.add(child.id);
+        if (child.status === "queued" || child.status === "running") {
+          await repos.executions.cancel(child.id, {
+            finishedAt,
+            metadata: { cancelledAt: finishedAt, cancellationSource: "parent" },
+          });
+          cancelled.push(child.id);
+        }
+        queue.push(child.id);
+      }
+    }
+    return cancelled;
   }
 
   // ---------------------------------------------------------------------------
@@ -479,11 +550,23 @@ export class NexusCoreEngine {
             { statusCode: 409 },
           );
         }
-        await repos.executions.update({
-          ...current,
-          status: "running",
-          startedAt,
-        });
+        try {
+          await repos.executions.update({
+            ...current,
+            status: "running",
+            startedAt,
+          });
+        } catch (error) {
+          // A cancellation committed by another instance between the read above
+          // and this write wins: the execution must not start.
+          const reconciled = await this.reconcileTerminalConflict(
+            ownerId,
+            runId,
+            error,
+            "step",
+          );
+          throw reconciled ?? error;
+        }
       });
 
       return await this.runRootExecution({
@@ -817,6 +900,16 @@ export class NexusCoreEngine {
             requestedAssistantKey: profile.key,
             delegationCount: 0,
           },
+        }).catch(async (error: unknown) => {
+          // A cancellation committed on another instance between the status read
+          // and this write wins over the execution that is merely starting.
+          const reconciled = await this.reconcileTerminalConflict(
+            ownerId,
+            runId,
+            error,
+            "step",
+          );
+          throw reconciled ?? error;
         });
         return repos.executions.appendStep({
           id: deriveStepId(runId, 0, "primary"),
@@ -848,6 +941,10 @@ export class NexusCoreEngine {
           limits: this.limits,
         });
       }
+
+      // Persisted state is authoritative right before the external call: another
+      // instance may have cancelled this run after the local admission.
+      await this.assertNotCancelled(ownerId, runId);
 
       const primary = await this.callProvider({
         ownerId,
@@ -1221,6 +1318,8 @@ export class NexusCoreEngine {
       },
     });
 
+    await this.assertNotCancelled(ownerId, runId);
+
     const synthesisResponse = await this.callProvider({
       ownerId,
       runId,
@@ -1409,6 +1508,8 @@ export class NexusCoreEngine {
     });
 
     try {
+      await this.assertNotCancelled(ownerId, childRunId);
+
       const response = await this.callProvider({
         ownerId,
         runId: childRunId,
@@ -1422,15 +1523,31 @@ export class NexusCoreEngine {
 
       const finishedAt = this.now().toISOString();
       const outcome = await this.tx(ownerId, async (repos) => {
-        const child = await repos.executions.getById(childRunId);
-        if (!child) {
+        const lockedChildStatus = await repos.executions.getStatusForUpdate(childRunId);
+        if (lockedChildStatus === null) {
           throw new CoreExecutionError("EXECUTION_NOT_FOUND", "Child execution not found");
         }
-        if (child.status === "cancelled") {
+        if (lockedChildStatus === "cancelled") {
           throw new CoreExecutionError(
             "EXECUTION_CANCELLED",
             "Delegated execution was cancelled",
             { statusCode: 409 },
+          );
+        }
+        if (lockedChildStatus !== "running" && lockedChildStatus !== "queued") {
+          throw new CoreExecutionError(
+            "EXECUTION_ALREADY_TERMINAL",
+            `Delegated execution is already terminal with status '${lockedChildStatus}'`,
+          );
+        }
+        const child = await repos.executions.getById(childRunId);
+        if (!child) {
+          throw new CoreExecutionError("EXECUTION_NOT_FOUND", "Child execution not found");
+        }
+        if (child.status !== lockedChildStatus) {
+          throw new CoreExecutionError(
+            "EXECUTION_ALREADY_TERMINAL",
+            `Delegated execution status changed concurrently to '${child.status}'`,
           );
         }
         const steps = await repos.executions.listSteps(childRunId);
@@ -1608,21 +1725,36 @@ export class NexusCoreEngine {
 
     try {
       const persisted = await this.tx(ownerId, async (repos) => {
-        const current = await repos.executions.getById(runId);
-        if (!current) {
+        // Serialize against a concurrent cancellation: the row lock makes the
+        // status check below and the terminal write atomic. A cancellation that
+        // already committed causes this finalization to abort, so a cancelled run
+        // can never be overwritten as succeeded/partial.
+        const lockedStatus = await repos.executions.getStatusForUpdate(runId);
+        if (lockedStatus === null) {
           throw new CoreExecutionError("EXECUTION_NOT_FOUND", "Execution not found");
         }
-        if (current.status === "cancelled") {
+        if (lockedStatus === "cancelled") {
           throw new CoreExecutionError(
             "EXECUTION_CANCELLED",
             "Execution was cancelled before the response could be persisted",
             { statusCode: 409 },
           );
         }
-        if (current.status !== "running" && current.status !== "queued") {
+        if (lockedStatus !== "running" && lockedStatus !== "queued") {
           throw new CoreExecutionError(
             "EXECUTION_ALREADY_TERMINAL",
-            `Execution is already terminal with status '${current.status}'`,
+            `Execution is already terminal with status '${lockedStatus}'`,
+          );
+        }
+
+        const current = await repos.executions.getById(runId);
+        if (!current) {
+          throw new CoreExecutionError("EXECUTION_NOT_FOUND", "Execution not found");
+        }
+        if (current.status !== lockedStatus) {
+          throw new CoreExecutionError(
+            "EXECUTION_ALREADY_TERMINAL",
+            `Execution status changed concurrently to '${current.status}'`,
           );
         }
 
@@ -1716,12 +1848,69 @@ export class NexusCoreEngine {
       };
     } catch (error) {
       if (error instanceof CoreExecutionError) throw error;
+      // A concurrent cancellation may commit between the row-lock read and this
+      // write (or win the lock first on another instance). The repository then
+      // rejects the terminal write as immutable; reconcile against the persisted
+      // state so the caller always sees the true authority instead of an opaque
+      // persistence error.
+      const reconciled = await this.reconcileTerminalConflict(
+        ownerId,
+        runId,
+        error,
+        "finalization",
+      );
+      if (reconciled) throw reconciled;
       throw new CoreExecutionError(
         "PERSISTENCE_FAILED",
         "Failed to persist the final execution state atomically",
         { retryable: true, cause: error },
       );
     }
+  }
+
+  /**
+   * A result-preserving write must never lose to a cancellation silently: when a
+   * persisted write fails because another instance already made the run terminal,
+   * the persisted truth wins and the caller receives it as a typed CORE error.
+   * Returns `null` when the run is not terminal (the failure was unrelated to
+   * cancellation), so the caller surfaces the original persistence error.
+   */
+  private async reconcileTerminalConflict(
+    ownerId: string,
+    runId: string,
+    error: unknown,
+    phase: "finalization" | "step",
+  ): Promise<CoreExecutionError | null> {
+    let status: string | null;
+    try {
+      status = await this.tx(ownerId, (repos) => repos.executions.getStatus(runId));
+    } catch {
+      return null;
+    }
+    if (status === "cancelled") {
+      this.logger?.info(
+        {
+          runId,
+          reason: error instanceof Error ? error.message : "unknown error",
+        },
+        "finalization lost the race to a cancellation; discarded the result",
+      );
+      return new CoreExecutionError(
+        "EXECUTION_CANCELLED",
+        phase === "finalization"
+          ? "Execution was cancelled before the response could be persisted; no result was produced"
+          : "Execution was cancelled by another request; no result was produced",
+        { statusCode: 409, details: { runId, status } },
+      );
+    }
+    if (status === "succeeded" || status === "partial") {
+      return new CoreExecutionError(
+        "EXECUTION_ALREADY_TERMINAL",
+        `Execution already finished with status '${status}'`,
+        { details: { runId, status } },
+      );
+    }
+    return null;
   }
 
   private async requireInputMessage(ownerId: string, runId: string): Promise<Message> {
@@ -1779,7 +1968,18 @@ export class NexusCoreEngine {
       this.limits.providerTimeoutMs,
     );
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const combined = AbortSignal.any([signal, timeoutSignal]);
+
+    // Cross-instance cancellation: a cancellation persisted by another instance
+    // must interrupt this call. Probing happens in short standalone reads, never
+    // while a transaction or row lock is held.
+    const persistedController = new AbortController();
+    const stopWatching = this.watcher.watch({
+      ownerId: input.ownerId,
+      runId,
+      controller: persistedController,
+      callerSignal: signal,
+    });
+    const combined = AbortSignal.any([signal, timeoutSignal, persistedController.signal]);
 
     try {
       return await target.adapter.generate({
@@ -1791,7 +1991,7 @@ export class NexusCoreEngine {
         signal: combined,
       });
     } catch (error) {
-      if (signal.aborted) {
+      if (signal.aborted || persistedController.signal.aborted) {
         throw new CoreExecutionError(
           "EXECUTION_CANCELLED",
           "Execution was cancelled while waiting for the provider",
@@ -1801,7 +2001,7 @@ export class NexusCoreEngine {
       if (error instanceof ProviderError) {
         if (error.code === "CANCELLED") {
           throw new CoreExecutionError(
-            timeoutSignal.aborted ? "EXECUTION_CANCELLED" : "EXECUTION_CANCELLED",
+            "EXECUTION_CANCELLED",
             "Provider call was cancelled",
             { statusCode: 409, cause: error },
           );
@@ -1820,6 +2020,8 @@ export class NexusCoreEngine {
         "Provider call failed before a response could be normalized",
         { providerKey: target.adapter.key, cause: error },
       );
+    } finally {
+      stopWatching();
     }
   }
 

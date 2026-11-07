@@ -69,6 +69,17 @@ export interface CancelExecution {
 
 export interface ExecutionRepository {
   getById(runId: CoreRun["id"]): Promise<CoreRun | null>;
+  /**
+   * Lightweight terminal-state probe used by the out-of-process cancellation
+   * watcher. Must not take row locks: it runs in its own short transaction
+   * while an external provider call is in flight.
+   */
+  getStatus(runId: CoreRun["id"]): Promise<CoreRun["status"] | null>;
+  /**
+   * Acquires the run row lock and returns the current status. Used to serialize
+   * cancellation against finalization so a terminal run can never be overwritten.
+   */
+  getStatusForUpdate(runId: CoreRun["id"]): Promise<CoreRun["status"] | null>;
   getByIdempotencyKey(idempotencyKey: CoreRun["idempotencyKey"]): Promise<CoreRun | null>;
   listByConversation(conversationId: Conversation["id"]): Promise<readonly CoreRun[]>;
   listChildRuns(parentRunId: CoreRun["id"]): Promise<readonly CoreRun[]>;

@@ -100,6 +100,51 @@ A decisão fica registrada e fora do escopo desta etapa.
 - Rate limiting existente (login e política de provedores) é reutilizado; nenhuma nova
   infraestrutura de autenticação foi criada.
 
+## 5.1 Cancelamento entre instâncias
+
+O cancelamento é autoritativo no **PostgreSQL persistido**, nunca apenas em memória. A
+topologia de destino (Vercel/serverless) não garante que `POST /v1/executions/:runId/cancel`
+chegue à mesma instância que está executando a chamada ao provedor; por isso
+`ExecutionCancellationRegistry` (o `AbortController` em memória) é apenas um atalho local.
+
+- **Autoridade**: `nexus.core_runs.status` é a única fonte de verdade. Uma execução cancelada
+  por qualquer instância é observada por todas as demais.
+- **`ExecutionCancellationWatcher`** (`apps/server/src/core/cancellation-watcher.ts`): consulta
+  o status persistido em leituras curtas e isoladas (transação própria por probe), com
+  intervalo padrão de 1 s e coalescência mínima de 250 ms entre probes. Ao ver um estado
+  terminal (`succeeded`, `partial`, `failed`, `cancelled`) aborta o `AbortController` local.
+  Erros de probe são registrados no log e **nunca** abortam a execução. Os timers são
+  `unref()`, então não seguram o processo.
+- **Antes das fronteiras externas**: a execução relê o estado persistido antes da chamada
+  primária ao provedor, antes da síntese e antes de cada chamada de filha delegada
+  (`assertNotCancelled`); um run cancelado falha com `EXECUTION_CANCELLED` e nenhuma resposta
+  é produzida.
+- **Durante a chamada**: quando o adaptador aceita `AbortSignal`, o sinal entregue é
+  `AbortSignal.any([callerSignal, timeoutSignal, persistedSignal])`, de modo que a chamada é
+  interrompida assim que o cancelamento persistido é detectado — sem esperar o timeout.
+- **Antes de persistir resultados**: `completeRootExecution` e a finalização de filhas tomam
+  o lock da linha (`getStatusForUpdate`) e, dentro da mesma transação, rejeitam `cancelled`
+  (`EXECUTION_CANCELLED`) e qualquer status fora de `running`/`queued`
+  (`EXECUTION_ALREADY_TERMINAL`). Um run cancelado nunca termina como `succeeded`/`partial`.
+- **Conflito de escrita**: se o cancelamento vencer entre a leitura e a escrita
+  (transição para `running`, marcação de etapa ou finalização), o repositório rejeita a
+  escrita imutável e o engine reconcilia a falha com o estado persistido, devolvendo
+  `EXECUTION_CANCELLED` em vez de um erro opaco de persistência.
+- **Cascata**: `cancel()` percorre os descendentes em largura sobre `parent_run_id`
+  (`cancelDescendants`, com guarda de ciclo) e marca as filhas ativas com
+  `cancellationSource: "parent"` na mesma transação. Como o estado é persistido, a instância
+  que executa a filha observa o cancelamento e aborta a própria chamada.
+- **Nunca segurar transação/lock durante polling ou chamadas externas**: cada probe e cada
+  leitura de status usam sua própria transação curta; nenhuma transação envolve
+  `adapter.generate()`.
+- **Idempotência**: recancelar um run terminal responde `EXECUTION_ALREADY_TERMINAL`; o
+  cancelamento repetido não sobrescreve estado terminal.
+
+Testes dedicados: `apps/server/src/core/cancellation-cross-instance.test.ts` (duas instâncias
+com registries independentes compartilhando só o banco em memória) e
+`apps/server/src/core/cancellation.postgres.integration.test.ts` (duas instâncias com pools
+próprios contra PostgreSQL 17, incluindo corrida cancelamento × finalização).
+
 ## 6. Migração `00004_core_execution_hierarchy.sql`
 
 Aditiva e aplicada sobre `00001`–`00003` sem reescrevê-las:
@@ -124,6 +169,12 @@ permanecem intactas porque nenhuma tabela ou política nova é criada.
 - `apps/server/src/routes/core.test.ts`: E2E HTTP com Fastify e provedor mockado.
 - `apps/server/src/core/{context-builder,delegation,errors,cancellation-registry}.test.ts`.
 - `apps/server/src/core/engine.postgres.integration.test.ts`: fluxo real contra PostgreSQL 17.11.
+- `apps/server/src/core/cancellation-cross-instance.test.ts`: cancelamento observado por outra
+  instância, checagem persistida antes da chamada, cascata pai→filha e corrida
+  cancelamento × finalização (registries independentes).
+- `apps/server/src/core/cancellation.postgres.integration.test.ts`: as mesmas garantias com
+  dois pools reais contra PostgreSQL 17.11, executado no CI em
+  `.github/workflows/database-postgres.yml`.
 - `packages/database/src/postgres/repositories.integration.test.ts`: linhagem, cancelamento e
   listagens no banco real.
 
