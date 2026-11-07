@@ -115,27 +115,48 @@ jobs:
           echo "release_apk=$(realpath "$release_apk")" >> "$GITHUB_OUTPUT"
 
       - name: Verify debug APK network policy
-        # The script writes `apk-policy-debug.txt` with the dumps it inspected; the
-        # upload step below publishes it even when this fails.
         run: |
+          set +e
           ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
+          status=$?
+          set -e
+          if [[ $status -ne 0 ]]; then
+            # Surface the diagnosis in the check run: the artifact upload below is
+            # the durable copy, but this is what the reviewer sees directly.
+            report="apps/mobile/android/apk-policy-debug.txt"
+            if [[ -f "$report" ]]; then
+              summary="$(head -c 60000 "$report")"
+              summary="${summary//'%'/'%25'}"
+              summary="${summary//$'\n'/'%0A'}"
+              summary="${summary//$'\r'/'%0D'}"
+              echo "::error title=Debug APK network policy::$summary"
+            else
+              echo "::error title=Debug APK network policy::checker failed without producing a report"
+            fi
+          fi
+          exit $status
         working-directory: apps/mobile/android
 
       - name: Verify release APK network policy
         run: |
+          set +e
           ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
+          status=$?
+          set -e
+          if [[ $status -ne 0 ]]; then
+            report="apps/mobile/android/apk-policy-release.txt"
+            if [[ -f "$report" ]]; then
+              summary="$(head -c 60000 "$report")"
+              summary="${summary//'%'/'%25'}"
+              summary="${summary//$'\n'/'%0A'}"
+              summary="${summary//$'\r'/'%0D'}"
+              echo "::error title=Release APK network policy::$summary"
+            else
+              echo "::error title=Release APK network policy::checker failed without producing a report"
+            fi
+          fi
+          exit $status
         working-directory: apps/mobile/android
-
-      - name: Publish policy inspection report
-        # Always runs: on failure this artifact is the diagnosis, since it contains
-        # the compiled manifest and the network security config read from the APK.
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: network-policy-report
-          path: apps/mobile/android/apk-policy-*.txt
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Dump compiled policy for the reviewer
         # Printed so the reviewer can see the actual packaged resource, not a claim

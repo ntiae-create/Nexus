@@ -241,19 +241,25 @@ inspect() {
   # Locate the compiled network security config. Resource file paths can be
   # renamed, so instead of guessing a name we look for the resource whose root
   # element is <network-security-config>.
-  local entry config_dump=""
+  command -v unzip >/dev/null 2>&1 || fail "unzip not found; required to list APK entries"
+
+  local entry candidate config_dump=""
   while IFS= read -r entry; do
     [[ "$entry" == res/*.xml ]] || continue
-    if "$aapt2" dump xmltree --file "$entry" "$apk" 2>/dev/null \
-        | grep -qE '^[[:space:]]*E: network-security-config'; then
+    candidate="$workdir/entry.xml"
+    # Dump to a file instead of piping into `grep -q`: under `set -o pipefail`,
+    # grep exiting early sends SIGPIPE to aapt2 and the pipeline reports failure,
+    # which would make a present config look absent.
+    "$aapt2" dump xmltree --file "$entry" "$apk" >"$candidate" 2>/dev/null || continue
+    if grep -qE '^[[:space:]]*E: network-security-config' "$candidate"; then
       if [[ -n "$config_dump" ]]; then
         fail "more than one network security config in the APK ($config_dump and $entry)"
       fi
       config_dump="$workdir/config.txt"
-      "$aapt2" dump xmltree --file "$entry" "$apk" >"$config_dump"
+      cp "$candidate" "$config_dump"
       printf 'network security config in APK: %s\n' "$entry"
     fi
-  done < <(unzip -Z1 "$apk" | grep -E '^res/.*\.xml$')
+  done < <(unzip -Z1 "$apk" 2>/dev/null | grep -E '^res/.*\.xml$' || true)
 
   [[ -n "$config_dump" ]] || fail "no network security config resource found inside $apk"
 
