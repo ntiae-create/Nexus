@@ -115,44 +115,61 @@ jobs:
           echo "release_apk=$(realpath "$release_apk")" >> "$GITHUB_OUTPUT"
 
       - name: Verify debug APK network policy
-        run: |
-          ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
-          status=$?
-          if [[ $status -ne 0 ]]; then
-            # Surface the diagnosis in the check run: the artifact upload below is
-            # the durable copy, but this is what the reviewer sees directly.
-            report="apps/mobile/android/apk-policy-debug.txt"
-            if [[ -f "$report" ]]; then
-              summary="$(head -c 60000 "$report")"
-              summary="${summary//'%'/'%25'}"
-              summary="${summary//$'\n'/'%0A'}"
-              summary="${summary//$'\r'/'%0D'}"
-              echo "::error title=Debug APK network policy::$summary"
-            else
-              echo "::error title=Debug APK network policy::checker failed without producing a report"
-            fi
-          fi
-          exit $status
+        id: verify_debug
+        continue-on-error: true
+        run: ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
         working-directory: apps/mobile/android
 
       - name: Verify release APK network policy
-        run: |
-          ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
-          status=$?
-          if [[ $status -ne 0 ]]; then
-            report="apps/mobile/android/apk-policy-release.txt"
-            if [[ -f "$report" ]]; then
-              summary="$(head -c 60000 "$report")"
-              summary="${summary//'%'/'%25'}"
-              summary="${summary//$'\n'/'%0A'}"
-              summary="${summary//$'\r'/'%0D'}"
-              echo "::error title=Release APK network policy::$summary"
-            else
-              echo "::error title=Release APK network policy::checker failed without producing a report"
-            fi
-          fi
-          exit $status
+        id: verify_release
+        continue-on-error: true
+        run: ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
         working-directory: apps/mobile/android
+
+      - name: Report policy verification result
+        run: |
+          status=0
+          for variant in debug release; do
+            report="apps/mobile/android/apk-policy-${variant}.txt"
+            echo "========== ${variant} =========="
+            if [[ -f "$report" ]]; then
+              cat "$report"
+            else
+              echo "(no report was produced)"
+            fi
+            echo
+          done
+
+          {
+            echo "## Android network policy verification"
+            echo
+            for variant in debug release; do
+              report="apps/mobile/android/apk-policy-${variant}.txt"
+              echo "### ${variant}"
+              echo '```'
+              if [[ -f "$report" ]]; then cat "$report"; else echo "(no report was produced)"; fi
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "debug outcome: ${{ steps.verify_debug.outcome }}"
+          echo "release outcome: ${{ steps.verify_release.outcome }}"
+
+          for variant in debug release; do
+            if [[ "${{ steps.verify_debug.outcome }}" == "success" && "${{ steps.verify_release.outcome }}" == "success" ]]; then
+              break
+            fi
+            report="apps/mobile/android/apk-policy-${variant}.txt"
+            [[ -f "$report" ]] || continue
+            verdict="$(head -1 "$report")"
+            # Single line on purpose: multi-line annotations are unreliable and the
+            # full dumps are already in the log and the job summary above.
+            echo "::error title=${variant} APK network policy::${verdict}"
+          done
+
+          [[ "${{ steps.verify_debug.outcome }}" == "success" ]] || status=1
+          [[ "${{ steps.verify_release.outcome }}" == "success" ]] || status=1
+          exit $status
 
       - name: Dump compiled policy for the reviewer
         # Printed so the reviewer can see the actual packaged resource, not a claim
