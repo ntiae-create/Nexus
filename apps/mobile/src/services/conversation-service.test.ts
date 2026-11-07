@@ -476,16 +476,24 @@ describe("chat session — network loss and recovery (idempotency)", () => {
   });
 
   it("discovers the run id of a message still being sent, by requestId", async () => {
+    // One fixture instance: `makeRun()` stamps `createdAt` from the wall clock, so building
+    // the server response and the expectation separately made this test flaky (two calls can
+    // land in different milliseconds).
+    const matchingRun = makeRun();
     const service = createConversationService({
       service: stubService({
-        listExecutions: async () => [makeRun({ requestId: "99999999-9999-4999-8999-999999999999" }), makeRun()],
+        listExecutions: async () => [
+          makeRun({ requestId: "99999999-9999-4999-8999-999999999999" }),
+          matchingRun,
+        ],
       }),
       token: TEST_TOKEN,
     });
 
     const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
 
-    expect(result).toEqual({ kind: "found", run: makeRun() });
+    // The run returned is the server's own object, matched by `requestId` — nothing derived.
+    expect(result).toEqual({ kind: "found", run: matchingRun });
   });
 
   it("reports discovery as unavailable (never as aborted) when probes keep failing", async () => {
@@ -909,6 +917,25 @@ describe("chat session — recovery of a run left running (3C.2 audit)", () => {
       expect(result.signedOut).toBe(false);
       expect(result.message).toBe("offline");
     }
+  });
+});
+
+describe("test fixtures — determinism", () => {
+  /**
+   * `makeRun`/`makeConversation`/`make*Message` stamp `createdAt`/`updatedAt` from the wall
+   * clock. A test that builds a fixture twice and compares them deeply is therefore flaky:
+   * the two calls can land in different milliseconds. That exact pattern made the discovery
+   * test fail intermittently in CI, so the fixtures are measured here to document the trap.
+   */
+  it("stamps timestamps from the wall clock, so a fixture must never be compared twice", () => {
+    const first = makeRun();
+    const second = makeRun();
+    // The deterministic fields are identical...
+    expect({ ...first, createdAt: null }).toEqual({ ...second, createdAt: null });
+    // ...but the timestamp is not guaranteed to be, which is why expectations reuse an
+    // instance instead of calling the builder again.
+    expect(typeof first.createdAt).toBe("string");
+    expect(new Date(first.createdAt).toString()).not.toBe("Invalid Date");
   });
 });
 
