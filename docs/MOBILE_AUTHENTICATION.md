@@ -67,6 +67,18 @@ O arquivo de debug tem o mesmo nome de recurso e vive no source set `debug`, ent
 - **Aparelho físico via USB (recomendado):** rode `adb reverse tcp:3000 tcp:3000` e configure `http://localhost:3000` no app. O tráfego sai pelo loopback, já liberado, sem expor a máquina na rede.
 - **Aparelho físico na mesma rede:** o IP precisa ser **literal** em `app/src/debug/res/xml/network_security_config.xml`, por exemplo `<domain includeSubdomains="false">192.168.0.10</domain>`, e então `http://192.168.0.10:3000`. A Network Security Configuration do Android **não aceita CIDR**: escrever `192.168.0.0/16` casaria com nada. Adicione um `<domain>` por endereço usado.
 
+### Validação no CI
+
+O workflow `.github/workflows/android-apk.yml` compila as duas variantes de verdade (JDK 21, Android SDK 35, Gradle Wrapper do projeto) e inspeciona **os APKs gerados**, não os XMLs do repositório:
+
+```sh
+./gradlew assembleDebug
+./gradlew assembleRelease
+apps/mobile/android/scripts/apk-network-policy.sh inspect <apk> debug|release
+```
+
+O script usa `aapt2 dump xmltree` para ler o manifesto compilado e o recurso de política dentro do APK, e falha quando: o manifesto não referencia `@xml/network_security_config`; há `usesCleartextTraffic`; o `base-config` permite cleartext; o release carrega qualquer exceção por domínio (vazamento do arquivo de debug); ou o debug libera algo fora de `10.0.2.2`, `localhost` e `127.0.0.1` (inclui CIDR, que a plataforma não suporta). A lógica do verificador é fixada por `src/test-support/apk-policy-verifier.test.ts`.
+
 ### Produção
 
 O endereço da API em produção precisa ser `https://`. Com a política de release, qualquer `http://` é bloqueado pela plataforma antes de a requisição sair do aparelho — não há caminho de configuração no app que reabra cleartext. A validação do endereço em `config.ts` aceita `http` apenas para permitir desenvolvimento; a exigência de TLS em produção é imposta pelo sistema operacional e verificada pelos testes de política de rede.
