@@ -10,8 +10,8 @@ import { getConversationAssistants, type AssistantOption } from "../lib/assistan
 import {
   cancelRun,
   followExecution,
+  isTerminalRunStatus,
   messageText,
-  pollDelayFor,
   recoverRunByRequestId,
   sendChatMessage,
   type CancelOutcome,
@@ -229,24 +229,96 @@ export interface ChatSession {
   /** Follows a run and reloads the history once it reaches a terminal state. */
   follow(runId: string, options?: FollowOptions): Promise<FollowResult>;
   /**
+   * Non-terminal executions of this conversation, in the server's own order.
+   *
+   * Used to recover a run that was admitted before the screen unmounted (user left the chat
+   * or the app was suspended). Filtering uses `runStatusSchema` through
+   * `isTerminalRunStatus`, so no new state vocabulary is introduced.
+   *
+   * Returns a `LoadResult` so a `401` reaches the session layer instead of looking like an
+   * empty list.
+   */
+  activeRuns(options?: { signal?: AbortSignal }): Promise<LoadResult<readonly CoreRun[]>>;
+  /**
    * Discovers the run id of a message that is still being sent.
    *
    * `POST .../messages` only answers when the execution finishes, so the id needed by
    * `POST /v1/executions/:runId/cancel` is not available while it runs. This polls the
    * conversation's persisted runs and matches `requestId` — the server's own correlation
    * id — using `GET /v1/conversations/:id/executions`. No id is derived client-side.
+   *
+   * The loop is bounded by the **lifetime of the send**, not by a fixed attempt count:
+   * it runs while `signal` is live and stops the moment the caller aborts it (send settled,
+   * unmount, conversation change, session expired). One probe at a time, never concurrent.
+   *
+   * Returns:
+   * - `found` with the server's run as soon as `requestId` matches;
+   * - `aborted` when the caller aborted — never a statement about the run;
+   * - `unavailable` when the state could not be read (repeated transport failures, `401`) or
+   *   when the successful probes exhausted `DISCOVERY_SAFETY_PROBE_CAP` with no match.
+   *   Only successful, non-matching probes count; a slow provider queue is still discovered.
    */
-  findRun(requestId: string, options?: DiscoveryOptions): Promise<CoreRun | null>;
+  findRun(requestId: string, options?: DiscoveryOptions): Promise<DiscoveryResult>;
 }
 
 export interface DiscoveryOptions {
   readonly signal?: AbortSignal;
   readonly scheduler?: (callback: () => void, delayMs: number) => void;
+  /** Test hook: stop after N successful probes (production leaves this unset). */
   readonly maxAttempts?: number;
+  /** Consecutive failed probes tolerated before giving up. */
+  readonly maxTransientFailures?: number;
+  /** Called after every probe that found persisted runs, so the UI can reflect progress. */
+  readonly onProbe?: (runs: readonly CoreRun[]) => void;
 }
 
-/** How many list calls are spent looking for a just-sent run. */
+/**
+ * Outcome of discovery. The distinction matters: only `aborted` means "we stopped asking",
+ * every other kind is a statement about the server's state.
+ */
+export type DiscoveryResult =
+  /** The server persisted the run; the id is authoritative. */
+  | { readonly kind: "found"; readonly run: CoreRun }
+  /** The caller aborted (send settled / unmount). No conclusion about the run. */
+  | { readonly kind: "aborted" }
+  /** Probing failed repeatedly; the run may still exist server-side. */
+  | { readonly kind: "unavailable"; readonly message: string };
+
+/**
+ * Successful probes performed before giving up on a run the server never recorded, when the
+ * caller provides no lifetime signal to bound the loop.
+ *
+ * This is the conservative fallback: a standalone caller that cannot tell when the send
+ * settles would otherwise probe forever.
+ */
 export const DEFAULT_DISCOVERY_ATTEMPTS = 8;
+
+/**
+ * Hard safety ceiling applied while the send is still pending.
+ *
+ * Discovery is bounded by the *send lifetime* (the `AbortSignal` the caller passes), which is
+ * the only thing that actually knows when probing stopped being useful. This cap exists only
+ * so a caller that never aborts cannot turn a capped backoff into an endless loop: at the
+ * steady-state 3 s interval it allows ~12 minutes of probing, longer than a full provider
+ * execution plus queueing, and it is never the reason a live execution goes untracked.
+ */
+export const DISCOVERY_SAFETY_PROBE_CAP = 240;
+
+/** Consecutive failed probes (network/5xx) tolerated while the send is still pending. */
+export const DEFAULT_DISCOVERY_TRANSIENT_FAILURES = 5;
+
+/**
+ * Backoff for discovery probes: fast at first (the CORE persists the run before calling the
+ * provider), then a slow steady state so a long execution costs ~1 request every 3 s.
+ */
+export const DISCOVERY_DELAYS_MS: readonly number[] = [
+  400, 800, 1_200, 1_600, 2_000, 2_500, 3_000,
+];
+
+export function discoveryDelayFor(attempt: number): number {
+  const index = Math.min(Math.max(attempt, 0), DISCOVERY_DELAYS_MS.length - 1);
+  return DISCOVERY_DELAYS_MS[index]!;
+}
 
 export interface ConversationService {
   list(options?: { signal?: AbortSignal }): Promise<LoadResult<ConversationsSnapshot>>;
@@ -282,25 +354,34 @@ export function createConversationService(input: {
   }
 
   /**
-   * Waits between discovery probes.
+   * Waits between discovery probes, waking up immediately on abort.
    *
-   * Uses the injected scheduler in tests and real timers otherwise; an aborted signal ends
-   * the wait immediately so an unmounted screen never keeps a loop alive.
+   * Resolves `true` when the full delay elapsed, `false` when the caller aborted. The timer
+   * and the `abort` listener are always released, so an unmounted screen leaves nothing
+   * behind (no dangling timer, no retained listener on a long-lived signal).
    */
-  function waitForDelay(delayMs: number, options: DiscoveryOptions): Promise<void> {
+  function waitForDelay(delayMs: number, options: DiscoveryOptions): Promise<boolean> {
+    const signal = options.signal;
+    if (signal?.aborted) return Promise.resolve(false);
+
     if (options.scheduler) {
-      return new Promise<void>((resolve) => options.scheduler!(resolve, delayMs));
+      // The scheduler only invokes the callback; the abort check happens after it fires so a
+      // test scheduler cannot outlive an aborted discovery.
+      return new Promise<void>((resolve) => {
+        options.scheduler!(() => resolve(), delayMs);
+      }).then(() => !signal?.aborted);
     }
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, delayMs);
-      options.signal?.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true },
-      );
+
+    return new Promise<boolean>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(true);
+      }, delayMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -541,24 +622,79 @@ export function createConversationService(input: {
         },
 
         async findRun(requestId, options = {}) {
-          const maxAttempts = options.maxAttempts ?? DEFAULT_DISCOVERY_ATTEMPTS;
-          for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-            if (options.signal?.aborted) return null;
+          // With a lifetime signal the loop is bounded by the send itself; without one, fall
+          // back to the conservative attempt budget. Either way a hard safety cap applies.
+          const maxAttempts =
+            options.maxAttempts ??
+            (options.signal ? DISCOVERY_SAFETY_PROBE_CAP : DEFAULT_DISCOVERY_ATTEMPTS);
+          const maxTransientFailures =
+            options.maxTransientFailures ?? DEFAULT_DISCOVERY_TRANSIENT_FAILURES;
+
+          let probes = 0;
+          let transientFailures = 0;
+          let attempt = 0;
+
+          // One probe at a time (awaited), so a slow request can never stack duplicates.
+          while (true) {
+            if (options.signal?.aborted) return { kind: "aborted" };
+
+            let runs: readonly CoreRun[] | null = null;
             try {
-              const runs = await service.listExecutions(token, conversationId, {
+              runs = await service.listExecutions(token, conversationId, {
                 ...(options.signal ? { signal: options.signal } : {}),
               });
+              transientFailures = 0;
+              probes += 1;
+            } catch (error) {
+              // Abort looks exactly like a transport failure at this level; never report an
+              // aborted local request as "the run is gone".
+              if (options.signal?.aborted) return { kind: "aborted" };
+              if (error instanceof ApiError && error.meansSessionInvalid) {
+                return { kind: "unavailable", message: describeApiError(error) };
+              }
+              transientFailures += 1;
+              if (transientFailures > maxTransientFailures) {
+                return {
+                  kind: "unavailable",
+                  message:
+                    "Não foi possível consultar o estado da execução no servidor. " +
+                    "Atualize a conversa para conferir o resultado.",
+                };
+              }
+            }
+
+            if (runs) {
+              options.onProbe?.(runs);
+              // Match by the server's own correlation id; nothing is derived locally.
               const match = runs.find((run) => run.requestId === requestId);
-              if (match) return match;
-            } catch {
-              // Discovery is best effort: the screen keeps showing "processando" and the
-              // cancel button appears only when the run is actually known.
+              if (match) return { kind: "found", run: match };
+              if (probes >= maxAttempts) {
+                return {
+                  kind: "unavailable",
+                  message:
+                    "O servidor não registrou uma execução para esta mensagem. " +
+                    "Atualize a conversa para conferir o resultado antes de reenviar.",
+                };
+              }
             }
-            if (attempt < maxAttempts - 1) {
-              await waitForDelay(pollDelayFor(attempt), options);
-            }
+
+            const waited = await waitForDelay(discoveryDelayFor(attempt), options);
+            if (!waited) return { kind: "aborted" };
+            attempt += 1;
           }
-          return null;
+        },
+
+        async activeRuns(options = {}) {
+          const result = await wrap(() =>
+            service.listExecutions(token, conversationId, {
+              ...(options.signal ? { signal: options.signal } : {}),
+            }),
+          );
+          if (!result.ok) return result;
+          return {
+            ok: true,
+            data: result.data.filter((run) => !isTerminalRunStatus(run.status)),
+          };
         },
 
         async follow(runId, options = {}) {

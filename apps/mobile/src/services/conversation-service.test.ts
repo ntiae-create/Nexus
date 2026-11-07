@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  DISCOVERY_DELAYS_MS,
+  discoveryDelayFor,
   conversationAssistantLabel,
   conversationLabel,
   conversationTimestampLabel,
@@ -480,12 +482,12 @@ describe("chat session — network loss and recovery (idempotency)", () => {
       token: TEST_TOKEN,
     });
 
-    const run = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
 
-    expect(run?.id).toBe(RUN_ID);
+    expect(result).toEqual({ kind: "found", run: makeRun() });
   });
 
-  it("gives up discovery without throwing when the list keeps failing", async () => {
+  it("reports discovery as unavailable (never as aborted) when probes keep failing", async () => {
     const service = createConversationService({
       service: stubService({
         listExecutions: async () => {
@@ -495,12 +497,330 @@ describe("chat session — network loss and recovery (idempotency)", () => {
       token: TEST_TOKEN,
     });
 
-    const run = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
       scheduler,
-      maxAttempts: 3,
+      maxTransientFailures: 2,
     });
 
-    expect(run).toBeNull();
+    expect(result.kind).toBe("unavailable");
+    if (result.kind === "unavailable") expect(result.message).toContain("Atualize a conversa");
+  });
+});
+
+describe("chat session — run discovery (3C.2 audit)", () => {
+  /**
+   * Regression 1: a run admitted late (provider slow to start) used to stay invisible because
+   * the old loop stopped after 8 *successful* probes (~25 s). Discovery must keep probing for
+   * as long as the send is pending; only `maxAttempts` consecutive misses bound it.
+   */
+  it("keeps probing past 8 successful non-matching probes and still finds the run", async () => {
+    let call = 0;
+    const listExecutions = vi.fn(async () => {
+      call += 1;
+      // The run only appears on the 12th successful probe — beyond the old 8-attempt cap.
+      return call >= 12 ? [makeRun({ status: "running" })] : [];
+    });
+    const service = createConversationService({
+      service: stubService({ listExecutions }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      maxAttempts: 20,
+    });
+
+    expect(result.kind).toBe("found");
+    if (result.kind === "found") expect(result.run.id).toBe(RUN_ID);
+    expect(listExecutions).toHaveBeenCalledTimes(12);
+  });
+
+  /**
+   * The budget counts only *successful* non-matching probes, so a flaky network must not eat
+   * into the window in which the run can still be discovered.
+   */
+  it("does not consume the successful-probe budget on transient failures", async () => {
+    let good = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          // Fail every other probe: 8 failures interleaved with 8 successes must still fit in
+          // the default budget of 8 successful probes.
+          if (good % 2 === 0) {
+            good += 1;
+            throw new ApiError({ kind: "network", message: "offline", retryable: true });
+          }
+          good += 1;
+          return good >= 16 ? [makeRun({ status: "running" })] : [];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
+
+    expect(result.kind).toBe("found");
+  });
+
+  /** With the default budget a permanently empty list still stops (bounded, not infinite). */
+  it("stops after the default number of successful non-matching probes", async () => {
+    let call = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          call += 1;
+          return [];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
+
+    expect(result.kind).toBe("unavailable");
+    expect(call).toBe(8);
+  });
+
+  /**
+   * Regression 2: one probe at a time. A slow response must never stack a second request for
+   * the same send (the old code could overlap a probe with the next scheduler tick).
+   */
+  it("never issues two probes concurrently", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let call = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          call += 1;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          inFlight -= 1;
+          return call >= 3 ? [makeRun({ status: "running" })] : [];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    // Real timers here on purpose: the concurrency must hold with async gaps.
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      maxAttempts: 10,
+    });
+
+    expect(result.kind).toBe("found");
+    expect(maxInFlight).toBe(1);
+  });
+
+  /**
+   * Regression 3: discovery stops the instant the send settles — it is aborted by the caller,
+   * and the abort must be observable as `aborted`, never as "the run does not exist".
+   */
+  it("stops on abort and reports aborted instead of unavailable", async () => {
+    const controller = new AbortController();
+    let probes = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          probes += 1;
+          if (probes === 3) controller.abort();
+          return [];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      signal: controller.signal,
+    });
+
+    expect(result).toEqual({ kind: "aborted" });
+    expect(probes).toBe(3);
+  });
+
+  /** Regression 3b: an abort that lands while a probe is in flight also stops immediately. */
+  it("stops when the signal is already aborted before the first probe", async () => {
+    const listExecutions = vi.fn(async () => [makeRun()]);
+    const service = createConversationService({
+      service: stubService({ listExecutions }),
+      token: TEST_TOKEN,
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      signal: controller.signal,
+    });
+
+    expect(result).toEqual({ kind: "aborted" });
+    expect(listExecutions).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Regression 4: the run id exposed to the UI is always the server's. `onProbe` receives the
+   * authoritative list, and a match on `requestId` is what unlocks the cancel button.
+   */
+  it("exposes the real server run id through onProbe as soon as it is listed", async () => {
+    const seen: string[] = [];
+    let call = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          call += 1;
+          return call === 1 ? [] : [makeRun({ id: RUN_ID, status: "running" })];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      onProbe: (runs) => {
+        for (const run of runs) seen.push(run.id);
+      },
+    });
+
+    expect(result.kind).toBe("found");
+    expect(seen).toEqual([RUN_ID]); // only the authoritative id, never a derived one
+  });
+
+  /** A `401` during discovery must not be reported as an absent run. */
+  it("reports an expired session during discovery as unavailable, not as a missing run", async () => {
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          throw new ApiError({ kind: "http", status: 401, message: "unauthorized", code: "AUTH_REQUIRED" });
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
+
+    expect(result.kind).toBe("unavailable");
+  });
+
+  /** Transient failures are retried a bounded number of times before giving up. */
+  it("tolerates transient failures without exceeding the configured budget", async () => {
+    let call = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          call += 1;
+          if (call === 1 || call === 2) throw new ApiError({ kind: "network", message: "offline" });
+          return [makeRun({ status: "running" })];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      maxTransientFailures: 3,
+    });
+
+    expect(result.kind).toBe("found");
+    expect(call).toBe(3);
+  });
+
+  /** Backoff is bounded and monotonic: no unbounded growth, no zero-delay busy loop. */
+  it("uses a bounded, non-decreasing backoff", () => {
+    const delays = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20].map((attempt) => discoveryDelayFor(attempt));
+    for (const delay of delays) {
+      expect(delay).toBeGreaterThan(0);
+      expect(delay).toBeLessThanOrEqual(Math.max(...DISCOVERY_DELAYS_MS));
+    }
+    for (let index = 1; index < delays.length; index += 1) {
+      expect(delays[index]!).toBeGreaterThanOrEqual(delays[index - 1]!);
+    }
+  });
+});
+
+describe("chat session — recovery of a run left running (3C.2 audit)", () => {
+  /**
+   * Regression 5: reopening a conversation must find the execution the server still owns and
+   * expose its **real** id, so the user can cancel it. Nothing is invented or re-sent.
+   */
+  it("lists only non-terminal runs, in the server's own order", async () => {
+    const running = makeRun({ id: RUN_ID, status: "running", createdAt: "2026-01-01T10:00:00.000Z" });
+    const queued = makeRun({
+      id: "11111111-1111-4111-8111-111111111111",
+      status: "queued",
+      createdAt: "2026-01-01T10:05:00.000Z",
+    });
+    const finished = makeRun({
+      id: "22222222-2222-4222-8222-222222222222",
+      status: "succeeded",
+      createdAt: "2026-01-01T09:00:00.000Z",
+    });
+    const service = createConversationService({
+      service: stubService({ listExecutions: async () => [finished, running, queued] }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).activeRuns();
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Terminal states are excluded; the remaining order is the server's (createdAt ASC).
+    expect(result.data.map((run) => run.id)).toEqual([RUN_ID, queued.id]);
+  });
+
+  it("returns the shared-schema terminal states as not active", async () => {
+    const statuses = ["succeeded", "partial", "failed", "cancelled"] as const;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () =>
+          statuses.map((status, index) =>
+            makeRun({ id: `3333333${index}-3333-4333-8333-333333333333`, status }),
+          ),
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).activeRuns();
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.data).toEqual([]);
+  });
+
+  /** A `401` while listing executions must reach the session layer, not look like "no runs". */
+  it("propagates an expired session instead of reporting an empty list", async () => {
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          throw new ApiError({ kind: "http", status: 401, message: "unauthorized", code: "AUTH_REQUIRED" });
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).activeRuns();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.signedOut).toBe(true);
+  });
+
+  /** A transport failure during recovery is reported, never silently ignored. */
+  it("reports a transport failure while listing executions", async () => {
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          throw new ApiError({ kind: "network", message: "offline" });
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).activeRuns();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.signedOut).toBe(false);
+      expect(result.message).toBe("offline");
+    }
   });
 });
 

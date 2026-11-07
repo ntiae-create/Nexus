@@ -112,6 +112,16 @@ export function makeInspection(overrides: Partial<CoreExecutionInspection> = {})
   };
 }
 
+/**
+ * Non-terminal / terminal runs as the server would list them.
+ *
+ * `listByConversation` orders by `createdAt ASC, id ASC`, so fixtures keep that ordering
+ * where the test depends on it (recovery follows the oldest active run).
+ */
+export function makeActiveRuns(runs: readonly CoreRun[]): readonly CoreRun[] {
+  return [...runs].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
 /** Full `POST /v1/conversations/:id/messages` body (HTTP 201). */
 export function makeExecutionResponse(
   overrides: Partial<CoreExecutionResponse> = {},

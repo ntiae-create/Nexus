@@ -50,6 +50,7 @@ type ChatOverrides = {
   cancel?: ChatSession["cancel"];
   follow?: ChatSession["follow"];
   findRun?: ChatSession["findRun"];
+  activeRuns?: ChatSession["activeRuns"];
 };
 
 function makeService(options: {
@@ -61,7 +62,8 @@ function makeService(options: {
     send: options.chat?.send ?? (async () => ({ kind: "rejected", message: "não configurado" })),
     cancel: options.chat?.cancel ?? (async () => ({ kind: "cancelled" })),
     follow: options.chat?.follow ?? (async () => ({ outcome: { kind: "aborted" }, messages: null })),
-    findRun: options.chat?.findRun ?? (async () => null),
+    findRun: options.chat?.findRun ?? (async () => ({ kind: "aborted" })),
+    activeRuns: options.chat?.activeRuns ?? (async () => ({ ok: true as const, data: [] })),
   };
 
   return {
@@ -560,11 +562,24 @@ describe("ChatScreen — execution states", () => {
 describe("ChatScreen — cancellation while processing", () => {
   it("offers cancel while processing and reloads the persisted state afterwards", async () => {
     let releaseSend: (() => void) | null = null;
-    const cancel = vi.fn(async (): Promise<CancelOutcome> => ({ kind: "cancelled" }));
-    const follow = vi.fn(async (): Promise<FollowResult> => ({
-      outcome: { kind: "cancelled", run: makeRun({ status: "cancelled" }) },
-      messages: [makeUserMessage({ content: [{ type: "text", text: "Mensagem persistida" }] })],
-    }));
+    // The tracking loop stays open, exactly like a run the server is still executing.
+    let resolveFollow: (value: FollowResult) => void = () => undefined;
+    const follow = vi.fn(
+      (): Promise<FollowResult> =>
+        new Promise<FollowResult>((resolve) => {
+          resolveFollow = resolve;
+        }),
+    );
+    const cancel = vi.fn(async (): Promise<CancelOutcome> => {
+      // The server honours the cancel: the loop already watching the run observes it.
+      resolveFollow({
+        outcome: { kind: "cancelled", run: makeRun({ status: "cancelled" }) },
+        messages: [
+          makeUserMessage({ content: [{ type: "text", text: "Mensagem persistida" }] }),
+        ],
+      });
+      return { kind: "cancelled" };
+    });
 
     const view = render(
       makeService({
@@ -578,7 +593,7 @@ describe("ChatScreen — cancellation while processing", () => {
           cancel,
           follow,
           // The run becomes discoverable immediately, so the cancel button appears.
-          findRun: async () => makeRun({ status: "running" }),
+          findRun: async () => ({ kind: "found" as const, run: makeRun({ status: "running" }) }),
         },
       }),
     );
@@ -588,6 +603,8 @@ describe("ChatScreen — cancellation while processing", () => {
     submit(view.host);
 
     await waitFor(() => text(view.host).includes("Cancelar execução"));
+    // The single tracking loop owns the run before the cancel.
+    await waitFor(() => follow.mock.calls.length === 1);
 
     await act(async () => {
       [...view.host.querySelectorAll<HTMLButtonElement>("button")]
@@ -596,9 +613,13 @@ describe("ChatScreen — cancellation while processing", () => {
       await wait(20);
     });
 
-    expect(cancel).toHaveBeenCalledWith(RUN_ID);
-    expect(follow).toHaveBeenCalledWith(RUN_ID, expect.anything());
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith(RUN_ID, expect.anything());
     await waitFor(() => text(view.host).includes("Mensagem persistida"));
+    await waitFor(() => text(view.host).includes("A execução foi cancelada"));
+    // No second loop: the cancel only asks the server and lets the live loop finish.
+    expect(follow).toHaveBeenCalledTimes(1);
+    expect(text(view.host)).not.toContain("Cancelar execução");
 
     await act(async () => {
       releaseSend?.();
@@ -619,7 +640,7 @@ describe("ChatScreen — cancellation while processing", () => {
               message: "Não foi possível conectar ao servidor.",
             }),
           }),
-          findRun: async () => makeRun({ status: "running" }),
+          findRun: async () => ({ kind: "found" as const, run: makeRun({ status: "running" }) }),
         },
       }),
     );

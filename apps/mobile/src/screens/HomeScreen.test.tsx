@@ -47,7 +47,8 @@ function makeService(overrides: Partial<ConversationService> = {}): Conversation
       send: async () => ({ kind: "rejected", message: "not used in this test" }),
       cancel: async () => ({ kind: "cancelled" }),
       follow: async () => ({ outcome: { kind: "aborted" }, messages: null }),
-      findRun: async () => null,
+      findRun: async () => ({ kind: "aborted" }),
+      activeRuns: async () => ({ ok: true, data: [] }),
     }),
   };
   return { ...base, ...overrides };

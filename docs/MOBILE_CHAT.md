@@ -103,26 +103,53 @@ Regras aplicadas:
   o app **nunca** envia `delegations` — delegação YUI → ALICE/SCHWI é decisão exclusiva do CORE.
 - Nenhum campo de provedor, modelo ou preço é enviado pelo cliente; a política `:free` continua
   inteiramente no backend.
+- **Ciclo de vida do rascunho**: o campo é limpo apenas quando o servidor já consumiu o texto
+  (`delivered`, `failed` ou `cancelled`). Em `rejected`/`unknown` o rascunho permanece, porque
+  nada foi persistido ou não há confirmação. Rascunhos nunca são limpos "otimisticamente".
+- **Trava de concorrência**: o envio é bloqueado somente enquanto o `POST` está em voo
+  (`sending !== null`). Uma execução que está apenas sendo acompanhada — inclusive uma
+  recuperada ao reabrir — **não** trava o composer: o servidor aceita uma nova mensagem e o
+  usuário não foi convidado a esperar.
 
-## 6. Acompanhamento de execução (polling)
+## 6. Descoberta do run e acompanhamento
 
-O `POST .../messages` só responde ao final da execução. Para que o usuário veja progresso e
-possa cancelar, o app faz duas coisas em paralelo:
+O `POST .../messages` só responde ao final da execução, então o `runId` necessário para
+cancelar não existe no cliente enquanto o CORE trabalha. O app separa dois ciclos, com no
+máximo **um de cada por vez**:
 
-1. **Descoberta** — `GET /v1/conversations/:id/executions` até encontrar o run cujo
-   `requestId` é o da mensagem enviada (8 tentativas, 400 ms → 3 s). Nenhum id de run é
-   derivado no cliente.
-2. **Acompanhamento** — quando o envio se recupera de falha ambígua, `GET /v1/executions/:runId`
-   com atrasos crescentes (`400, 800, 1200, 1600, 2000, 2500, 3000` ms, teto de 40 tentativas).
+1. **Descoberta** — `GET /v1/conversations/:id/executions` procurando o run cujo `requestId`
+   é exatamente o da mensagem enviada. Nenhum id de run é derivado, hasheado ou inventado no
+   cliente.
+2. **Acompanhamento** — `GET /v1/executions/:runId` com atrasos crescentes
+   (`400, 800, 1200, 1600, 2000, 2500, 3000` ms, teto de 40 tentativas), iniciado pela
+   descoberta ou pela recuperação ao reabrir.
 
-Garantias:
+### Política de descoberta
+
+| Aspecto | Comportamento |
+| --- | --- |
+| Limite | Enquanto o envio está pendente, quem limita é o **tempo de vida do próprio envio** (`AbortSignal` do `POST`). O laço não termina por número fixo de tentativas enquanto a mensagem ainda está em voo. |
+| Teto de segurança | `DISCOVERY_SAFETY_PROBE_CAP = 240` probes — ~12 min no intervalo de 3 s. Existe só para um chamador que nunca aborta; não é o que interrompe uma execução viva. Sem sinal, cai no orçamento conservador de 8 probes bem-sucedidas. |
+| Falhas transitórias | Até 5 falhas **consecutivas** (rede/`5xx`) são toleradas; elas não consomem o orçamento de probes bem-sucedidas. Um `401` encerra como `unavailable` e devolve o usuário ao login. |
+| Concorrência | Uma probe por vez (`await`), sempre. Um servidor lento nunca empilha requisições duplicadas. |
+| Encerramento | Termina imediatamente quando: encontra o run, o envio conclui (`discovery.abort()` no `finally` do send), a tela desmonta, ou a conversa troca. |
+| Resultado | `found` (run real do servidor), `aborted` (cancelado localmente — nada se conclui sobre o run) ou `unavailable` (o estado não pôde ser lido; a UI diz isso e oferece atualizar). Nunca confunde abort local com "run inexistente". |
+| Timers e listeners | `waitForDelay` sempre limpa o `setTimeout` e remove o listener de `abort`, inclusive no caminho feliz — nenhum timer ou listener abandonado por probe. |
+
+Quando a lista já contém o run, `onProbe` publica o id **real** na tela imediatamente, e é
+isso que faz o botão de cancelar aparecer no instante em que o servidor expõe a execução.
+
+### Garantias do acompanhamento
 
 - a consulta **para no primeiro estado terminal** (`succeeded`, `partial`, `failed`, `cancelled`);
-- erros transitórios (rede, `5xx`) são tolerados até 4 probes consecutivos; `401` interrompe
-  imediatamente e devolve o usuário ao login;
-- cada envio tem seu próprio `AbortController`, abortado no unmount da tela, então nenhuma
-  requisição ou timer sobrevive à navegação;
-- a taxa é limitada pelo backoff — não há laço apertado nem streaming inventado.
+- erros transitórios são tolerados até 4 probes consecutivas; `401` interrompe na hora e volta
+  ao login;
+- cada ciclo (`send`, `discovery`, `tracking`, `history`, `recovery`, `cancel`) tem seu próprio
+  `AbortController`, todos abortados no unmount;
+- toda continuação depois de um `await` valida `mounted` **e** o id da conversa antes de tocar
+  no estado, então uma resposta atrasada não escreve na tela errada;
+- a taxa é limitada pelo backoff — não há laço apertado, requisição concorrente nem streaming
+  inventado.
 
 ## 7. Estados apresentados
 
@@ -134,6 +161,7 @@ Garantias:
 | `failed` | Bloco de erro com `failureCode` persistido (ex.: `PROVIDER_TIMEOUT`) e nenhuma bolha de assistente. |
 | `cancelled` | Nenhuma resposta; o histórico é recarregado e o indicador desaparece. |
 | ambíguo | "Não foi possível confirmar o envio/estado. Reabra a conversa antes de reenviar." |
+| recuperado | O mesmo indicador de progresso, com a nota "Execução em andamento recuperada do servidor ao reabrir a conversa." e botão Cancelar. |
 | `401` | Volta ao login e limpa o token armazenado. |
 
 O código exato do erro é exibido apenas quando vem do contrato (`coreExecutionErrorCodeSchema`
@@ -141,12 +169,20 @@ ou `PROVIDER_*`); mensagens internas do servidor nunca são ecoadas.
 
 ## 8. Cancelamento
 
-1. O botão aparece quando o run foi descoberto por `requestId`.
-2. `POST /v1/executions/:runId/cancel` — autoridade é o PostgreSQL do CORE, não o app.
-3. `EXECUTION_ALREADY_TERMINAL` / `EXECUTION_CANCELLED` não são tratados como falha: a
-   execução apenas terminou antes, e o histórico é recarregado.
-4. Depois do cancelamento o app segue o run até o estado terminal e recarrega o histórico,
-   garantindo que nada seja "cancelado" apenas na UI.
+1. O botão aparece quando o run real foi descoberto por `requestId` (ou recuperado ao reabrir).
+   Antes disso a tela só informa "Enviando ao NEXUS CORE…" — ela não inventa um id.
+2. `POST /v1/executions/:runId/cancel` — a autoridade é o PostgreSQL do CORE, não o app.
+3. O clique tem trava própria: um `AbortController` de cancelamento, o botão desabilitado e o
+   rótulo "Cancelando…" enquanto a requisição está em voo. Duplo toque não gera duas chamadas.
+4. **Cancelar não abre segundo laço.** Se já existe um acompanhamento vivo para aquele run, ele
+   é quem observa o estado terminal; a decisão é tomada *antes* do `await`, porque o laço pode
+   terminar durante o cancelamento. Só o caso órfão (run conhecido, sem laço) faz um `follow`.
+5. `EXECUTION_ALREADY_TERMINAL` / `EXECUTION_CANCELLED` não são tratados como falha: a execução
+   apenas terminou antes, e a tela informa isso.
+6. Falha do cancelamento **não** é mascarada: a mensagem de erro aparece, a execução continua
+   marcada como em andamento e nenhum estado terminal é inventado.
+7. **Abortar localmente ≠ cancelar no servidor.** Desmontar a tela ou trocar de conversa apenas
+   para o polling local; a execução continua no CORE e será recuperada na próxima visita.
 
 ## 9. Persistência e recuperação ao reabrir
 
@@ -155,8 +191,35 @@ ou `PROVIDER_*`); mensagens internas do servidor nunca são ecoadas.
 - Após um envio, a recarga do histórico é a fonte de renderização. Se essa recarga falhar, o
   app usa os objetos já devolvidos pelo `POST` (`inputMessage`/`assistantMessage`), que também
   são persistidos; nada é perdido nem inventado.
-- Se o reload falhar depois de um polling de sucesso, o resultado aparece como "não foi
-  possível carregar o histórico" com ação de atualizar — nunca como resposta inexistente.
+
+### Execução iniciada antes de sair da tela
+
+Cenário real: o usuário envia, o provedor ainda está trabalhando e ele sai da conversa (ou o
+app é suspenso). O `POST` local é abortado, mas a execução **continua no CORE**. Ao reabrir:
+
+1. a tela carrega o histórico persistido; com histórico não vazio, faz **uma** consulta a
+   `GET /v1/conversations/:id/executions`;
+2. os runs são filtrados com o vocabulário do schema compartilhado — permanecem apenas
+   `queued`/`running` (`activeRuns()`, usando `isTerminalRunStatus`);
+3. havendo execução ativa, a tela restaura o estado de processamento e passa a acompanhar
+   aquele `runId` real, com botão Cancelar disponível;
+4. ao chegar ao estado terminal, o histórico é recarregado e a resposta exibida é a
+   **persistida** — nunca uma mensagem otimista;
+5. **nada é reenviado**: a recuperação só lê e observa. Nenhum `POST .../messages` é feito, e
+   nenhuma segunda execução é criada para "buscar" a primeira.
+
+Contrato usado: o CORE grava `core_run_id` em `messages` apenas via `appendAssistant`, e a
+mensagem do usuário tem `runId = null`; a correlação entre mensagem e execução é feita pelo
+`requestId` do run. Por isso a recuperação parte da lista de execuções, e não do histórico.
+
+Múltiplas execuções ativas: a tela segue a **mais antiga** (ordem do servidor,
+`created_at ASC, id ASC`), que é a única ordem determinística que o contrato oferece, e diz
+que a execução foi recuperada do servidor. Ela não escolhe arbitrariamente, não mescla duas
+execuções em um estado e não inventa eventos.
+
+Se a consulta falhar, a tela **não** afirma que não há execução: mostra "não foi possível
+confirmar" com ação de verificar novamente. Um `401` volta ao login. Não há recuperação em
+segundo plano: o app não finge suporte a background que o contrato não oferece.
 
 ## 10. Falhas, isolamento e idempotência
 
@@ -187,29 +250,45 @@ ou `PROVIDER_*`); mensagens internas do servidor nunca são ecoadas.
 
 ## 12. Testes
 
-Arquivos novos (nenhum teste existente foi removido ou enfraquecido):
+Arquivos (nenhum teste existente foi removido ou enfraquecido):
 
 | Arquivo | Cobertura |
 | --- | --- |
 | `src/services/core-service.test.ts` | 9 rotas, envelopes, validação Zod, Bearer, ids, timeouts, erros do contrato. |
 | `src/services/execution-service.test.ts` | Estados terminais, backoff, `succeeded`/`partial`/`failed`/`cancelled`, erros transitórios, `401`, abort, cancelamento, recuperação. |
-| `src/services/conversation-service.test.ts` | Listagem/criação/histórico, envio, idempotência, recuperação por `requestId`, tradução de erros. |
+| `src/services/conversation-service.test.ts` | Listagem/criação/histórico, envio, idempotência, recuperação por `requestId`, tradução de erros, descoberta (limites, abort, concorrência, backoff) e `activeRuns()`. |
 | `src/lib/assistants.test.ts` | Espelho do catálogo conferido contra `catalog.ts` e a migração `00001`. |
 | `src/screens/HomeScreen.test.tsx` | Estados de lista, criação com cada assistente, refresh, logout, sem exclusão. |
 | `src/screens/ChatScreen.test.tsx` | Histórico, seleção, envio, trava de duplicidade, `partial`/`failed`/`cancelled`, cancelamento, sessão expirada. |
+| `src/screens/chat-recovery.test.tsx` | **Auditoria corretiva**: descoberta pelo serviço real (run admitido depois de 8 probes, parada no fim do envio, parada no unmount, id real exposto), recuperação ao reabrir, `succeeded`/`partial`/`failed`/`cancelled`, nenhum reenvio, dois runs ativos, laço único, troca rápida de conversa, sessão expirada e rede fora durante a recuperação, ausência de `setState` após unmount. |
 | `src/chat-flow.test.tsx` | Fluxo completo pelo `App` real com `fetch` mockado: criar, conversar, reabrir, recuperar, cancelar, sair. |
 
+`chat-recovery.test.tsx` monta `createConversationService` sobre um `CoreService` dublê, então
+o laço de descoberta, o backoff e os `AbortSignal` exercitados são os de produção — a tela é
+apenas a orquestração sobre eles. `ChatScreen.test.tsx` mantém o dublê de `ChatSession` para
+isolar comportamento de interface.
+
 Mocks controlados apenas: `fetchImpl` injetado e dublês de `CoreService`. **Nenhum teste faz
-chamada real a provedor ou a OpenRouter.**
+chamada real a provedor ou a OpenRouter.** Todas as fixtures vêm dos schemas compartilhados
+(`test-support/core-fixtures.ts`); nenhum formato é inventado no teste.
+
+Os testes de integração PostgreSQL (`*.integration.test.ts`, 28 casos) exigem
+`NEXUS_DATABASE_URL` e por isso aparecem como *skipped* fora do workflow dedicado.
 
 ## 13. Limitações desta etapa
 
 - **Sem exclusão de conversa**: o backend não expõe rota de exclusão; o app não oferece o
   botão. A listagem já filtra `status !== "deleted"`.
 - **Sem streaming**: o contrato não tem SSE/WebSocket; o acompanhamento é polling limitado.
-- **Cancelamento depende de descoberta**: enquanto o `POST` não retorna e a lista de execuções
-  não mostra o run, o botão de cancelar aparece apenas como "processando". O estado chega em
-  poucos segundos, porque o CORE persiste o run antes de chamar o provedor.
+- **Cancelamento depende de descoberta**: enquanto o servidor não lista o run, a tela não tem
+  id para cancelar e mostra apenas "processando" — nada é inventado no cliente. A descoberta
+  não é mais limitada por número fixo de tentativas enquanto o envio está pendente, então o
+  botão aparece assim que o CORE expõe a execução, mesmo num enfileiramento lento.
+- **Sem cancelamento em segundo plano**: se o app for encerrado, o polling local morre. A
+  execução continua no CORE e é recuperada na próxima abertura da conversa (com cancelamento
+  disponível de novo); não há trabalho em background após o processo morrer.
+- **Várias execuções ativas**: o contrato não oferece um "run atual" por conversa; a tela segue
+  a mais antiga e informa a origem. Ela não soma, mescla nem escolhe por conta própria.
 - **Sem título automático**: a conversa fica "Conversa sem título" até existir um resumo
   gerado pelo backend; o app não inventa título a partir do texto local.
 - **Sem token refresh**: mantido o comportamento da 3C.1; sessão expirada volta ao login.
