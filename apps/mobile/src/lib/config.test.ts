@@ -1,9 +1,23 @@
-import { describe, expect, it } from "vitest";
+/**
+ * @vitest-environment happy-dom
+ *
+ * The legacy override lives in `localStorage`, so these cases need a DOM.
+ */
+import { beforeEach, describe, expect, it } from "vitest";
 import {
+  API_BASE_URL_STORAGE_KEY,
   DEVELOPMENT_API_BASE_URL,
+  getApiBaseUrl,
   normalizeApiBaseUrl,
+  readLegacyApiBaseUrl,
+  resetApiBaseUrl,
   resolveApiBaseUrl,
+  shouldMigrateLegacyApiBaseUrl,
 } from "./config.js";
+
+const setLegacy = (value: string): void => {
+  window.localStorage.setItem(API_BASE_URL_STORAGE_KEY, value);
+};
 
 describe("api base url configuration", () => {
   describe("normalizeApiBaseUrl", () => {
@@ -72,6 +86,63 @@ describe("api base url configuration", () => {
       // The APK must fail explicitly as "not configured" instead of trying to reach
       // the phone itself, which would surface as an opaque network error.
       expect(resolveApiBaseUrl({ stored: null, fromEnv: null, native: true })).toBeNull();
+    });
+  });
+
+  describe("legacy nexus.apiBaseUrl override", () => {
+    beforeEach(() => {
+      window.localStorage.clear();
+      resetApiBaseUrl();
+    });
+
+    it("reads a valid legacy address from localStorage", () => {
+      setLegacy("https://legacy.example.test/");
+      expect(readLegacyApiBaseUrl()).toBe("https://legacy.example.test");
+    });
+
+    it("returns null when the legacy value is absent", () => {
+      expect(readLegacyApiBaseUrl()).toBeNull();
+    });
+
+    it("ignores an unusable legacy value", () => {
+      setLegacy("not-a-url");
+      expect(readLegacyApiBaseUrl()).toBeNull();
+    });
+
+    it("is recovered by getApiBaseUrl before the development fallback", () => {
+      // Regression: the browser used to skip the legacy key and go straight to
+      // the localhost default, losing an address configured by an older build.
+      setLegacy("https://legacy.example.test");
+      expect(getApiBaseUrl()).toBe("https://legacy.example.test");
+    });
+
+    it("falls back to the development default when nothing is configured", () => {
+      expect(getApiBaseUrl()).toBe(DEVELOPMENT_API_BASE_URL);
+    });
+  });
+
+  describe("shouldMigrateLegacyApiBaseUrl", () => {
+    it("migrates a legacy address when no preference exists", () => {
+      expect(
+        shouldMigrateLegacyApiBaseUrl({ stored: null, legacy: "https://legacy.example.test" }),
+      ).toBe(true);
+    });
+
+    it("never overwrites a newer preference with the legacy value", () => {
+      expect(
+        shouldMigrateLegacyApiBaseUrl({
+          stored: "https://current.example.test",
+          legacy: "https://legacy.example.test",
+        }),
+      ).toBe(false);
+    });
+
+    it("does not migrate when the legacy value is unusable", () => {
+      expect(shouldMigrateLegacyApiBaseUrl({ stored: null, legacy: "not-a-url" })).toBe(false);
+    });
+
+    it("does nothing when neither source is configured", () => {
+      expect(shouldMigrateLegacyApiBaseUrl({ stored: null, legacy: null })).toBe(false);
     });
   });
 });

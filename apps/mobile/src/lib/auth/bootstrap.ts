@@ -1,5 +1,13 @@
 import { Preferences } from "@capacitor/preferences";
-import { API_BASE_URL_PREFERENCE_KEY, isNativeApp, normalizeApiBaseUrl, resolveApiBaseUrl, setApiBaseUrl } from "../config.js";
+import {
+  API_BASE_URL_PREFERENCE_KEY,
+  isNativeApp,
+  normalizeApiBaseUrl,
+  readLegacyApiBaseUrl,
+  resolveApiBaseUrl,
+  setApiBaseUrl,
+  shouldMigrateLegacyApiBaseUrl,
+} from "../config.js";
 import { createApiClient } from "../../services/api-client.js";
 import { createAuthService } from "../../services/auth-service.js";
 import { createSecureStorage, type SecureStorage } from "./secure-storage.js";
@@ -20,6 +28,13 @@ export interface AppContainer {
  * It lives in Capacitor `Preferences` (plain, unencrypted, non-secret) because an
  * address is configuration, not a credential. Secure storage is reserved for the
  * session token.
+ *
+ * Precedence, highest first:
+ * 1. `Preferences` (set by this build's configuration screen);
+ * 2. legacy `nexus.apiBaseUrl` from `localStorage` (previous builds), migrated
+ *    into `Preferences` on Android without overwriting a newer value;
+ * 3. `VITE_NEXUS_API_URL`;
+ * 4. the browser-only development default.
  */
 async function readConfiguredApiBaseUrl(): Promise<string | null> {
   try {
@@ -31,6 +46,30 @@ async function readConfiguredApiBaseUrl(): Promise<string | null> {
 }
 
 /**
+ * Copies a legacy address into `Preferences` so the current build keeps working.
+ *
+ * The preference is only written when it holds no usable value, so a newer
+ * configuration is never replaced by an older one. A failed write is not fatal:
+ * the address still applies for this run and the next launch retries.
+ */
+async function migrateLegacyApiBaseUrl(
+  configured: string | null,
+  legacy: string | null,
+): Promise<string | null> {
+  if (!shouldMigrateLegacyApiBaseUrl({ stored: configured, legacy })) return configured;
+
+  const normalized = normalizeApiBaseUrl(legacy);
+  if (!normalized) return configured;
+
+  try {
+    await Preferences.set({ key: API_BASE_URL_PREFERENCE_KEY, value: normalized });
+  } catch {
+    // Keep using the legacy address in this session; nothing is lost.
+  }
+  return normalized;
+}
+
+/**
  * Builds the application graph once, before React renders.
  *
  * Resolving the base URL here (instead of inside a render) keeps the HTTP client
@@ -39,7 +78,13 @@ async function readConfiguredApiBaseUrl(): Promise<string | null> {
  */
 export async function bootstrapApp(): Promise<AppContainer> {
   const native = isNativeApp();
-  const stored = native ? await readConfiguredApiBaseUrl() : null;
+
+  // `localStorage` is read for the endpoint only — never for a credential. On the
+  // web it is the actual configuration source; on Android it is the legacy store
+  // written by earlier builds, migrated into `Preferences` below.
+  const legacy = readLegacyApiBaseUrl();
+  const configured = native ? await readConfiguredApiBaseUrl() : null;
+  const stored = native ? await migrateLegacyApiBaseUrl(configured, legacy) : legacy;
 
   const resolved = resolveApiBaseUrl({
     stored,

@@ -43,7 +43,7 @@ interface SecureStoragePlugin {
 /**
  * Native plugin access is declared through `registerPlugin`, exactly like any
  * Capacitor plugin. The Android module that implements it ships with the app
- * (`android/app/src/main/java/dev/nexus/mobile/SecureSessionPlugin.kt`), and its
+ * (`android/app/src/main/java/dev/nexus/mobile/SecureSessionPlugin.java`), and its
  * backing store is Android Keystore-encrypted, so the token is not readable by
  * `adb`/backups the way plain SharedPreferences would be.
  *

@@ -1,9 +1,12 @@
 import { Capacitor } from "@capacitor/core";
 
 /**
- * Runtime override key. Preserved for compatibility: it can still be set from the
- * browser console or by a previous build, but it is no longer the recommended way
- * to point the APK at a backend.
+ * Legacy key for the runtime override.
+ *
+ * Earlier builds stored the backend address here through `localStorage` on every
+ * platform — including inside the Android WebView. It holds an address only, never
+ * a credential, so keeping compatibility with it is safe. It is read (and, on
+ * Android, migrated) but never written by this version.
  */
 export const API_BASE_URL_STORAGE_KEY = "nexus.apiBaseUrl";
 
@@ -51,7 +54,10 @@ export function normalizeApiBaseUrl(raw: unknown): string | null {
 }
 
 export interface ResolveApiBaseUrlInput {
-  /** Value persisted by the app configuration screen. */
+  /**
+   * Value persisted by the app configuration screen (Capacitor `Preferences`).
+   * Takes precedence over every legacy source.
+   */
   readonly stored?: string | null;
   /** Value coming from `VITE_NEXUS_API_URL` at build time. */
   readonly fromEnv?: string | null;
@@ -76,6 +82,20 @@ export function resolveApiBaseUrl(input: ResolveApiBaseUrlInput): string | null 
   return input.native ? null : DEVELOPMENT_API_BASE_URL;
 }
 
+/**
+ * Decides whether a legacy address should be migrated into `Preferences`.
+ *
+ * Migration never overwrites a value that is already configured: the current
+ * preference always wins, and an unusable legacy value is simply ignored rather
+ * than propagated.
+ */
+export function shouldMigrateLegacyApiBaseUrl(input: {
+  readonly stored: string | null;
+  readonly legacy: string | null;
+}): boolean {
+  return normalizeApiBaseUrl(input.stored) === null && normalizeApiBaseUrl(input.legacy) !== null;
+}
+
 const isNativePlatform = (): boolean => {
   try {
     return Capacitor.isNativePlatform();
@@ -84,6 +104,17 @@ const isNativePlatform = (): boolean => {
     return false;
   }
 };
+
+/**
+ * Reads the legacy `localStorage` override.
+ *
+ * Kept for installations that stored the address in an earlier build. The value is
+ * an endpoint, not a secret; nothing else is ever read from or written to
+ * `localStorage` here.
+ */
+export function readLegacyApiBaseUrl(): string | null {
+  return normalizeApiBaseUrl(readStoredOverride());
+}
 
 const readStoredOverride = (): string | null => {
   try {
@@ -109,9 +140,12 @@ export function setApiBaseUrl(value: string | null): void {
 /**
  * Resolves the API base URL synchronously.
  *
- * Precedence: value configured during bootstrap > runtime override
+ * Precedence: value configured during bootstrap > legacy runtime override
  * (`nexus.apiBaseUrl` in localStorage) > `VITE_NEXUS_API_URL` > development default
  * (browser only).
+ *
+ * This is the synchronous fallback used before/around bootstrap. The application
+ * graph is built by `bootstrapApp()`, which also awaits the native preference.
  */
 export function getApiBaseUrl(): string | null {
   if (configuredBaseUrl !== undefined) {

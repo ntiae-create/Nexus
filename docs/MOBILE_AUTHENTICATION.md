@@ -33,7 +33,7 @@ A senha nunca é persistida em nenhum backend, e o token nunca é renderizado, r
 
 ## Endereço da API
 
-A precedência é: preferência `nexus.apiBaseUrl` (definida em "Configurar endereço da API", dentro do aplicativo) → `VITE_NEXUS_API_URL` → padrão de desenvolvimento apenas no navegador. Em Android não há padrão: sem endereço configurado, o aplicativo pede o endereço em vez de assumir `localhost`, que no dispositivo aponta para o próprio aparelho. A URL precisa ser absoluta `http`/`https` e não pode conter credenciais.
+A precedência é: preferência `nexus.apiBaseUrl` (definida em "Configurar endereço da API", dentro do aplicativo) → chave legada `nexus.apiBaseUrl` do `localStorage` (gravada por versões anteriores) → `VITE_NEXUS_API_URL` → padrão de desenvolvimento apenas no navegador. No Android, o valor legado é migrado para `Preferences` na inicialização, sem nunca sobrescrever uma preferência mais nova; no navegador, ele é lido diretamente, e só contém endereço — nunca credencial. Em Android não há padrão: sem endereço configurado, o aplicativo pede o endereço em vez de assumir `localhost`, que no dispositivo aponta para o próprio aparelho. A URL precisa ser absoluta `http`/`https` e não pode conter credenciais.
 
 ## Testes
 
