@@ -245,16 +245,29 @@ inspect() {
 
   local aapt2
   aapt2="$(find_aapt2)" || fail "aapt2 not found (set AAPT2 or install Android build-tools)"
+  if [[ ! -x "$aapt2" ]]; then
+    fail "aapt2 is not executable: $aapt2"
+  fi
+  # Best-effort: a diagnostic probe must never decide the script's exit status.
+  local aapt2_version
+  aapt2_version="$("$aapt2" version 2>&1 | head -1 || true)"
   DIAGNOSTIC_NOTE="apk: $apk
 aapt2: $aapt2
-aapt2 version: $("$aapt2" version 2>&1 | head -1)"
+aapt2 version: ${aapt2_version:-<unknown>}"
 
-  local workdir
+  # `workdir` must NOT be `local`: the EXIT trap runs after inspect() returns, when
+  # the local scope is gone. Under `set -u` the trap would then abort with
+  # "workdir: unbound variable" *after* the verdict was printed, turning a PASS into
+  # exit code 1. A global variable keeps the trap valid for the whole run.
   workdir="$(mktemp -d)"
-  trap 'rm -rf "$workdir"' EXIT
+  trap 'rm -rf "${workdir:-}"' EXIT
 
   local manifest_dump="$workdir/manifest.txt"
-  "$aapt2" dump xmltree --file AndroidManifest.xml "$apk" >"$manifest_dump"
+  if ! "$aapt2" dump xmltree --file AndroidManifest.xml "$apk" >"$manifest_dump" 2>"$workdir/aapt2.err"; then
+    DIAGNOSTIC_NOTE="${DIAGNOSTIC_NOTE}
+aapt2 dump failed: $(head -3 "$workdir/aapt2.err" 2>/dev/null || true)"
+    fail "aapt2 failed to dump the manifest of $apk"
+  fi
 
   # Locate the compiled network security config. Resource file paths can be
   # renamed, so instead of guessing a name we look for the resource whose root
