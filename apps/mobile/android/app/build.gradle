@@ -17,6 +17,13 @@ android {
         }
     }
     buildTypes {
+        // Network policy is selected purely by the `res/xml` source set:
+        //   main  -> network_security_config.xml        cleartext denied everywhere
+        //   debug -> network_security_config.xml        cleartext allowed for private LAN only
+        // The debug file has the same resource name, so Gradle's source-set
+        // precedence swaps it in for debug builds and it never reaches a release
+        // APK. The strict policy lives in `main`, so a missing override fails
+        // closed (HTTPS only) rather than opening cleartext traffic.
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'

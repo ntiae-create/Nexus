@@ -48,7 +48,28 @@ NEXUS_DATABASE_URL=... NEXUS_SESSION_SECRET=... NEXUS_OWNER_PASSWORD=... npm run
 
 No navegador, `npm run dev` abre o aplicativo em `http://localhost:5173` e o proxy de `/v1` encaminha para `NEXUS_DEV_API_PROXY` (padrão `http://127.0.0.1:3000`), evitando CORS em desenvolvimento.
 
-Para o Android: `npm run build --workspace @nexus/mobile`, depois `npx cap sync android` em `apps/mobile` e abra `apps/mobile/android` no Android Studio. No dispositivo, defina o endereço da API em "Configurar endereço da API" usando o IP da máquina de desenvolvimento (por exemplo `http://192.168.0.10:3000`); `localhost` jamais funciona a partir do aparelho. Serve HTTP em texto claro apenas para desenvolvimento local — produção exige HTTPS.
+Para o Android: `npm run build --workspace @nexus/mobile`, depois `npx cap sync android` em `apps/mobile` e abra `apps/mobile/android` no Android Studio.
+
+## HTTP em desenvolvimento e HTTPS em produção
+
+O `targetSdkVersion` é 35, e desde o Android 9 (API 28) o tráfego em texto claro é bloqueado por padrão. Uma rejeição silenciosa de `http://` no aparelho parece "backend fora do ar", então a política é declarada explicitamente em `android:networkSecurityConfig`.
+
+| Build | Arquivo de política | Cleartext |
+| --- | --- | --- |
+| Release (`main`) | `app/src/main/res/xml/network_security_config.xml` | **Negado para todos os destinos**; nenhuma exceção por domínio |
+| Debug | `app/src/debug/res/xml/network_security_config.xml` | Negado por padrão; liberado apenas para `10.0.2.2`, `localhost` e `127.0.0.1` |
+
+O arquivo de debug tem o mesmo nome de recurso e vive no source set `debug`, então o Gradle o substitui apenas em builds de debug e ele **nunca entra em um APK de release**. A política estrita fica em `main`, de modo que uma ausência de override falha fechada (somente HTTPS), nunca aberta.
+
+### Escolhendo o endereço na prática
+
+- **Emulador:** use `http://10.0.2.2:3000` — já liberado, é o alias do host.
+- **Aparelho físico via USB (recomendado):** rode `adb reverse tcp:3000 tcp:3000` e configure `http://localhost:3000` no app. O tráfego sai pelo loopback, já liberado, sem expor a máquina na rede.
+- **Aparelho físico na mesma rede:** o IP precisa ser **literal** em `app/src/debug/res/xml/network_security_config.xml`, por exemplo `<domain includeSubdomains="false">192.168.0.10</domain>`, e então `http://192.168.0.10:3000`. A Network Security Configuration do Android **não aceita CIDR**: escrever `192.168.0.0/16` casaria com nada. Adicione um `<domain>` por endereço usado.
+
+### Produção
+
+O endereço da API em produção precisa ser `https://`. Com a política de release, qualquer `http://` é bloqueado pela plataforma antes de a requisição sair do aparelho — não há caminho de configuração no app que reabra cleartext. A validação do endereço em `config.ts` aceita `http` apenas para permitir desenvolvimento; a exigência de TLS em produção é imposta pelo sistema operacional e verificada pelos testes de política de rede.
 
 ## Limitações conhecidas
 
@@ -57,4 +78,5 @@ Para o Android: `npm run build --workspace @nexus/mobile`, depois `npx cap sync 
 - **Sem renovação de token.** O token expira no prazo emitido pelo servidor; ao expirar, a próxima validação leva à tela de login. Renovação não faz parte do contrato atual e não foi adicionada.
 - **Bloqueio `429` é global.** É a política do backend existente, não algo introduzido aqui; o aplicativo apenas apresenta a mensagem.
 - **Sem verificação de certificado fixada (pinning).** Fora do escopo de 3C.1.
+- **Lista de IPs de debug é manual.** Como a plataforma não aceita CIDR, cada endereço de LAN usado em desenvolvimento precisa ser adicionado ao arquivo de debug. A alternativa sem edição é `adb reverse`.
 - **YUI, ALICE e SCHWI, chat, histórico e ferramentas permanecem intocados** nesta etapa.
