@@ -113,6 +113,8 @@ jobs:
           echo "release_apk=${release_apk}" >> "$GITHUB_OUTPUT"
 
       - name: Verify debug APK network policy
+        # The script writes `apk-policy-debug.txt` with the dumps it inspected; the
+        # upload step below publishes it even when this fails.
         run: |
           ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
         working-directory: apps/mobile/android
@@ -121,6 +123,17 @@ jobs:
         run: |
           ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
         working-directory: apps/mobile/android
+
+      - name: Publish policy inspection report
+        # Always runs: on failure this artifact is the diagnosis, since it contains
+        # the compiled manifest and the network security config read from the APK.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-policy-report
+          path: apps/mobile/android/apk-policy-*.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Dump compiled policy for the reviewer
         # Printed so the reviewer can see the actual packaged resource, not a claim

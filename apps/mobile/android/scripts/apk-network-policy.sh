@@ -33,6 +33,16 @@ fail() {
     printf '\n--- compiled network security config ---\n' >&2
     cat "${DIAGNOSTIC_CONFIG}" >&2 || true
   fi
+  # Written to a file as well, so CI can upload it as a readable artifact even
+  # when the job log is not accessible to the reviewer.
+  if [[ -n "${DIAGNOSTIC_OUTPUT:-}" ]]; then
+    {
+      printf 'verdict: FAIL - %s\n\n' "$*"
+      cat "${DIAGNOSTIC_MANIFEST:-/dev/null}" 2>/dev/null || true
+      printf '\n--- network security config ---\n'
+      cat "${DIAGNOSTIC_CONFIG:-/dev/null}" 2>/dev/null || true
+    } >"${DIAGNOSTIC_OUTPUT}" 2>&1 || true
+  fi
   exit 1
 }
 
@@ -217,6 +227,8 @@ inspect() {
 
   local aapt2
   aapt2="$(find_aapt2)" || fail "aapt2 not found (set AAPT2 or install Android build-tools)"
+
+  DIAGNOSTIC_OUTPUT="${DIAGNOSTIC_OUTPUT:-apk-policy-${variant}.txt}"
 
   local workdir
   workdir="$(mktemp -d)"
