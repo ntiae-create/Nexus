@@ -223,12 +223,13 @@ check() {
 inspect() {
   local apk="${1:?apk required}" variant="${2:?variant required}"
 
+  # Set first, so even an early failure leaves a report behind for the reviewer.
+  DIAGNOSTIC_OUTPUT="${DIAGNOSTIC_OUTPUT:-apk-policy-${variant}.txt}"
+
   [[ -f "$apk" ]] || fail "APK not found: $apk"
 
   local aapt2
   aapt2="$(find_aapt2)" || fail "aapt2 not found (set AAPT2 or install Android build-tools)"
-
-  DIAGNOSTIC_OUTPUT="${DIAGNOSTIC_OUTPUT:-apk-policy-${variant}.txt}"
 
   local workdir
   workdir="$(mktemp -d)"
