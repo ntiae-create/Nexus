@@ -158,16 +158,16 @@ jobs:
           # One annotation per variant that actually failed, single line on purpose:
           # multi-line annotations are unreliable and the full dumps are already in
           # the log and the job summary above.
-          if [[ "${{ steps.verify_debug.outcome }}" != "success" ]]; then
-            verdict="$(head -1 apps/mobile/android/apk-policy-debug.txt 2>/dev/null || echo 'no report')"
-            echo "::error title=Debug APK network policy::${verdict}"
+          for variant in debug release; do
+            [ "${{ steps.verify_debug.outcome }}" = "success" ] &&               [ "${{ steps.verify_release.outcome }}" = "success" ] && break
+            if [ "$variant" = "debug" ] && [ "${{ steps.verify_debug.outcome }}" = "success" ]; then continue; fi
+            if [ "$variant" = "release" ] && [ "${{ steps.verify_release.outcome }}" = "success" ]; then continue; fi
+            verdict="no report"
+            report="apps/mobile/android/apk-policy-${variant}.txt"
+            if [ -f "$report" ]; then verdict="$(head -1 "$report")"; fi
+            echo "::error title=${variant} APK network policy::${verdict}"
             status=1
-          fi
-          if [[ "${{ steps.verify_release.outcome }}" != "success" ]]; then
-            verdict="$(head -1 apps/mobile/android/apk-policy-release.txt 2>/dev/null || echo 'no report')"
-            echo "::error title=Release APK network policy::${verdict}"
-            status=1
-          fi
+          done
 
           echo "final status: ${status}"
           exit $status
