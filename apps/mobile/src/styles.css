@@ -1,6 +1,6 @@
 :root {
-  color: #e5e7eb;
-  background: #111827;
+  color: #e7e7ea;
+  background: #0b0b0f;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", sans-serif;
   font-synthesis: none;
@@ -22,7 +22,9 @@ body {
   place-items: center;
   padding: calc(24px + env(safe-area-inset-top)) 24px
     calc(24px + env(safe-area-inset-bottom));
-  background: radial-gradient(circle at 20% 20%, #1e293b 0%, #111827 55%);
+  background:
+    radial-gradient(circle at 18% 12%, #1b1b2b 0%, #0b0b0f 55%),
+    radial-gradient(circle at 82% 88%, #141827 0%, #0b0b0f 60%);
 }
 
 .screen {
@@ -31,16 +33,16 @@ body {
 
 .card {
   width: 100%;
-  padding: 32px;
-  border: 1px solid #374151;
-  border-radius: 20px;
-  background: #1f2937;
-  box-shadow: 0 24px 80px rgb(0 0 0 / 24%);
+  padding: 24px;
+  border: 1px solid #262634;
+  border-radius: 18px;
+  background: #131320;
+  box-shadow: 0 24px 60px rgb(0 0 0 / 40%);
 }
 
 .eyebrow {
   margin: 0;
-  color: #93c5fd;
+  color: #a78bfa;
   font-size: 0.8rem;
   font-weight: 700;
   letter-spacing: 0.14em;
@@ -298,4 +300,344 @@ h1 {
   clip-path: inset(50%);
   white-space: nowrap;
   border: 0;
+}
+
+
+/* ------------------------------------------------------------------ NEXUS shell */
+
+/*
+ * Chat and home layouts own the full viewport height with `dvh`, so the Android on-screen
+ * keyboard shrinking the visual viewport does not push the composer out of reach. Safe-area
+ * insets keep content clear of the status bar and gesture bar.
+ */
+.home-screen {
+  width: min(100%, 560px);
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.home-header,
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.home-title,
+.chat-title {
+  margin: 6px 0 0;
+  font-size: 1.5rem;
+  line-height: 1.2;
+}
+
+.home-section-title {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+  color: #c7c7d4;
+}
+
+.home-create {
+  display: grid;
+  gap: 14px;
+}
+
+.home-list-section,
+.home-footer {
+  display: grid;
+  gap: 12px;
+}
+
+.home-footer .details {
+  margin: 0;
+}
+
+.conversation-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.conversation-item {
+  width: 100%;
+  min-height: 64px;
+  display: grid;
+  gap: 4px;
+  padding: 14px 16px;
+  border: 1px solid #262634;
+  border-radius: 14px;
+  background: #131320;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.conversation-item:active,
+.conversation-item:hover {
+  border-color: #4c3f8f;
+  background: #17172a;
+}
+
+.conversation-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.conversation-meta {
+  color: #9b9bb0;
+  font-size: 0.85rem;
+}
+
+/* Assistant selection (YUI / ALICE / SCHWI) — buttons with radio semantics. */
+.assistant-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.assistant-option {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid #33334a;
+  border-radius: 999px;
+  background: #14141f;
+  color: #cfcfe0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.assistant-option[aria-checked="true"],
+.assistant-option-selected {
+  border-color: #7c5cf0;
+  background: #241d45;
+  color: #f3f0ff;
+  box-shadow: 0 0 0 1px #7c5cf0 inset;
+}
+
+.assistant-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------------- chat screen */
+
+.chat-screen {
+  width: min(100%, 560px);
+  height: calc(100dvh - 48px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chat-header {
+  flex: 0 0 auto;
+  align-items: flex-start;
+}
+
+.chat-back {
+  align-self: center;
+  padding-left: 0;
+}
+
+.chat-titles {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.chat-title {
+  overflow: hidden;
+  font-size: 1.15rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-subtitle {
+  margin: 2px 0 0;
+  color: #9b9bb0;
+  font-size: 0.8rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.chat-assistant {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 8px;
+}
+
+.chat-assistant[hidden] {
+  display: none;
+}
+
+.chat-assistant-label {
+  margin: 0;
+  color: #9b9bb0;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chat-loading,
+.chat-empty,
+.chat-alert {
+  flex: 0 0 auto;
+}
+
+.chat-messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 4px 2px 8px;
+  list-style: none;
+  scrollbar-width: thin;
+}
+
+.bubble-row {
+  display: flex;
+  width: 100%;
+}
+
+.bubble-row-user {
+  justify-content: flex-end;
+}
+
+.bubble-row-assistant {
+  justify-content: flex-start;
+}
+
+.bubble {
+  max-width: 86%;
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  font-size: 0.97rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.bubble-user {
+  border: 1px solid #3a3a8f;
+  border-bottom-right-radius: 6px;
+  background: linear-gradient(160deg, #2a2a6e 0%, #24245c 100%);
+  color: #f1f1ff;
+}
+
+.bubble-assistant {
+  border: 1px solid #262634;
+  border-bottom-left-radius: 6px;
+  background: #16161f;
+  color: #e7e7ea;
+}
+
+.bubble-pending {
+  display: grid;
+  gap: 10px;
+}
+
+.bubble-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: #a9a9c2;
+  font-size: 0.74rem;
+}
+
+.bubble-author {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.bubble-user .bubble-meta {
+  color: #c3c3ec;
+}
+
+.bubble-text {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.bubble-state {
+  margin: 0;
+  padding-top: 2px;
+  font-size: 0.78rem;
+  color: #fbbf24;
+}
+
+.bubble-state-failed,
+.bubble-state-cancelled {
+  color: #fca5a5;
+}
+
+/* -------------------------------------------------------------------- composer */
+
+.composer {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 10px;
+  padding: 10px 0 calc(2px + env(safe-area-inset-bottom));
+  border-top: 1px solid #22222f;
+}
+
+.composer-input {
+  width: 100%;
+  min-height: 48px;
+  max-height: 160px;
+  padding: 12px 14px;
+  border: 1px solid #33334a;
+  border-radius: 14px;
+  background: #101018;
+  color: #f3f3f7;
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1.4;
+  resize: none;
+}
+
+.composer-input:focus-visible,
+.composer-send:focus-visible,
+.conversation-item:focus-visible,
+.assistant-option:focus-visible {
+  outline: 2px solid #a78bfa;
+  outline-offset: 2px;
+}
+
+.composer-send {
+  min-width: 96px;
+  min-height: 48px;
+}
+
+.composer-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #9b9bb0;
+  font-size: 0.8rem;
+}
+
+/* Slightly denser layout on very small screens, still meeting 44px touch targets. */
+@media (max-width: 380px) {
+  .bubble {
+    max-width: 92%;
+  }
+
+  .composer-send {
+    min-width: 80px;
+    padding: 0 14px;
+  }
 }

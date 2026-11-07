@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { Conversation } from "@nexus/shared";
 import { AuthProvider, useAuth } from "./state/auth-context.js";
 import { LoginScreen } from "./screens/LoginScreen.js";
 import { HomeScreen } from "./screens/HomeScreen.js";
+import { ChatScreen } from "./screens/ChatScreen.js";
 import type { AppContainer } from "./lib/auth/bootstrap.js";
 import { ApiBaseUrlScreen } from "./screens/ApiBaseUrlScreen.js";
 
@@ -14,8 +16,11 @@ const NOTICE_BY_REASON: Record<string, string | undefined> = {
 };
 
 function AuthenticatedApp({ container }: { container: AppContainer }) {
-  const { snapshot, login, logout, restore } = useAuth();
+  const { snapshot, login, logout, restore, handleUnauthorized } = useAuth();
   const [logoutBusy, setLogoutBusy] = useState(false);
+  // The open conversation lives here, not in HomeScreen, so navigating to the chat does not
+  // unmount the screen that owns the list and a screen cannot keep its own copy of the data.
+  const [openConversation, setOpenConversation] = useState<Conversation | null>(null);
   // Shown on the login screen: the Home screen unmounts as soon as logout
   // succeeds, so the "revocation unconfirmed" warning must live above it.
   const [logoutNotice, setLogoutNotice] = useState<string | null>(null);
@@ -34,6 +39,21 @@ function AuthenticatedApp({ container }: { container: AppContainer }) {
       setShowConfig(false);
     }
   }, [snapshot.status.kind]);
+
+  // Leaving the authenticated area (logout, expiry, revoked token) must also close the chat,
+  // so the next login never resumes on a conversation that was never validated again.
+  useEffect(() => {
+    if (snapshot.status.kind !== "signed-in") setOpenConversation(null);
+  }, [snapshot.status.kind]);
+
+  const sessionToken =
+    snapshot.status.kind === "signed-in" ? snapshot.status.session.token : null;
+
+  // One service per session: the token is captured here and never stored elsewhere.
+  const conversationService = useMemo(
+    () => (sessionToken ? container.createConversationService(sessionToken) : null),
+    [container, sessionToken],
+  );
 
   const configurationError =
     container.apiBaseUrl === null && !showConfig
@@ -72,26 +92,45 @@ function AuthenticatedApp({ container }: { container: AppContainer }) {
     );
   }
 
-  if (snapshot.status.kind === "signed-in") {
+  if (snapshot.status.kind === "signed-in" && conversationService) {
+    const logoutHandler = async () => {
+      setLogoutBusy(true);
+      try {
+        const outcome = await logout();
+        setLogoutNotice(
+          outcome.revokedRemotely
+            ? null
+            : "Sessão encerrada neste dispositivo, mas o servidor não confirmou a revogação. " +
+                "Entre novamente quando a conexão voltar.",
+        );
+        return { revokedRemotely: outcome.revokedRemotely };
+      } finally {
+        setLogoutBusy(false);
+      }
+    };
+
+    if (openConversation) {
+      return (
+        <ChatScreen
+          conversation={openConversation}
+          service={conversationService}
+          onBack={() => setOpenConversation(null)}
+          onSessionExpired={() => {
+            setOpenConversation(null);
+            void handleUnauthorized();
+          }}
+        />
+      );
+    }
+
     return (
       <HomeScreen
         session={snapshot.status.session}
+        service={conversationService}
         busy={logoutBusy}
-        onLogout={async () => {
-          setLogoutBusy(true);
-          try {
-            const outcome = await logout();
-            setLogoutNotice(
-              outcome.revokedRemotely
-                ? null
-                : "Sessão encerrada neste dispositivo, mas o servidor não confirmou a revogação. " +
-                    "Entre novamente quando a conexão voltar.",
-            );
-            return { revokedRemotely: outcome.revokedRemotely };
-          } finally {
-            setLogoutBusy(false);
-          }
-        }}
+        onOpenConversation={setOpenConversation}
+        onLogout={logoutHandler}
+        onSessionExpired={() => void handleUnauthorized()}
       />
     );
   }
