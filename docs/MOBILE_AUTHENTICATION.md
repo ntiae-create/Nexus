@@ -77,7 +77,11 @@ O workflow `.github/workflows/android-apk.yml` compila as duas variantes de verd
 apps/mobile/android/scripts/apk-network-policy.sh inspect <apk> debug|release
 ```
 
-O script usa `aapt2 dump xmltree` para ler o manifesto compilado e o recurso de política dentro do APK, e falha quando: o manifesto não referencia `@xml/network_security_config`; há `usesCleartextTraffic`; o `base-config` permite cleartext; o release carrega qualquer exceção por domínio (vazamento do arquivo de debug); ou o debug libera algo fora de `10.0.2.2`, `localhost` e `127.0.0.1` (inclui CIDR, que a plataforma não suporta). A lógica do verificador é fixada por `src/test-support/apk-policy-verifier.test.ts`.
+O script usa `aapt2 dump xmltree` para ler o manifesto compilado e o recurso de política dentro do APK. Contrato de saída: **0 apenas quando a política está correta**, 1 em qualquer outro caso (política inválida, APK ausente, `aapt2` ausente ou com falha). Falhas de ferramentas são normalizadas para 1, para que o código não carregue o status de outro programa.
+
+Um detalhe de shell que já quebrou este verificador: um `trap ... EXIT` que referencia uma variável `local` executa depois que o escopo da função morreu e, sob `set -u`, aborta com `unbound variable` **depois** de imprimir o veredito — transformando PASS em exit 1. O diretório temporário é global e o trap usa `${workdir:-}`. O mesmo vale para sondas de diagnóstico (`aapt2 version`), que nunca podem definir o código de saída.
+
+O script falha quando: o manifesto não referencia `@xml/network_security_config`; há `usesCleartextTraffic`; o `base-config` permite cleartext; o release carrega qualquer exceção por domínio (vazamento do arquivo de debug); ou o debug libera algo fora de `10.0.2.2`, `localhost` e `127.0.0.1` (inclui CIDR, que a plataforma não suporta). A lógica do verificador é fixada por `src/test-support/apk-policy-verifier.test.ts`.
 
 ### Produção
 
