@@ -134,6 +134,16 @@ chegue à mesma instância que está executando a chamada ao provedor; por isso
   (`cancelDescendants`, com guarda de ciclo) e marca as filhas ativas com
   `cancellationSource: "parent"` na mesma transação. Como o estado é persistido, a instância
   que executa a filha observa o cancelamento e aborta a própria chamada.
+- **Cascata concorrente com a conclusão de uma filha**: `listChildRuns` é apenas um retrato de
+  descoberta — outra instância pode finalizar a filha entre a leitura e a escrita. Por isso o
+  cancelamento de cada descendente passa por `cancelDescendantIfActive`, que relê o status
+  **sob o lock da linha** (`getStatusForUpdate`) dentro da mesma transação e só então decide:
+  `queued`/`running` são canceladas, estados terminais (`succeeded`, `partial`, `failed`,
+  `cancelled`) são **ignorados** e a cascata prossegue. Sem essa revalidação, o repositório
+  rejeitaria a transição com "Terminal executions are immutable" e a transação inteira sofreria
+  rollback, desfazendo também o cancelamento válido do pai. As proteções do repositório
+  (imutabilidade de estados terminais, RLS, hierarquia) permanecem intactas — o engine apenas
+  consulta o estado correto antes de escrever.
 - **Nunca segurar transação/lock durante polling ou chamadas externas**: cada probe e cada
   leitura de status usam sua própria transação curta; nenhuma transação envolve
   `adapter.generate()`.
@@ -173,8 +183,9 @@ permanecem intactas porque nenhuma tabela ou política nova é criada.
   instância, checagem persistida antes da chamada, cascata pai→filha e corrida
   cancelamento × finalização (registries independentes).
 - `apps/server/src/core/cancellation.postgres.integration.test.ts`: as mesmas garantias com
-  dois pools reais contra PostgreSQL 17.11, executado no CI em
-  `.github/workflows/database-postgres.yml`.
+  dois pools reais contra PostgreSQL 17.11, incluindo a corrida determinística em que outra
+  instância finaliza a filha entre a descoberta e o cancelamento (barreiras de promise, sem
+  `sleep`); executado no CI em `.github/workflows/database-postgres.yml`.
 - `packages/database/src/postgres/repositories.integration.test.ts`: linhagem, cancelamento e
   listagens no banco real.
 

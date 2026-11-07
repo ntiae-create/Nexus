@@ -475,6 +475,13 @@ export class NexusCoreEngine {
    * Recursively cancels descendants of a run. Traversal is breadth-first over
    * persisted `parent_run_id` links, so grandchildren produced by deeper
    * delegation are covered even when they belong to another instance.
+   *
+   * `listChildRuns` is only a discovery snapshot: a child may finalize on another
+   * instance between that read and the write below. The status is therefore
+   * revalidated under the row lock at write time, and a child that already became
+   * terminal is skipped. Without this, `executions.cancel` rejects with
+   * "Terminal executions are immutable", aborts `cancel()`, and rolls back the
+   * legitimate cancellation of the parent.
    */
   private async cancelDescendants(
     repos: NexusRepositories,
@@ -482,6 +489,7 @@ export class NexusCoreEngine {
     finishedAt: string,
   ): Promise<string[]> {
     const cancelled: string[] = [];
+    const skipped: string[] = [];
     const queue: string[] = [rootRunId];
     const visited = new Set<string>([rootRunId]);
 
@@ -491,17 +499,61 @@ export class NexusCoreEngine {
       for (const child of children) {
         if (visited.has(child.id)) continue;
         visited.add(child.id);
-        if (child.status === "queued" || child.status === "running") {
-          await repos.executions.cancel(child.id, {
-            finishedAt,
-            metadata: { cancelledAt: finishedAt, cancellationSource: "parent" },
-          });
+
+        // Conditional cancellation: the lock serializes against a concurrent
+        // finalization, and the status returned by the lock is the value the
+        // transition is validated against, so only queued/running runs are
+        // cancelled and terminal ones are left untouched.
+        const attempt = await this.cancelDescendantIfActive(repos, child.id, finishedAt);
+        if (attempt === "cancelled") {
           cancelled.push(child.id);
+        } else if (attempt === "terminal") {
+          skipped.push(child.id);
         }
+        // A child that vanished between the snapshot and the lock is not a
+        // terminal run and cannot be cancelled; the cascade simply continues.
+
+        // Descendants are visited regardless of this child's status: a finished
+        // child may still have left running grandchildren behind.
         queue.push(child.id);
       }
     }
+
+    if (skipped.length > 0) {
+      this.logger?.info(
+        { runId: rootRunId, skippedRunIds: skipped },
+        "descendant already terminal when the cascade reached it; left untouched",
+      );
+    }
     return cancelled;
+  }
+
+  /**
+   * Cancels a single descendant only when it is still `queued`/`running`.
+   *
+   * The decision is made inside the same transaction, under the run row lock, so
+   * a concurrent finalization either happens entirely before this attempt (and the
+   * child is reported `terminal`, left untouched) or entirely after it (and it
+   * then observes the persisted `cancelled`). Because the status is re-read under
+   * the lock, and because a child that is already terminal is skipped instead of
+   * rejected by the repository, a concurrent conclusion can never roll back the
+   * parent cancellation.
+   */
+  private async cancelDescendantIfActive(
+    repos: NexusRepositories,
+    runId: string,
+    finishedAt: string,
+  ): Promise<"cancelled" | "terminal" | "missing"> {
+    const lockedStatus = await repos.executions.getStatusForUpdate(runId);
+    if (lockedStatus === null) return "missing";
+    if (lockedStatus !== "queued" && lockedStatus !== "running") return "terminal";
+
+    const updated = await repos.executions.cancel(runId, {
+      finishedAt,
+      metadata: { cancelledAt: finishedAt, cancellationSource: "parent" },
+    });
+    // Defensive: the row is locked, so this cannot disagree with `lockedStatus`.
+    return updated.status === "cancelled" ? "cancelled" : "terminal";
   }
 
   // ---------------------------------------------------------------------------
