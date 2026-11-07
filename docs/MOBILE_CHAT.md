@@ -128,12 +128,13 @@ máximo **um de cada por vez**:
 
 | Aspecto | Comportamento |
 | --- | --- |
-| Limite | Enquanto o envio está pendente, quem limita é o **tempo de vida do próprio envio** (`AbortSignal` do `POST`). O laço não termina por número fixo de tentativas enquanto a mensagem ainda está em voo. |
-| Teto de segurança | `DISCOVERY_SAFETY_PROBE_CAP = 240` probes — ~12 min no intervalo de 3 s. Existe só para um chamador que nunca aborta; não é o que interrompe uma execução viva. Sem sinal, cai no orçamento conservador de 8 probes bem-sucedidas. |
-| Falhas transitórias | Até 5 falhas **consecutivas** (rede/`5xx`) são toleradas; elas não consomem o orçamento de probes bem-sucedidas. Um `401` encerra como `unavailable` e devolve o usuário ao login. |
+| Limite com sinal | **Não existe teto de tentativas.** Quem limita é exclusivamente o **tempo de vida do envio** (`AbortSignal` do `POST`): a descoberta vive enquanto o POST estiver pendente, por mais probes bem-sucedidas que passem. |
+| Limite sem sinal | Sem `AbortSignal` não há ciclo de vida a observar, então vale o orçamento conservador `DEFAULT_DISCOVERY_ATTEMPTS = 8` probes bem-sucedidas. Esse valor **nunca** é aplicado quando há sinal. |
+| `maxAttempts` | Override explícito de quem chama (usado em teste). Não é definido pela tela. |
+| Falhas transitórias | Até 5 falhas **consecutivas** (rede/`5xx`) são toleradas e o contador zera a cada sucesso; elas não consomem o orçamento de probes bem-sucedidas. Um `401` encerra como `unavailable` e devolve o usuário ao login. |
 | Concorrência | Uma probe por vez (`await`), sempre. Um servidor lento nunca empilha requisições duplicadas. |
-| Encerramento | Termina imediatamente quando: encontra o run, o envio conclui (`discovery.abort()` no `finally` do send), a tela desmonta, ou a conversa troca. |
-| Resultado | `found` (run real do servidor), `aborted` (cancelado localmente — nada se conclui sobre o run) ou `unavailable` (o estado não pôde ser lido; a UI diz isso e oferece atualizar). Nunca confunde abort local com "run inexistente". |
+| Encerramento | Termina quando: encontra o run pelo `requestId`; o POST termina e aborta a descoberta (`discovery.abort()` no `finally` do send); a tela desmonta; a conversa troca; a sessão expira; ou as falhas transitórias excedem o orçamento. **Nenhum desses caminhos é contagem de probes bem-sucedidas.** |
+| Resultado | `found` (run real do servidor), `aborted` (cancelado localmente — nada se conclui sobre o run) ou `unavailable` (o estado não pôde ser lido — falhas de transporte ou `401`; a UI diz isso e oferece atualizar). Nunca confunde abort local com "run inexistente". |
 | Timers e listeners | `waitForDelay` sempre limpa o `setTimeout` e remove o listener de `abort`, inclusive no caminho feliz — nenhum timer ou listener abandonado por probe. |
 
 Quando a lista já contém o run, `onProbe` publica o id **real** na tela imediatamente, e é
@@ -256,11 +257,11 @@ Arquivos (nenhum teste existente foi removido ou enfraquecido):
 | --- | --- |
 | `src/services/core-service.test.ts` | 9 rotas, envelopes, validação Zod, Bearer, ids, timeouts, erros do contrato. |
 | `src/services/execution-service.test.ts` | Estados terminais, backoff, `succeeded`/`partial`/`failed`/`cancelled`, erros transitórios, `401`, abort, cancelamento, recuperação. |
-| `src/services/conversation-service.test.ts` | Listagem/criação/histórico, envio, idempotência, recuperação por `requestId`, tradução de erros, descoberta (limites, abort, concorrência, backoff) e `activeRuns()`. |
+| `src/services/conversation-service.test.ts` | Listagem/criação/histórico, envio, idempotência, recuperação por `requestId`, tradução de erros, descoberta (abort, concorrência, backoff, **250 probes bem-sucedidas sem teto** com sinal e orçamento de 8 sem sinal) e `activeRuns()`. |
 | `src/lib/assistants.test.ts` | Espelho do catálogo conferido contra `catalog.ts` e a migração `00001`. |
 | `src/screens/HomeScreen.test.tsx` | Estados de lista, criação com cada assistente, refresh, logout, sem exclusão. |
 | `src/screens/ChatScreen.test.tsx` | Histórico, seleção, envio, trava de duplicidade, `partial`/`failed`/`cancelled`, cancelamento, sessão expirada. |
-| `src/screens/chat-recovery.test.tsx` | **Auditoria corretiva**: descoberta pelo serviço real (run admitido depois de 8 probes, parada no fim do envio, parada no unmount, id real exposto), recuperação ao reabrir, `succeeded`/`partial`/`failed`/`cancelled`, nenhum reenvio, dois runs ativos, laço único, troca rápida de conversa, sessão expirada e rede fora durante a recuperação, ausência de `setState` após unmount. |
+| `src/screens/chat-recovery.test.tsx` | **Auditoria corretiva**: descoberta pelo serviço real (run admitido depois de 8 probes, **run admitido depois de 250 probes** pela própria tela, parada no fim do envio, parada no unmount, id real exposto), recuperação ao reabrir, `succeeded`/`partial`/`failed`/`cancelled`, nenhum reenvio, dois runs ativos, laço único, troca rápida de conversa, sessão expirada e rede fora durante a recuperação, ausência de `setState` após unmount. |
 | `src/chat-flow.test.tsx` | Fluxo completo pelo `App` real com `fetch` mockado: criar, conversar, reabrir, recuperar, cancelar, sair. |
 
 `chat-recovery.test.tsx` monta `createConversationService` sobre um `CoreService` dublê, então

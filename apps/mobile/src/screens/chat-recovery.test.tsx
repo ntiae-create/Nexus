@@ -200,6 +200,54 @@ describe("audit 3C.2 — discovery keeps the execution cancellable", () => {
     view.unmount();
   });
 
+  /**
+   * Review blocker on PR #6: the screen passes only `signal` (never `maxAttempts`), so the
+   * discovery it drives must not be cut by a probe ceiling. Here the run appears only after
+   * 250 successful probes — well past the removed 240 cap — while the POST is still pending,
+   * and the cancel button must still show up with the real server id.
+   */
+  it("keeps probing past 240 successful probes and still exposes the real run id", async () => {
+    let probes = 0;
+    let sendRelease: (() => void) | null = null;
+    const listExecutions = vi.fn(async () => {
+      probes += 1;
+      return probes >= 250
+        ? [makeRun({ status: "running", requestId: REQUEST_ID_OF_SEND() || undefined })]
+        : [];
+    });
+
+    const core = coreStub({
+      listExecutions,
+      sendMessage: (async (_token: string, _conversationId: string, input: unknown) => {
+        captureRequestId(input);
+        await new Promise<void>((resolve) => {
+          sendRelease = resolve;
+        });
+        return makeExecutionResponse();
+      }) as unknown as CoreService["sendMessage"],
+      getExecution: async () => makeInspection({ execution: makeRun({ status: "running" }) }),
+    });
+
+    const { service } = serviceFrom(core, async () => []);
+    const view = render(service, { scheduler: immediateScheduler });
+    await waitFor(() => text(view.host).includes("Nenhuma mensagem"));
+
+    typeInto(view.host, "Tarefa muito longa");
+    submit(view.host);
+
+    // 250 probes later the screen still finds the run instead of giving up as unavailable.
+    await waitFor(() => text(view.host).includes("Cancelar execução"), 8000);
+    expect(probes).toBeGreaterThanOrEqual(250);
+    expect(text(view.host)).not.toContain("não pôde ser consultado");
+    expect(text(view.host)).not.toContain("não registrou uma execução");
+
+    await act(async () => {
+      sendRelease?.();
+      await wait(20);
+    });
+    view.unmount();
+  });
+
   it("stops discovery the moment the send settles", async () => {
     let probes = 0;
     const listExecutions = vi.fn(async () => {

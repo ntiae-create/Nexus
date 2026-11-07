@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_DISCOVERY_ATTEMPTS,
   DISCOVERY_DELAYS_MS,
   discoveryDelayFor,
   conversationAssistantLabel,
@@ -510,8 +511,8 @@ describe("chat session — network loss and recovery (idempotency)", () => {
 describe("chat session — run discovery (3C.2 audit)", () => {
   /**
    * Regression 1: a run admitted late (provider slow to start) used to stay invisible because
-   * the old loop stopped after 8 *successful* probes (~25 s). Discovery must keep probing for
-   * as long as the send is pending; only `maxAttempts` consecutive misses bound it.
+   * the old loop stopped after 8 *successful* probes (~25 s). With a lifecycle signal there is
+   * no successful-probe cap at all: the send's own lifetime is the bound.
    */
   it("keeps probing past 8 successful non-matching probes and still finds the run", async () => {
     let call = 0;
@@ -525,14 +526,100 @@ describe("chat session — run discovery (3C.2 audit)", () => {
       token: TEST_TOKEN,
     });
 
+    const controller = new AbortController();
     const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
       scheduler,
-      maxAttempts: 20,
+      signal: controller.signal,
     });
 
     expect(result.kind).toBe("found");
     if (result.kind === "found") expect(result.run.id).toBe(RUN_ID);
     expect(listExecutions).toHaveBeenCalledTimes(12);
+  });
+
+  /**
+   * Blocker found in review of PR #6: with a lifecycle signal the loop must not stop after a
+   * fixed number of successful non-matching probes. The previous code applied a 240-probe
+   * ceiling (~12 min), which could end a discovery as `unavailable` while the POST was still
+   * pending. Here the run only appears after 250 successful probes — past that old ceiling —
+   * and discovery must still find it.
+   */
+  it("survives more than 240 successful non-matching probes while the POST stays pending", async () => {
+    const controller = new AbortController();
+    let call = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const listExecutions = vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      call += 1;
+      try {
+        return call >= 250 ? [makeRun({ status: "queued" })] : [];
+      } finally {
+        inFlight -= 1;
+      }
+    });
+    const service = createConversationService({
+      service: stubService({ listExecutions }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      signal: controller.signal,
+    });
+
+    expect(result.kind).toBe("found");
+    if (result.kind === "found") expect(result.run.id).toBe(RUN_ID);
+    expect(listExecutions).toHaveBeenCalledTimes(250);
+    // No overlapping request at any point during the long discovery.
+    expect(maxInFlight).toBe(1);
+    // The send was never aborted, so the lifecycle signal is still live and unused.
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  /** The same long discovery still stops immediately when the send finally settles. */
+  it("stops a long-lived signal discovery on abort, not on a probe count", async () => {
+    const controller = new AbortController();
+    let call = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          call += 1;
+          // Abort arrives long after any fixed budget would have expired.
+          if (call === 260) controller.abort();
+          return [];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
+      scheduler,
+      signal: controller.signal,
+    });
+
+    expect(result).toEqual({ kind: "aborted" });
+    expect(call).toBe(260);
+  });
+
+  /** Without a lifecycle signal the conservative budget still applies (no infinite loop). */
+  it("applies the default attempt budget only when no lifecycle signal is given", async () => {
+    let call = 0;
+    const service = createConversationService({
+      service: stubService({
+        listExecutions: async () => {
+          call += 1;
+          return [];
+        },
+      }),
+      token: TEST_TOKEN,
+    });
+
+    const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, { scheduler });
+
+    expect(result.kind).toBe("unavailable");
+    expect(call).toBe(DEFAULT_DISCOVERY_ATTEMPTS);
   });
 
   /**
@@ -604,8 +691,9 @@ describe("chat session — run discovery (3C.2 audit)", () => {
     });
 
     // Real timers here on purpose: the concurrency must hold with async gaps.
+    const controller = new AbortController();
     const result = await service.chat(CONVERSATION_ID).findRun(REQUEST_ID, {
-      maxAttempts: 10,
+      signal: controller.signal,
     });
 
     expect(result.kind).toBe("found");

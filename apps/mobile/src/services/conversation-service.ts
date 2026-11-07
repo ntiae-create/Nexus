@@ -247,24 +247,43 @@ export interface ChatSession {
    * conversation's persisted runs and matches `requestId` — the server's own correlation
    * id — using `GET /v1/conversations/:id/executions`. No id is derived client-side.
    *
-   * The loop is bounded by the **lifetime of the send**, not by a fixed attempt count:
-   * it runs while `signal` is live and stops the moment the caller aborts it (send settled,
-   * unmount, conversation change, session expired). One probe at a time, never concurrent.
+   * When the caller passes a lifecycle `signal`, the loop is bounded **exclusively** by it:
+   * it runs while the POST is pending and stops only when (a) the run is found, (b) the
+   * caller aborts — send settled, unmount, conversation change —, (c) the session expires, or
+   * (d) consecutive transient failures exceed `maxTransientFailures`. There is **no** cap on
+   * successful non-matching probes in that mode: an execution admitted after a long provider
+   * queue is still discovered, however long it takes. One probe at a time, never concurrent.
+   *
+   * Without a signal there is no lifecycle to observe, so `maxAttempts`
+   * (default `DEFAULT_DISCOVERY_ATTEMPTS`) bounds successful non-matching probes — the
+   * conservative fallback for standalone callers.
    *
    * Returns:
    * - `found` with the server's run as soon as `requestId` matches;
    * - `aborted` when the caller aborted — never a statement about the run;
-   * - `unavailable` when the state could not be read (repeated transport failures, `401`) or
-   *   when the successful probes exhausted `DISCOVERY_SAFETY_PROBE_CAP` with no match.
-   *   Only successful, non-matching probes count; a slow provider queue is still discovered.
+   * - `unavailable` when the state could not be read (repeated transport failures, `401`) or,
+   *   without a signal, when the configured probe budget was exhausted with no match.
    */
   findRun(requestId: string, options?: DiscoveryOptions): Promise<DiscoveryResult>;
 }
 
 export interface DiscoveryOptions {
+  /**
+   * Lifecycle of the send that owns the discovery.
+   *
+   * When present it is the **only** bound on successful probes: discovery lives as long as
+   * the POST does. Aborting it (send settled, unmount, conversation change) ends the loop
+   * immediately as `aborted`.
+   */
   readonly signal?: AbortSignal;
   readonly scheduler?: (callback: () => void, delayMs: number) => void;
-  /** Test hook: stop after N successful probes (production leaves this unset). */
+  /**
+   * Successful non-matching probes tolerated **before giving up without a signal**.
+   *
+   * Ignored when `signal` is present, unless a caller sets it explicitly: with a lifecycle
+   * signal, probing must not stop while the POST is still pending. Kept as an explicit
+   * override for tests and for callers that want their own bound.
+   */
   readonly maxAttempts?: number;
   /** Consecutive failed probes tolerated before giving up. */
   readonly maxTransientFailures?: number;
@@ -285,26 +304,21 @@ export type DiscoveryResult =
   | { readonly kind: "unavailable"; readonly message: string };
 
 /**
- * Successful probes performed before giving up on a run the server never recorded, when the
- * caller provides no lifetime signal to bound the loop.
+ * Successful probes performed before giving up on a run the server never recorded.
  *
- * This is the conservative fallback: a standalone caller that cannot tell when the send
- * settles would otherwise probe forever.
+ * Applies **only** to discovery without a lifecycle `signal` — a standalone caller that
+ * cannot tell when the send settles would otherwise probe forever. A discovery driven by the
+ * send's own `AbortSignal` is never cut short by a probe count: the POST stays pending, so
+ * probing stays useful.
  */
 export const DEFAULT_DISCOVERY_ATTEMPTS = 8;
 
 /**
- * Hard safety ceiling applied while the send is still pending.
+ * Consecutive failed probes (network/5xx) tolerated while the discovery is running.
  *
- * Discovery is bounded by the *send lifetime* (the `AbortSignal` the caller passes), which is
- * the only thing that actually knows when probing stopped being useful. This cap exists only
- * so a caller that never aborts cannot turn a capped backoff into an endless loop: at the
- * steady-state 3 s interval it allows ~12 minutes of probing, longer than a full provider
- * execution plus queueing, and it is never the reason a live execution goes untracked.
+ * This budget is orthogonal to `DEFAULT_DISCOVERY_ATTEMPTS`: failures describe our ability to
+ * *ask*, not the server's state, so they are counted separately and reset on every success.
  */
-export const DISCOVERY_SAFETY_PROBE_CAP = 240;
-
-/** Consecutive failed probes (network/5xx) tolerated while the send is still pending. */
 export const DEFAULT_DISCOVERY_TRANSIENT_FAILURES = 5;
 
 /**
@@ -622,11 +636,14 @@ export function createConversationService(input: {
         },
 
         async findRun(requestId, options = {}) {
-          // With a lifetime signal the loop is bounded by the send itself; without one, fall
-          // back to the conservative attempt budget. Either way a hard safety cap applies.
+          // Bounds on successful non-matching probes:
+          // - explicit override always wins (tests / callers with their own bound);
+          // - with a lifecycle signal there is deliberately **no** probe cap — the send's own
+          //   lifetime is the bound, so an execution admitted late is never abandoned;
+          // - without a signal, fall back to the conservative attempt budget.
           const maxAttempts =
             options.maxAttempts ??
-            (options.signal ? DISCOVERY_SAFETY_PROBE_CAP : DEFAULT_DISCOVERY_ATTEMPTS);
+            (options.signal ? Number.POSITIVE_INFINITY : DEFAULT_DISCOVERY_ATTEMPTS);
           const maxTransientFailures =
             options.maxTransientFailures ?? DEFAULT_DISCOVERY_TRANSIENT_FAILURES;
 
@@ -668,6 +685,8 @@ export function createConversationService(input: {
               // Match by the server's own correlation id; nothing is derived locally.
               const match = runs.find((run) => run.requestId === requestId);
               if (match) return { kind: "found", run: match };
+              // `Number.POSITIVE_INFINITY` means "the caller owns the lifecycle": never stop
+              // a live discovery just because many successful probes went by.
               if (probes >= maxAttempts) {
                 return {
                   kind: "unavailable",
