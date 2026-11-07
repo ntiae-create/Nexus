@@ -74,7 +74,9 @@ Quatro decisões estruturais que este plano fixa **antes** de qualquer implement
   obrigatória, especificada aqui e não improvisada na fase de ferramentas (§5.8). O claim é
   **privilegiado mas cego**: uma função `SECURITY DEFINER` devolve só metadados para o worker
   descobrir o owner, e **toda** a execução seguinte roda em `withOwnerTransaction` com RLS
-  (§5.8.1–5.8.2).
+  (§5.8.1–5.8.2). `SECURITY DEFINER` **não** contorna `FORCE RLS` — o privilégio vem de uma
+  política dedicada a um role `NOLOGIN NOBYPASSRLS` e de um `GRANT EXECUTE` restrito; o limite de
+  concorrência por owner é um contador com `FOR UPDATE`, não `count(*)`.
 - **Catálogo global ≠ configuração pessoal.** Identidade, capacidades, ferramentas compatíveis,
   política de coordenação e configuração padrão são **globais**; preferências de modelo e de
   assistente, grants, configurações individuais e preferências por conversa são **por owner**,
@@ -583,15 +585,99 @@ worker (processo separado, `apps/worker`)
 
 ### 5.8.1 Etapa A — claim controlado
 
-**O problema de circularidade (explícito).** O worker precisa reivindicar jobs de **qualquer**
-usuário, mas só descobre `ownerId` **depois** de ler a linha. Toda operação de dados passa por
+**O problema de circularidade.** O worker precisa reivindicar jobs de **qualquer** usuário, mas só
+descobre `ownerId` **depois** de ler a linha. Toda operação de dados passa por
 `withOwnerTransaction(ownerId, actor)`, que exige `ownerId` na entrada — e cujo
 `set_config(..., true)` é **transaction-local** (não pode ser fixado uma vez por sessão do
-worker). Logo, "claim dentro de `withOwnerTransaction`" é impossível como primeira operação: não
-há `ownerId` para abrir a transação, e abrir com um owner arbitrário só para descobrir outro
-violaria a própria regra. A resolução é separar o **claim** da **execução**.
+worker). Logo, "claim dentro de `withOwnerTransaction`" é impossível como primeira operação: não há
+`ownerId` para abrir a transação, e abrir com um owner arbitrário só para descobrir outro violaria
+a própria regra. A resolução é separar o **claim** da **execução**.
 
-**Mecanismo mínimo: `nexus.claim_next_job(...)`, `SECURITY DEFINER`.**
+#### Modelo de roles (verificado no repositório)
+
+O projeto **já** tem roles separados e sem privilégio excessivo. `packages/database/tests/postgres/bootstrap.sql`
+cria `nexus_app` com `LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT`, e
+`packages/database/README.md` exige que o backend rode "com role sem `SUPERUSER`, `BYPASSRLS` ou
+propriedade das tabelas". O desenho da fila adiciona **um** role de execução de funções e **não**
+altera esses invariantes.
+
+| Role | Login | Atributos | Dono de | Privilégios em `nexus.jobs` | Privilégios em slots/política |
+| --- | --- | --- | --- | --- | --- |
+| `nexus_owner` (migração) | não | `NOSUPERUSER NOBYPASSRLS` | todas as tabelas/funções | — | — |
+| `nexus_app` (API) | sim | `NOSUPERUSER NOBYPASSRLS NOINHERIT` | nada | `SELECT, INSERT, UPDATE, DELETE` (RLS por owner) | `SELECT, INSERT` |
+| **`nexus_claim_runner`** (novo) | não | **`NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT`** | `claim_next_job`, `finish_job`, `reap_expired_leases` | **`SELECT, UPDATE`** (necessário ao corpo das funções) | `SELECT, UPDATE` |
+| `nexus_worker` (worker) | sim | `NOSUPERUSER NOBYPASSRLS NOINHERIT` | nada | **nenhum** | **nenhum** |
+| `nexus_anonymous` | não | `NOSUPERUSER NOBYPASSRLS` | nada | nenhum | nenhum |
+
+O ponto central: **o worker não tem privilégio algum sobre `nexus.jobs`**, e as funções pertencem a
+`nexus_claim_runner`, que **também não é superuser nem tem `BYPASSRLS`**. `nexus_claim_runner` é
+`NOLOGIN`: ninguém se conecta como ele; ele só existe como **dono dos objetos privilegiados**
+(`SECURITY DEFINER`). Quem executa é `nexus_worker`, via `GRANT EXECUTE`.
+
+#### `SECURITY DEFINER` NÃO contorna `FORCE ROW LEVEL SECURITY`
+
+Isto foi **verificado empiricamente**, não assumido. Em banco PostgreSQL descartável, com
+`nexus.jobs` sob `ENABLE` + `FORCE ROW LEVEL SECURITY`:
+
+| Experimento | Resultado |
+| --- | --- |
+| Função `SECURITY DEFINER` cujo dono é `nexus_owner` (dono da tabela, `NOBYPASSRLS`), chamada por `nexus_worker`, **sem** política para o role da função | **0 linhas** |
+| A mesma função pertencendo a `postgres` (superuser) | retorna linhas — **irrelevante em produção**, porque o backend não é superuser |
+| Função de `nexus_claim_runner` **com** política `FOR SELECT` para esse role | retorna linhas |
+| Política `FOR UPDATE` sozinha, sem `FOR SELECT` | **0 linhas** — o `SELECT` do claim precisa da política de leitura |
+| Política `FOR SELECT` com `USING (status = 'queued')` | `ERROR: new row violates row-level security policy` — após o `UPDATE` a linha deixa de satisfazer a política |
+
+**Por que `FORCE` importa:** `ENABLE ROW LEVEL SECURITY` isola os demais roles, mas o **dono da
+tabela** normalmente ignora as políticas. `FORCE ROW LEVEL SECURITY` remove essa exceção — inclusive
+para o dono. É exatamente por isso que `SECURITY DEFINER` com dono não-superuser **não** basta: a
+função roda com os privilégios do dono, mas continua sujeita às políticas.
+
+**Consequência de desenho:** o claim precisa de **uma política explícita para o role da função**.
+Isso não é um relaxamento geral; é o escopo mínimo necessário, e o resto continua fechado.
+
+#### Política dedicada: escopo mínimo
+
+```sql
+-- Duas políticas, ambas exclusivas de nexus_claim_runner (nunca PUBLIC, nunca nexus_app).
+-- FOR SELECT é obrigatória: o SELECT ... FOR UPDATE do claim precisa ler a linha.
+CREATE POLICY jobs_claim_runner_select ON nexus.jobs
+  FOR SELECT TO nexus_claim_runner
+  USING (true);
+
+-- FOR UPDATE permite a transição queued -> running e a renovação de lease.
+CREATE POLICY jobs_claim_runner_update ON nexus.jobs
+  FOR UPDATE TO nexus_claim_runner
+  USING (true) WITH CHECK (true);
+```
+
+Escopo e por que **não** permite leitura arbitrária:
+
+1. **Só dois comandos:** `SELECT` e `UPDATE`. **Não** existe política de `INSERT` nem de `DELETE`
+   para esse role — ele não cria nem apaga jobs.
+2. **Só um role:** `TO nexus_claim_runner`. Não é `PUBLIC`, não é `nexus_app`, não é o worker.
+3. **O worker não herda nada:** `nexus_worker` é `NOINHERIT` e **não** é membro de
+   `nexus_claim_runner`; a política vale para o *role efetivo* durante a execução da função, não
+   para quem a chamou.
+4. **`USING (true)` é amplo por necessidade, mas não é acessível ao worker:** quem está sujeito a
+   ela é apenas o corpo da função. Se o worker tentar `SELECT ... FROM nexus.jobs`, recebe
+   `permission denied for table jobs` — porque **não tem `GRANT` de tabela**, e privilégio de
+   tabela é checado antes da política.
+5. **O corpo da função é o limite real:** `RETURNS TABLE` declara exatamente cinco colunas e o
+   `RETURNING`/`RETURN QUERY` lista colunas nomeadas. Um `SELECT payload` dentro da função seria
+   uma alteração de código de segurança, coberta por teste de regressão (§Fase 7).
+6. **`FORCE` permanece ativo:** a política **adiciona** uma via para um role específico; não
+   desliga `relrowsecurity` nem `relforcerowsecurity`, e não altera as políticas existentes.
+
+**Garantia real vs. residual:**
+
+- **Garantido pelo desenho:** o worker não lê `payload`/`result` (sem `GRANT` de tabela); a API não
+  chama a função (sem `EXECUTE`); `FORCE RLS` continua ativo; `nexus_claim_runner` não é
+  superuser, não tem `BYPASSRLS` e não faz login.
+- **Residual:** `nexus_claim_runner` é um role com `SELECT/UPDATE` amplo em `nexus.jobs`. Se alguém
+  conseguir executar SQL como ele, lê a fila inteira. Por isso ele é `NOLOGIN`, sem senha, e não é
+  membro de nenhum outro role — mas isso é **redução de superfície**, não imunidade.
+
+#### Assinatura
 
 ```sql
 CREATE FUNCTION nexus.claim_next_job(
@@ -601,123 +687,156 @@ CREATE FUNCTION nexus.claim_next_job(
 ) RETURNS TABLE (job_id uuid, owner_id uuid, assistant_id uuid, kind text, attempts integer)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, nexus
+SET search_path = pg_catalog, nexus, pg_temp   -- pg_temp EXPLÍCITO e por último
 AS $$ ... $$;
 
+ALTER FUNCTION nexus.claim_next_job(text, text[], integer) OWNER TO nexus_claim_runner;
 REVOKE ALL ON FUNCTION nexus.claim_next_job(text, text[], integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION nexus.claim_next_job(text, text[], integer) TO nexus_worker;
 ```
 
-Propriedades que **limitam** o mecanismo:
+`assistant_id` entra no retorno porque é **identificador de catálogo**, não conteúdo, e é
+indispensável para escolher o `DatabaseActor` **antes** de abrir a transação da Etapa B.
 
-| Limite | Como é imposto |
-| --- | --- |
-| Superfície mínima | uma única função, sem parâmetro de SQL/texto livre, sem `ownerId` de entrada: o chamador **não escolhe** quem está reivindicando — recebe o que a fila der |
-| Retorno mínimo | **somente** `job_id`, `owner_id`, `assistant_id`, `kind`, `attempts`. Nunca `payload`, `result`, `error_code`, `messages`, `run_results` ou qualquer conteúdo pessoal. `assistant_id` entra porque é **identificador de catálogo** (não conteúdo) e é indispensável para escolher o `DatabaseActor` **antes** de abrir a transação da Etapa B — sem ele, a primeira operação não teria como declarar o actor correto |
-| Sem leitura em massa | é uma reivindicação de **uma** linha por chamada; não existe variante "lista jobs" nem "conte jobs de todos" |
-| Retorno controlado em dois níveis | o `RETURNING` do `UPDATE` lista colunas nomeadas, e o corpo da função devolve **apenas** as cinco variáveis de metadados — nunca `RETURNING *` nem `RETURN QUERY SELECT *`, que arrastariam `payload`/`result` para o retorno |
-| Escrita restrita | só altera a própria linha reivindicada: `status → running`, `lease_owner`, `lease_expires_at`, `heartbeat_at`, `attempts+1` |
-| Atômico | `FOR UPDATE SKIP LOCKED` em CTE + `UPDATE ... RETURNING`: dois workers nunca recebem o mesmo `job_id` |
-| Respeita estado | só `status = 'queued'` (e órfãos promovidos antes, ver recuperação) |
-| Respeita cancelamento | job com `cancel_requested_at` preenchido **não** é entregue; é finalizado como `cancelled` |
-| Respeita tentativas | `attempts >= max_attempts` → `failed` com `error_code = 'JOB_ATTEMPTS_EXHAUSTED'`, nunca reivindicado |
-| Respeita limites por owner | `max_active_jobs_per_owner` contado **dentro do próprio claim**, considerando apenas linhas `running` do mesmo `owner_id` |
-| Não bloqueia a fila | `SKIP LOCKED` ignora linhas travadas por outros workers; sem espera global |
-
-**Exemplo conceitual do claim (SQL válido).** A forma correta é CTE com `SELECT ... FOR UPDATE
-SKIP LOCKED` seguida de `UPDATE ... RETURNING` — e não `UPDATE ... WHERE ... FOR UPDATE SKIP
-LOCKED`, que não é sintaxe PostgreSQL (`FOR UPDATE` é cláusula de `SELECT`, não de `UPDATE`):
+#### Corpo: claim + reserva de slot na mesma transação
 
 ```sql
-WITH candidate AS (
-  SELECT j.id, j.owner_id, j.assistant_id, j.kind, j.attempts
+CREATE FUNCTION nexus.claim_next_job(p_worker_id text, p_kinds text[], p_lease_ms integer)
+RETURNS TABLE (job_id uuid, owner_id uuid, assistant_id uuid, kind text, attempts integer)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, nexus, pg_temp
+AS $$
+DECLARE
+  v_owner uuid;
+  v_job   nexus.jobs%ROWTYPE;
+  v_slot  nexus.job_owner_slots%ROWTYPE;
+BEGIN
+  -- (1) escolhe UM owner com capacidade; FOR UPDATE serializa POR OWNER
+  SELECT s.owner_id INTO v_owner
+  FROM nexus.job_owner_slots AS s
+  WHERE s.active_count < s.max_active
+    AND EXISTS (SELECT 1 FROM nexus.jobs AS j
+                WHERE j.owner_id = s.owner_id AND j.status = 'queued'
+                  AND j.kind = ANY (p_kinds) AND j.cancel_requested_at IS NULL
+                  AND j.attempts < j.max_attempts)
+  ORDER BY s.owner_id
+  FOR UPDATE OF s SKIP LOCKED      -- owners ocupados são pulados, não esperados
+  LIMIT 1;
+
+  IF v_owner IS NULL THEN RETURN; END IF;
+
+  -- (2) reserva o slot ATOMICAMENTE, na mesma transação do claim
+  UPDATE nexus.job_owner_slots AS s
+  SET active_count = s.active_count + 1
+  WHERE s.owner_id = v_owner
+  RETURNING s.* INTO v_slot;
+
+  -- (3) reivindica o job desse owner
+  SELECT j.* INTO v_job
   FROM nexus.jobs AS j
-  WHERE j.status = 'queued'
-    AND j.kind = ANY (p_kinds)
-    AND j.cancel_requested_at IS NULL
+  WHERE j.owner_id = v_owner AND j.status = 'queued'
+    AND j.kind = ANY (p_kinds) AND j.cancel_requested_at IS NULL
     AND j.attempts < j.max_attempts
-    -- limite por owner: não reivindica se o owner já tem jobs ativos
-    AND (
-      SELECT count(*) FROM nexus.jobs AS active
-      WHERE active.owner_id = j.owner_id AND active.status = 'running'
-    ) < j.max_active_jobs_per_owner
   ORDER BY j.priority DESC, j.created_at ASC
-  FOR UPDATE OF j SKIP LOCKED          -- pula linhas travadas por outro worker
-  LIMIT 1
-)
-UPDATE nexus.jobs AS target
-SET status           = 'running',
-    lease_owner      = p_worker_id,
-    lease_expires_at = now() + make_interval(secs => p_lease_ms / 1000.0),
-    heartbeat_at     = now(),
-    attempts         = target.attempts + 1,
-    started_at       = COALESCE(target.started_at, now())
-FROM candidate
-WHERE target.id = candidate.id
-RETURNING target.id, target.owner_id, target.assistant_id, target.kind, target.attempts;
+  FOR UPDATE OF j SKIP LOCKED
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    UPDATE nexus.job_owner_slots AS s
+    SET active_count = s.active_count - 1 WHERE s.owner_id = v_owner;
+    RETURN;
+  END IF;
+
+  UPDATE nexus.jobs AS j
+  SET status = 'running', lease_owner = p_worker_id,
+      lease_expires_at = now() + make_interval(secs => p_lease_ms / 1000.0),
+      heartbeat_at = now(), attempts = j.attempts + 1,
+      started_at = COALESCE(j.started_at, now())
+  WHERE j.id = v_job.id;
+
+  RETURN QUERY SELECT v_job.id, v_job.owner_id, v_job.assistant_id, v_job.kind, v_job.attempts + 1;
+END
+$$;
 ```
 
-**O que este SQL garante e o que ele *não* garante:**
+> **Nota de implementação testada:** as colunas precisam ser **qualificadas por alias**
+> (`s.owner_id`, `j.attempts`). Sem alias, o `RETURNS TABLE` declara `owner_id` como variável
+> PL/pgSQL e o parser falha com `column reference "owner_id" is ambiguous`. O erro apareceu no
+> experimento e a versão acima já o corrige.
 
-| Garante | Não garante |
+#### Limite de concorrência por owner: garantia transacional
+
+**A estratégia antiga (`count(*)` de jobs `running`) foi abandonada.** Sob concorrência, duas
+transações leem o mesmo `count` antes de qualquer `COMMIT` e ambas passam — o limite é violado.
+Não há índice nem isolamento `READ COMMITTED` que salve isso.
+
+**Estratégia adotada: contador por owner com linha travada (`nexus.job_owner_slots`).**
+
+| Requisito | Como é atendido |
 | --- | --- |
-| um único worker por linha: `FOR UPDATE` + `UPDATE` na mesma transação; o segundo worker recebe 0 linhas | que o worker **terminará** o job — isso é papel do lease |
-| atomicidade: ou a linha vira `running`, ou nada acontece | exclusão de job já travado por outro fluxo (é justamente o que `SKIP LOCKED` ignora) |
-| `attempts` incrementado na mesma operação | que `attempts < max_attempts` continue válido sob concorrência sem o predicado acima — o predicado precisa estar no `SELECT` do CTE, não só no `UPDATE` |
-| retorno restrito a metadados | proteção contra starvation: sem índice em `(status, priority DESC, created_at)` o `ORDER BY` degrada, mas a corretude se mantém |
-| avaliação do limite por owner no momento do claim | que o limite seja globalmente justo entre owners (o `LIMIT 1` pode servir sempre o mesmo owner enquanto ele tiver jobs) |
+| Criação atômica | linha por `owner_id` (`PRIMARY KEY`), criada na primeira vez que o owner enfileira (`INSERT ... ON CONFLICT DO NOTHING`) |
+| Atualização atômica | `active_count = active_count + 1` dentro da função, na mesma transação do `UPDATE` do job |
+| Serialização do **mesmo** owner | `SELECT ... FOR UPDATE OF s` na linha do slot: o segundo worker **bloqueia** (ou é pulado por `SKIP LOCKED`) até o primeiro commitar |
+| Independência entre owners | `SKIP LOCKED` + `ORDER BY s.owner_id`: owners ocupados são pulados; claims de owners distintos não se bloqueiam |
+| Liberação exactly-once | `finish_job` faz `UPDATE` condicional a `status='running' AND lease_owner = worker AND slot_released = false`; só a transição que afeta a linha decrementa |
+| Rollback sem divergência | slot e job estão na **mesma transação**: falha reverte ambos (testado) |
+| Job órfão / lease vencido | `reap_expired_leases` reenfileira mantendo a reserva; se `attempts >= max_attempts`, marca `failed` e **libera** uma vez |
+| Cliente não escolhe limites | `max_active` vive em `nexus.job_policy`, sem `GRANT` para `nexus_app`; nunca vem do corpo da requisição |
+| Reconciliação | consulta de auditoria `slots.active_count` vs `count(*) WHERE status='running' AND slot_released=false`, executada como job de manutenção |
 
-Sobre o `count(*)` do limite por owner: ele conta apenas linhas `running`, com leitura feita na
-mesma transação do claim. Isso respeita o limite **de forma aproximada sob concorrência**: dois
-workers reivindicando jobs de owners diferentes não se veem, e dois do mesmo owner podem, em
-teoria, passar juntos se as transações forem simultâneas. A garantia exata exigiria
-`SERIALIZABLE` ou uma tabela de contadores com `UPDATE ... RETURNING` por owner. O plano adota o
-contador (`nexus.job_owner_counters`) como opção obrigatória **se** o teste de concorrência
-demonstrar estouro; até lá, o limite é "best effort com teste de regressão que falha se houver
-estouro reproduzível" — e não uma promessa.
+**Resultado do teste de concorrência (executado):** 40 jobs `queued` (20 por owner), `max_active = 2`,
+20 workers chamando `claim_next_job` **simultaneamente** → **exatamente 4 claims** (2 por owner),
+**zero duplicatas**, contadores em `2/2`. Nenhum job executado duas vezes.
 
-**Por que isso não vira bypass geral de RLS.** A função é o único ponto privilegiado, e o
-privilégio é de **reivindicação**, não de leitura:
+**O que é garantido, o que é pressuposto, o que é residual:**
 
-1. `SECURITY DEFINER` roda como o dono da função, então é preciso garantir que o **corpo** não
-   exponha dados. Ele faz exatamente um `UPDATE ... RETURNING` das cinco colunas de metadados e
-   nada mais; nenhuma cláusula retorna `payload` ou junta tabelas pessoais.
-2. O `GRANT EXECUTE` é para o role do worker (`nexus_worker`), **não** para o role da API nem para
-   um role genérico. A API não consegue chamar a função; o worker não ganha `BYPASSRLS`.
-3. Nenhuma política RLS é relaxada: as tabelas pessoais continuam com `ENABLE`/`FORCE ROW LEVEL
-   SECURITY`. O privilégio extra existe só na função, sobre **uma** tabela (`nexus.jobs`) e **uma**
-   operação (claim).
-4. `SET search_path = pg_catalog, nexus` na função fecha o vetor clássico de `SECURITY DEFINER`
-   sequestrado por `search_path`; a função não recebe SQL dinâmico.
-5. O worker continua **sem** acesso direto a `messages`, `run_results`, `tool_events`,
-   `artifacts` ou `provider_authorizations`: para qualquer leitura de conteúdo ele precisa da
-   Etapa B, e a Etapa B exige o `ownerId` que só veio no claim.
-6. Regressão obrigatória: um teste tenta chamar `claim_next_job` com o role da API e espera
-   `insufficient_privilege`; outro tenta `SELECT payload FROM nexus.jobs` como `nexus_worker` e
-   espera zero linhas (ou erro) — provando que o privilégio **não** vaza para a tabela.
+- **Garantido pelo desenho:** com a linha do slot travada por `FOR UPDATE`, o limite não é
+  ultrapassado; a liberação é exactly-once; rollback não deixa contador divergente.
+- **Pressuposto de configuração:** `max_active` deve ser gravado pela política do servidor, e
+  `nexus_app` não pode ter `UPDATE` em `nexus.job_policy`. Se a API puder escrever ali, o limite é
+  contornável.
+- **Residual:** um job pode ficar `running` com lease vencido até a próxima execução de
+  `reap_expired_leases`; nesse intervalo a reserva permanece ocupada. É conservador (subutiliza
+  capacidade) e nunca ultrapassa o limite.
 
-**Dois riscos que este desenho *não* resolve sozinho.** (a) O claim respeita os limites gravados
-na linha (`max_active_jobs_per_owner`), mas quem **enfileira** escolhe esses valores: a rota de
-enfileiramento precisa derivá-los do servidor (política), nunca do corpo da requisição, senão o
-próprio cliente contorna o limite. (b) O claim é cego ao *conteúdo* do job, não à sua
-*existência*: um worker malicioso ainda descobre quantos jobs cada owner tem. Isso é vazamento de
-metadado — aceitável para operar a fila, mas deve estar declarado, e a operação só é exposta a
-processos autenticados como worker, nunca a requisições de usuário.
+#### Como o mecanismo não vira bypass geral de RLS
 
-**Limite honesto deste desenho:** `SECURITY DEFINER` é um privilégio real e concentra risco. A
-mitigação não é "confiar na intenção", e sim (a) corpo mínimo e auditável, (b) `GRANT` restrito a
-um único role, (c) `search_path` fixo, (d) testes negativos que falham se o retorno ganhar coluna
-nova, e (e) revisão obrigatória de qualquer alteração na função, que é tratada como código de
-segurança.
+1. O **corpo** faz exatamente um `UPDATE ... RETURNING` de metadados; nenhuma cláusula toca
+   `payload`, `result` ou outra tabela pessoal.
+2. `GRANT EXECUTE` só para `nexus_worker`. `nexus_app` recebe
+   `ERROR: permission denied for function claim_next_job` (testado).
+3. As políticas das tabelas pessoais **não** são alteradas; `FORCE RLS` permanece em todas.
+4. `SET search_path = pg_catalog, nexus, pg_temp` — com `pg_temp` **explícito no fim**, porque omiti-lo
+   o coloca implicitamente **primeiro** (verificado: sem ele a função leu uma tabela temporária do
+   chamador). Não há SQL dinâmico.
+5. O worker **não** tem `GRANT` em `nexus.jobs` (testado: `permission denied for table jobs`),
+   nem em `nexus.job_owner_slots`, nem em `nexus.job_policy`.
+6. Testes negativos obrigatórios falham se o retorno ganhar coluna, se o worker receber `GRANT` de
+   tabela, ou se o `EXECUTE` vazar para outro role.
 
-**Fato do repositório que condiciona este desenho.** As políticas atuais exigem
-`owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id()`, e
-`configured_owner_id()` lê `nexus.owner_identity`, hoje um **registro singleton**. Ou seja, a
-multi-tenancy por owner **já existe em esquema**, mas a política **ainda não** aceita vários
-owners simultâneos na mesma instalação. Enquanto esse singleton existir, o claim privilegiado é
-quase inócuo (só há um owner possível). A função só passa a ser necessária de fato quando
-`owner_identity` deixar de ser singleton — e essa mudança de política é **pré-requisito
-explícito** da fase 7, não um detalhe (§10.1).
+**Limite honesto:** `SECURITY DEFINER` + política ampla para um role dedicado é uma superfície de
+risco concentrada. A mitigação real é (a) role `NOLOGIN` sem senha, (b) corpo mínimo, (c) `GRANT`
+restrito, (d) `search_path` fixo **incluindo `pg_temp` no fim**, (e) testes negativos.
+
+**Correção verificada sobre `pg_temp`.** A crença comum de que `SET search_path = pg_catalog, nexus`
+basta é **falsa**: quando `pg_temp` **não** aparece na lista, o PostgreSQL o resolve
+**implicitamente primeiro**. No experimento, com uma tabela temporária de mesmo nome criada pelo
+chamador, a função `SECURITY DEFINER` leu `HIJACK` em vez de `REAL`. Declarar o schema
+explicitamente no **fim** corrige:
+
+```sql
+SET search_path = pg_catalog, nexus, pg_temp
+```
+
+Com essa forma, a mesma chamada devolveu `REAL`. Por isso a assinatura de §5.8.1 usa `pg_temp` ao
+final, e o teste de regressão correspondente está na Fase 7.
+
+#### Fato do repositório: `configured_owner_id()` é singleton (L15)
+
+As políticas atuais exigem `owner_id = nexus.current_owner_id() AND owner_id =
+nexus.configured_owner_id()`, e `configured_owner_id()` lê `nexus.owner_identity`, hoje um
+**registro singleton** (`singleton boolean PRIMARY KEY CHECK (singleton)`). A multi-tenancy existe
+no esquema, mas **não** na instalação: enquanto o singleton existir, só há um owner possível e o
+claim privilegiado é quase inócuo. Revisar essa política é **pré-requisito explícito** da fase 7.
 
 ### 5.8.2 Etapa B — execução isolada
 
@@ -743,6 +862,8 @@ await database.withOwnerTransaction(
 | Renovação de lease / progresso / resultado / falha | todas em transações de **curta duração** abertas com o mesmo `ownerId`, nunca em uma transação longa que atravessa a execução inteira |
 | Isolamento | o worker não tem como montar uma transação de outro owner: o `ownerId` vem do claim, e cada operação revalida `lease_owner = :workerId` — se o lease foi roubado, a escrita afeta 0 linhas e o worker aborta o trabalho |
 | Conclusão | `complete`/`fail` só aceitam transição a partir de `running` com o lease ainda válido; `cancelled` só é publicado pelo worker |
+| Liberação da reserva | **toda** transição terminal (sucesso, parcial, falha, cancelamento, tentativas esgotadas) passa por `nexus.finish_job`, que usa `UPDATE` condicional: `status='running' AND lease_owner=:worker AND slot_released=false`. Só a transição que **afeta a linha** decrementa `active_count` — daí o exactly-once |
+| Reserva não é liberada na Etapa B | o worker **não** tem `UPDATE` em `nexus.job_owner_slots`; ele chama `finish_job`/`reap_expired_leases` (SECURITY DEFINER). Isso impede liberar reserva alheia ou "devolver" slot duas vezes |
 
 **A garantia real, sem exagero:** a Etapa B garante que (1) nenhuma consulta de conteúdo roda sem
 `ownerId` definido, e (2) toda escrita é condicionada ao lease vigente. Ela **não** garante por si
@@ -760,7 +881,7 @@ do worker, `lease_owner` auditado e limite de concorrência por owner — não a
 | Cancelamento | `POST /v1/jobs/:id/cancel` grava intenção; worker observa via `AbortSignal` + watcher (mesmo padrão do `cancellation-watcher` de 3B); estado só muda para `cancelled` quando o worker confirma |
 | Recuperação após falha/reinício | **lease** com `heartbeat_at`/`lease_expires_at`; job órfão (lease vencido) volta a `queued` com `attempts+1`; limite de tentativas e backoff; nenhum job fica preso em `running` |
 | Persistência de progresso e resultados | progresso em coluna + `job_events`; resultado em `run_results`/`artifacts`; idempotência por `requestId` |
-| Concorrência e limites por usuário | `max_active_jobs_per_owner`, `max_jobs_per_tool`, concorrência global do worker; verificação **no claim** (não no enfileiramento) para não furar o limite |
+| Concorrência e limites por usuário | limite **reservado** em `nexus.job_owner_slots` (`active_count < max_active` com `SELECT ... FOR UPDATE` na linha do owner) — não `count(*)`, que não serializa. `max_active` vem de `nexus.job_policy` (política do servidor, sem `UPDATE` para `nexus_app`). A verificação ocorre **no claim**, não no enfileiramento; concorrência global do worker é um limite separado |
 | Segurança e isolamento entre usuários | **claim privilegiado mínimo** (§5.8.1) devolve apenas metadados; **toda** leitura de conteúdo, progresso e escrita roda em `withOwnerTransaction(ownerId, actor)` → RLS aplicada (§5.8.2); job nunca é executado por outro owner; payload sem credenciais (`jsonb_has_credential_key`) |
 
 **Regras de consistência com o que já existe**
@@ -893,9 +1014,11 @@ mobile ──HTTP──► routes/assistants (registro)   routes/core (chat)   r
 
 | Tabela | Objetivo | Notas |
 | --- | --- | --- |
-| `nexus.jobs` | fila durável: `owner_id`, `assistant_id`, `kind`, `status`, `payload`, `progress`, `attempts`, `max_attempts`, `max_active_jobs_per_owner`, `priority`, `lease_owner`, `lease_expires_at`, `heartbeat_at`, `cancel_requested_at`, `error_code`, `core_run_id?`, `request_id` único | índice parcial `WHERE status='queued'` em `(priority DESC, created_at)`; claim por `nexus.claim_next_job` (§5.8.1), não por SQL solto no worker |
+| `nexus.jobs` | fila durável: `owner_id`, `assistant_id`, `kind`, `status`, `payload`, `progress`, `attempts`, `max_attempts`, `priority`, `lease_owner`, `lease_expires_at`, `heartbeat_at`, `cancel_requested_at`, `slot_released` (default `false`), `error_code`, `core_run_id?`, `request_id` único, `started_at` | índice parcial `WHERE status='queued'` em `(priority DESC, created_at)`; claim só por `nexus.claim_next_job` (§5.8.1). **Não** carrega `max_active_jobs_per_owner`: o limite é política do servidor, não dado do job |
 | `nexus.job_events` | progresso append-only (`job_id`, `sequence`, `kind`, `data`) | histórico monotônico |
-| `nexus.job_owner_counters` | contador de jobs ativos por `owner_id` (`active_count`), para limites exatos sob concorrência | **opcional até** o teste de concorrência reprovar o `count(*)` de §5.8.1; atualizado na mesma transação do claim/finish |
+| `nexus.job_owner_slots` | reserva por `owner_id`: `active_count`, `max_active` (`PRIMARY KEY owner_id`), `CHECK (active_count >= 0)` | **obrigatória**, não opcional: é o mecanismo de serialização do limite. `UPDATE` atômico na mesma transação do claim; `FOR UPDATE` na linha do owner serializa claims do mesmo dono |
+| `nexus.job_policy` | política do servidor: `scope` (`global`/`owner`/`assistant`), `max_active_jobs` | de onde `max_active` é copiado no primeiro enfileiramento. **Sem `GRANT` para `nexus_app` em escrita**: se a API pudesse alterar, o cliente contornaria o limite |
+| `nexus.job_maintenance` | registro das execuções de `reap_expired_leases` (início, fim, jobs recuperados, divergências) | auditoria da reconciliação de contadores |
 
 **Mídia e artefatos (fases 10–11)**
 
@@ -920,11 +1043,25 @@ texto; índice por `(owner_id, …)`. Tabelas de **catálogo global** (`assistan
 `tool_definitions`, `media_services`) não têm `owner_id` nem RLS — mesma decisão já tomada para
 `nexus.assistants`.
 
-Exceção **única e explicitamente delimitada**: `nexus.jobs` recebe `GRANT EXECUTE` de
-`nexus.claim_next_job` (SECURITY DEFINER) para o role do worker, e **nada mais**. Isso não é
-relaxamento de política: a tabela continua com `FORCE ROW LEVEL SECURITY`, e o único alívio é a
-função de claim, que devolve metadados (§5.8.1). Qualquer outra tabela — inclusive `job_events` e
-`artifacts` — **não** tem função privilegiada; o worker as acessa apenas na Etapa B, com RLS.
+**Exceção única e explicitamente delimitada — a fila.** Diferentemente de `job_events` e
+`artifacts` (que seguem o padrão normal), `nexus.jobs` recebe:
+
+| Objeto | Privilégio | Concedido a | Por quê |
+| --- | --- | --- | --- |
+| `nexus.jobs` | `SELECT, UPDATE` | `nexus_claim_runner` | necessários ao corpo das funções de claim/finish |
+| `nexus.jobs` | *nenhum* | `nexus_worker` | o worker **não** toca a tabela diretamente |
+| `nexus.claim_next_job`, `finish_job`, `reap_expired_leases` | `EXECUTE` | `nexus_worker` | única via de acesso do worker |
+| as três funções | `EXECUTE` revogado | `PUBLIC` | impede acesso por qualquer outro role |
+
+Isso **não** desliga `FORCE ROW LEVEL SECURITY`: `nexus.jobs` mantém `ENABLE` + `FORCE`, e recebe
+duas políticas adicionais, ambas restritas a `nexus_claim_runner` (`FOR SELECT` e `FOR UPDATE`),
+porque — como o experimento de §5.8.1 provou — `SECURITY DEFINER` **não** contorna `FORCE RLS`.
+O worker nunca é sujeito dessas políticas: ele não tem `GRANT` de tabela, e privilégio de tabela é
+avaliado antes da política.
+
+Nenhuma tabela pessoal (`messages`, `run_results`, `tool_events`, `artifacts`,
+`provider_authorizations`) recebe função privilegiada de qualquer tipo. O worker as acessa apenas na
+Etapa B, com `withOwnerTransaction` e RLS por owner.
 
 ### 6.5 Fronteira global × pessoal (resumo executável)
 
@@ -933,6 +1070,13 @@ função de claim, que devolve metadados (§5.8.1). Qualquer outra tabela — in
 | Catálogo global | `assistants`, `assistant_config_versions`, `assistant_capabilities`, `tool_definitions`, `media_services` | não | não (por design, já vigente) |
 | Configuração pessoal | `tool_grants`, `tool_confirmations`, `user_assistant_preferences`, `user_assistant_settings`, `*_provider_preferences`, `conversation_settings` | sim | **sim, FORCE** |
 | Execução por owner | `conversations`, `messages`, `core_runs`, `run_steps`, `run_results`, `tool_events`, `tool_invocations`, `jobs`, `job_events`, `artifacts` | sim | **sim, FORCE** (já vigente para os 8 primeiros) |
+
+**Infraestrutura de fila (classificação própria, fora das duas anteriores):**
+
+| Tabela | `owner_id` | RLS | Acesso |
+| --- | --- | --- | --- |
+| `job_owner_slots` | sim (PK) | a definir na fase 7: leitura só via função; `nexus_app` **sem** escrita em `max_active` | `nexus_claim_runner` (leitura/escrita), `nexus_app` (`SELECT` para exibir uso) |
+| `job_policy` | não (global + por escopo) | não é dado pessoal, mas **é política de segurança**: escrita exclusiva de migração/admin | leitura por `nexus_claim_runner`; `nexus_app` sem `UPDATE` |
 
 ---
 
@@ -1038,11 +1182,14 @@ export interface JobClaimService {
 /** Etapa B — tudo aqui exige ownerId e roda em withOwnerTransaction (RLS ativa). */
 export interface JobRepository {
   getForExecution(jobId: string, workerId: string): Promise<JobExecution | null>; // payload só aqui
-  heartbeat(jobId: string, workerId: string, leaseMs: number): Promise<boolean>;  // false = lease perdido
+  /** false = lease perdido; a escrita não acontece. INSERT/UPDATE direto, sem tocar o contador. */
+  heartbeat(jobId: string, workerId: string, leaseMs: number): Promise<boolean>;
   reportProgress(jobId: string, workerId: string, progress: number, event: JobEventPayload): Promise<void>;
-  complete(jobId: string, workerId: string, result: JobCompletion): Promise<void>;
-  fail(jobId: string, workerId: string, error: ToolError): Promise<void>;
-  acknowledgeCancellation(jobId: string, workerId: string): Promise<void>;
+  /** Terminalizam o job. Delegam a nexus.finish_job (SECURITY DEFINER): transição + liberação
+   *  da reserva na mesma transação; `false` = lease perdido ou já terminalizado. */
+  complete(jobId: string, workerId: string, result: JobCompletion): Promise<boolean>;
+  fail(jobId: string, workerId: string, error: ToolError): Promise<boolean>;
+  acknowledgeCancellation(jobId: string, workerId: string): Promise<boolean>;
 }
 
 export interface JobQueue {
@@ -1067,6 +1214,24 @@ export interface JobWorker {
 
 `cancelled` só é publicado após o worker confirmar (`acknowledgeCancellation`); job com lease
 vencido volta a `queued` por uma rotina de manutenção, não pelo worker que caiu.
+
+**Onde cada método roda (importa para privilégio):**
+
+| Chamada | Role | RLS | Transação |
+| --- | --- | --- | --- |
+| `JobClaimService.claimNext` | `nexus_worker` executando `nexus.claim_next_job` | política dedicada a `nexus_claim_runner` | uma transação: slot + job |
+| `JobRepository.getForExecution`, `heartbeat`, `reportProgress` | processo do worker conectado como `nexus_app` | `withOwnerTransaction` (RLS por owner + `lease_owner` na condição) | curta, por operação |
+| `JobRepository.complete`, `fail`, `acknowledgeCancellation` | **delegam** a `nexus.finish_job` (SECURITY DEFINER), não fazem `UPDATE` direto | política dedicada | transição terminal **+** liberação da reserva na mesma transação |
+| `reap_expired_leases` | `nexus_worker` chamando a função | política dedicada | uma transação por lote |
+
+A separação é deliberada: `heartbeat`/`reportProgress` são escritas de rotina que podem usar o
+caminho normal com RLS; **terminalizar** um job toca o contador, então passa pela função que
+garante o decremento único. Nenhum caminho do worker tem `UPDATE` direto em `job_owner_slots`.
+
+`JobClaimService` e `JobRepository` **não** compartilham conexão: um roda como `nexus_worker`
+(chamando a função), o outro como a role da aplicação com RLS. Misturar os dois num único pool
+anularia a separação.
+
 
 ### 7.6 Orçamentos
 
@@ -1184,33 +1349,47 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
 
 ### Fase 7 — Infraestrutura de execução assíncrona (G11)
 
-- Ordem interna desta fase (não inverter): **7a** esquema + `nexus.claim_next_job` com `GRANT`
-  restrito ao role do worker; **7b** `JobClaimService`/`JobRepository`/`JobWorker`; **7c** rotas
-  `POST/GET/cancel`; **7d** manutenção de lease vencido.
-- Pré-requisito explícito: revisar `configured_owner_id()` (hoje singleton) — o claim privilegiado
-  só tem função real quando a política aceitar mais de um owner (§5.8.1).
-- **Testes (todos obrigatórios):**
-  - **concorrência:** dois workers chamando `claimNext` simultaneamente **nunca** recebem o mesmo
-    `job_id` (N jobs, M workers, soma de claims distintos = N);
-  - **claim não vaza conteúdo:** o retorno de `claimNext` não contém `payload`, `result` nem
-    qualquer campo pessoal — teste de tipo **e** teste SQL que falha se a função passar a retornar
-    coluna nova;
-  - **privilégio não vaza para a tabela:** role da API chamando `claim_next_job` →
-    `insufficient_privilege`; role do worker fazendo `SELECT payload FROM nexus.jobs` → 0 linhas
-    (ou erro), provando que o `GRANT` é só da função;
-  - **limite por owner** respeitado no claim, com teste que reproduz o cenário de estouro sob
-    concorrência (e que obriga o contador de §5.8.1 se falhar);
-  - **worker não executa job de outro owner:** `getForExecution`/`heartbeat`/`complete` com
-    `jobId` de outro owner afetam 0 linhas e não vazam erro diferenciado;
-  - **operações pós-claim respeitam RLS:** toda leitura de conteúdo falha sem `ownerId` definido;
-    `heartbeat` de worker cujo lease expirou devolve `false` e a escrita não passa;
-  - **lease vencido recupera com segurança:** job órfão volta a `queued`, é reivindicado por outro
-    worker e conclui **uma única vez** (sem duplicar efeito nem artefato);
-  - **falha durante o claim não deixa estado inconsistente:** exceção entre o `SELECT` e o
-    `UPDATE` (ou no meio da função) → transação revertida, job continua `queued`, nenhum lease
-    órfão;
-  - `202` + `jobId` sem trabalho no HTTP; progresso monotônico; cancelamento só vira `cancelled`
-    com confirmação; `requestId` duplicado não cria dois jobs.
+Ordem interna (não inverter): **7a** esquema + roles + funções privilegiadas; **7b**
+`JobClaimService`/`JobRepository`/`JobWorker`; **7c** rotas `POST/GET/cancel`; **7d** manutenção de
+lease vencido e reconciliação.
+
+**Pré-requisitos explícitos:**
+
+- revisar `configured_owner_id()` (hoje singleton, L15) — sem isso só existe um owner e o claim
+  privilegiado é inócuo;
+- criar `nexus_claim_runner` (`NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT`) e **não** dar a ele
+  login, senha, `BYPASSRLS` ou membership de outro role;
+- confirmar que `nexus_worker` **não** recebe `GRANT` em `nexus.jobs`, `nexus.job_owner_slots`
+  nem `nexus.job_policy`;
+- `max_active` gravado por política do servidor; `nexus_app` **sem** `UPDATE` em `job_policy`.
+
+**Testes de integração PostgreSQL (obrigatórios antes de liberar a implementação).** Alguns são
+executáveis no workflow `database-postgres.yml`, que hoje já sobe um PostgreSQL 17 com
+`bootstrap.sql`; os demais exigem ler `pg_policies`/`pg_class` e são igualmente CI-only.
+
+| # | Teste | Como prova |
+| --- | --- | --- |
+| 1 | **Dois workers concorrentes não pegam o mesmo job** | N jobs, M workers em paralelo; soma dos `job_id` devolvidos = N sem repetição |
+| 2 | **Claim não expõe conteúdo** | comparar o tipo de retorno com a lista fechada de 5 colunas; falhar se surgir coluna nova |
+| 3 | **Worker não lê payload** | `SET ROLE nexus_worker; SELECT payload FROM nexus.jobs` → `permission denied for table jobs` |
+| 4 | **Role da API não executa a função** | `SET ROLE nexus_app; SELECT nexus.claim_next_job(...)` → `permission denied for function` |
+| 5 | **Anônimo não obtém acesso privilegiado** | `has_function_privilege('nexus_anonymous', ...)` = false para as três funções |
+| 6 | **`FORCE RLS` permanece ativo** | `SELECT relrowsecurity AND relforcerowsecurity FROM pg_class` = true em `nexus.jobs`, após as políticas novas |
+| 7 | **`SECURITY DEFINER` sozinho não basta** | função de teste com dono não-superuser e **sem** política para o role → 0 linhas (regressão do achado de §5.8.1) |
+| 7b | **`pg_temp` no fim do `search_path`** | criar tabela temporária com o nome de uma tabela lida pela função e chamar: o resultado tem de vir de `nexus`, não do temp (regressão do sequestro verificado em §5.8.1) |
+| 8 | **Limite por owner nunca é ultrapassado** | P jobs, `max_active = K`, W workers concorrentes → `count(running) <= K` por owner em **todas** as observações |
+| 9 | **Liberação exactly-once** | `finish_job` duas vezes → segunda retorna `false`; `active_count` decrementa uma vez |
+| 10 | **Claim concorrente do mesmo owner serializa** | 2 claims do mesmo owner com `max_active=1` → exatamente 1 sucesso |
+| 11 | **Claims de owners diferentes são independentes** | owner A saturado não bloqueia owner B (tempo de resposta e resultado) |
+| 12 | **Rollback não deixa contador divergente** | claim + exceção na mesma transação → `active_count` idêntico ao inicial |
+| 13 | **Lease vencido recupera e libera corretamente** | expirar lease → `reap_expired_leases` reenfileira mantendo reserva; se `attempts` esgotado, `failed` + reserva liberada uma vez |
+| 14 | **Reap é idempotente** | segunda execução devolve 0 e não altera contadores |
+| 15 | **Cliente não altera limites** | `SET ROLE nexus_app; UPDATE nexus.job_policy` → `permission denied` |
+| 16 | **Reconciliação detecta divergência** | injetar `active_count` inconsistente; job de manutenção reporta e corrige para `count(running) AND slot_released=false` |
+| 17 | **`202` + `jobId` sem trabalho no HTTP**; progresso monotônico; `cancelled` só após confirmação; `requestId` idempotente | testes de API já previstos |
+
+Os testes 1–16 **não** podem ser substituídos por mocks: a garantia é do PostgreSQL (locks,
+políticas, privilégios), não do código TypeScript.
 
 ### Fase 8 — Primeira ferramenta real de baixo risco (leitura de arquivo em sandbox)
 
@@ -1256,7 +1435,7 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
 | 4 | E2E de conversa; `:free`; delegação YUI→nova; app sem código novo |
 | 5 | isolamento de grants entre owners; grant ausente; grant não amplia catálogo; coexistência de preferências |
 | 6 | ausência de executor; grant ausente; limites; evento de auditoria; `executionMode: job` sem fila |
-| 7 | 202/`jobId`; progresso monotônico; **dois workers nunca pegam o mesmo job**; **claim não expõe payload nem dado pessoal** (inclui guard de retorno e de privilégio); limite por owner no claim; **worker não executa job de outro owner**; operações pós-claim sob RLS; **retomada segura de lease vencido**; **falha no meio do claim não deixa job preso**; cancelamento confirmado; `requestId` idempotente |
+| 7 | **PostgreSQL (CI):** dois workers não pegam o mesmo job; claim não expõe payload (guard de colunas); worker não lê `jobs`; API não executa a função; anônimo sem privilégio; `FORCE RLS` ativo após as políticas; `SECURITY DEFINER` sem política = 0 linhas; **limite por owner nunca ultrapassado**; liberação exactly-once; mesmo owner serializa; owners diferentes independentes; rollback sem divergência; lease vencido recupera e libera; reap idempotente; cliente não altera `job_policy`; reconciliação detecta divergência. **API:** 202/`jobId`; progresso monotônico; cancelamento confirmado; `requestId` idempotente |
 | 8 | path traversal; isolamento de sandbox; cota; **prompt injection não altera instruções** |
 | 9 | fuga de FS/rede; fork bomb; timeout; memória; env sem segredos; cancelamento encerra processo |
 | 10 | `paid`/`unknown` bloqueados; ausência de serviço gratuito → indisponível; ownership e TTL de artefato; **zero acoplamento com o catálogo de chat** |
@@ -1281,7 +1460,11 @@ sandbox local (as integrações PostgreSQL seguem no workflow `database-postgres
 | Custo de mídia: serviço pago acionado sem intenção | **alta** | só `costStatus: free_confirmed` executa; `paid`/`unknown` bloqueados; sem fallback pago |
 | Job preso em `running` após queda do worker | **alta** | lease + heartbeat; job órfão volta a `queued`; teste de retomada obrigatório |
 | Vazamento entre usuários no worker | **crítica** | claim privilegiado devolve só metadados; execução inteira em `withOwnerTransaction`; RLS aplicada; testes de isolamento e de privilégio (§5.8) |
-| Função `SECURITY DEFINER` de claim virar bypass de RLS | **crítica** | corpo mínimo de uma tabela/uma operação; `GRANT` só ao role do worker; `search_path` fixo; testes negativos que falham se o retorno crescer ou se o worker ler a tabela direto |
+| Função `SECURITY DEFINER` de claim virar bypass de RLS | **crítica** | **`SECURITY DEFINER` não contorna `FORCE RLS`** (provado em §5.8.1); exige política dedicada só para `nexus_claim_runner` (`FOR SELECT`+`FOR UPDATE`, nunca `INSERT`/`DELETE`); role `NOLOGIN NOBYPASSRLS`; `GRANT` só a `nexus_worker`; `search_path` fixo; testes 3–7 da Fase 7 |
+| `nexus_claim_runner` ser usado como identidade de leitura da fila | **alta** | role sem login/senha/membership; `SELECT/UPDATE` só nas tabelas de fila (não em `messages`/`run_results`); qualquer `SET ROLE` exige ser membro — e nenhum role de aplicação é |
+| Limite de concorrência violado sob claim paralelo | **crítica** | `job_owner_slots` com `UPDATE active_count+1` + `SELECT ... FOR UPDATE` na linha do owner; **não** `count(*)`; teste 8 (W workers, K limite) e teste 12 (rollback) |
+| Contador divergente após falha/retomada | **alta** | slot e transição do job na **mesma** transação (rollback reverte ambos, testado); `slot_released` garante decremento único; `reap` idempotente; reconciliador no teste 16 |
+| Cliente escolher/alterar o próprio limite | **alta** | `max_active` em `nexus.job_policy`, sem `UPDATE` para `nexus_app` (teste 15); nunca lido do corpo da requisição |
 | Claim entregar job cujo owner não corresponde à política vigente (singleton) | **alta** | revisar `configured_owner_id()` antes da fase 7; sem isso, a multi-tenancy de jobs não é real |
 | Estouro de concorrência/quota por usuário | alta | limites verificados **no claim**, não no enfileiramento |
 | Ferramenta maliciosa ou conteúdo hostil manipulando o modelo | **alta** | envelope de dado não confiável, `evaluateToolPolicy`, sandbox sem rede, auditoria |
@@ -1314,9 +1497,10 @@ sandbox local (as integrações PostgreSQL seguem no workflow `database-postgres
    indisponível, sem fallback pago e sem consumo financeiro automático.
 6. Toda tarefa longa roda em job com fila durável, worker separado, progresso persistido,
    cancelamento confirmado e **retomada após falha/reinício**, com isolamento entre owners. O
-   claim é privilegiado **apenas** para reivindicar (metadados mínimos, `GRANT` restrito) e a
-   execução inteira roda em `withOwnerTransaction` com RLS — provado por testes de concorrência,
-   de não-exposição de payload e de privilégio.
+   claim é privilegiado **apenas** para reivindicar (metadados mínimos, `GRANT` restrito a
+   `nexus_worker`, política dedicada só a `nexus_claim_runner`) e a execução inteira roda em
+   `withOwnerTransaction` com RLS. **Ambas** as garantias — isolamento e limite de concorrência —
+   são demonstradas por testes de integração PostgreSQL (Fase 7, itens 1–16), não por intenção.
 7. Todo uso de ferramenta gera `tool_events` auditável com dono, run, versão e
    `contains_untrusted_external_data = true`.
 8. Saída de ferramenta entra no contexto como dado delimitado, com teste de prompt injection.
