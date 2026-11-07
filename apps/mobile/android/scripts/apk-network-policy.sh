@@ -23,6 +23,16 @@ DEBUG_ALLOWED_DOMAINS="10.0.2.2 localhost 127.0.0.1"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
+  # Printing the compiled dumps turns a CI failure into a diagnosis instead of a
+  # mystery: the reviewer sees exactly what the APK contains.
+  if [[ -n "${DIAGNOSTIC_MANIFEST:-}" && -f "${DIAGNOSTIC_MANIFEST}" ]]; then
+    printf '\n--- compiled manifest ---\n' >&2
+    cat "${DIAGNOSTIC_MANIFEST}" >&2 || true
+  fi
+  if [[ -n "${DIAGNOSTIC_CONFIG:-}" && -f "${DIAGNOSTIC_CONFIG}" ]]; then
+    printf '\n--- compiled network security config ---\n' >&2
+    cat "${DIAGNOSTIC_CONFIG}" >&2 || true
+  fi
   exit 1
 }
 
@@ -55,6 +65,22 @@ find_aapt2() {
   return 1
 }
 
+# Normalizes a compiled boolean attribute.
+#
+# `aapt2 dump xmltree` may render a boolean either as the literal `true`/`false`
+# (when the value came from a string) or as its compiled binary form
+# `(type 0x12)0xffffffff` / `(type 0x12)0x0`. Both must be understood, otherwise
+# the check would reject a perfectly valid APK.
+normalize_bool() {
+  local raw
+  raw="$(printf '%s' "$1" | tr -d '[:space:]')"
+  case "$raw" in
+    true|"(type0x12)0xffffffff"|0xffffffff) printf 'true\n' ;;
+    false|"(type0x12)0x0"|0x0) printf 'false\n' ;;
+    *) printf '%s\n' "$raw" ;;
+  esac
+}
+
 # Prints the cleartextTrafficPermitted value of the base-config element.
 base_cleartext() {
   awk '
@@ -65,7 +91,7 @@ base_cleartext() {
       print
       exit
     }
-  ' "$1"
+  ' "$1" | while IFS= read -r value; do normalize_bool "$value"; done
 }
 
 # Prints every `cleartextTrafficPermitted` value found under domain-config blocks.
@@ -76,7 +102,7 @@ domain_cleartext_values() {
       sub(/.*cleartextTrafficPermitted=/, "")
       print
     }
-  ' "$1"
+  ' "$1" | while IFS= read -r value; do normalize_bool "$value"; done
 }
 
 # Prints one domain per line (the T: '"..."' lines inside domain elements).
@@ -99,6 +125,9 @@ check() {
 
   [[ -f "$manifest_dump" ]] || fail "manifest dump not found: $manifest_dump"
   [[ -f "$config_dump" ]] || fail "network security config dump not found: $config_dump"
+
+  DIAGNOSTIC_MANIFEST="$manifest_dump"
+  DIAGNOSTIC_CONFIG="$config_dump"
 
   ########################################
   # Manifest

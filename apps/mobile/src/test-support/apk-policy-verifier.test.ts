@@ -109,6 +109,53 @@ describe("APK network policy verifier — accepted artifacts", () => {
   });
 });
 
+describe("APK network policy verifier — compiled boolean encodings", () => {
+  // aapt2 may render a boolean as its compiled binary form. Both encodings mean
+  // the same thing, and treating one as invalid would reject a correct APK (or,
+  // worse, accept a permissive one).
+  // Matches what a real debug APK contains: base-config denied (compiled as 0x0)
+  // and the domain exception allowed (compiled as 0xffffffff).
+  const BINARY_OPEN = CONFIG_DEBUG
+    .replace("A: cleartextTrafficPermitted=false", "A: cleartextTrafficPermitted=(type 0x12)0x0")
+    .replace(
+      "A: cleartextTrafficPermitted=true",
+      "A: cleartextTrafficPermitted=(type 0x12)0xffffffff",
+    );
+
+  const BINARY_CLOSED_RELEASE = CONFIG_RELEASE.replace(
+    "A: cleartextTrafficPermitted=false",
+    "A: cleartextTrafficPermitted=(type 0x12)0x0",
+  );
+
+  it("reads a binary-encoded false as a denial", () => {
+    const result = runCheck("release", MANIFEST_OK, BINARY_CLOSED_RELEASE);
+    expect(result.status).toBe(0);
+    expect(result.output).toContain("PASS: release APK network policy is correct");
+  });
+
+  it("reads a binary-encoded true as permission and rejects it for release", () => {
+    const binaryOpenRelease = CONFIG_RELEASE.replace(
+      "A: cleartextTrafficPermitted=false",
+      "A: cleartextTrafficPermitted=(type 0x12)0xffffffff",
+    );
+    const result = runCheck("release", MANIFEST_OK, binaryOpenRelease);
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("expected 'false'");
+  });
+
+  it("accepts a debug APK whose booleans are binary-encoded", () => {
+    const result = runCheck("debug", MANIFEST_OK, BINARY_OPEN);
+    expect(result.status).toBe(0);
+  });
+
+  it("prints the compiled dumps when a check fails", () => {
+    // A CI failure must be diagnosable without re-running the job.
+    const result = runCheck("release", MANIFEST_OK, CONFIG_DEBUG);
+    expect(result.output).toContain("compiled network security config");
+    expect(result.output).toContain("E: domain-config");
+  });
+});
+
 describe("APK network policy verifier — rejected artifacts", () => {
   it("rejects a release APK carrying the debug cleartext exception", () => {
     const result = runCheck("release", MANIFEST_OK, CONFIG_DEBUG);
