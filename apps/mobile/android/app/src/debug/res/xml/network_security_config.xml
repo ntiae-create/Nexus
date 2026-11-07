@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-only network policy for NEXUS (app/src/debug — never packaged in release).
+
+  Cleartext stays denied by default. It is enabled only for the loopback aliases
+  and for IPs a developer explicitly lists below.
+
+  IMPORTANT: Android's Network Security Configuration has NO CIDR / prefix syntax.
+  A <domain> entry matches one literal hostname or IP address. Writing
+  `192.168.0.0/16` would match nothing while looking like it enforced something,
+  so the specific addresses must be listed.
+
+  Already listed (no edit needed):
+    10.0.2.2    Android emulator alias for the host machine
+    localhost   loopback, for `adb reverse tcp:3000 tcp:3000`
+    127.0.0.1   same, as a literal IPv4 loopback
+
+  To use a physical device on the same LAN, add YOUR machine's address, e.g.:
+    <domain includeSubdomains="false">192.168.0.10</domain>
+
+  Keep this list to private addresses only. A public host or a production API
+  stays HTTPS-only even in debug builds, and release builds do not contain this
+  file at all: they use app/src/main/res/xml/network_security_config.xml, which
+  denies all cleartext traffic.
+
+  Alternative that needs no config change: `adb reverse tcp:3000 tcp:3000` maps
+  the device's localhost:3000 to the host's 3000, so `http://localhost:3000`
+  works over loopback.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Emulator alias for the developer machine. -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+        <!-- Loopback, for `adb reverse tcp:3000 tcp:3000`. -->
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <!-- Add your own LAN address here, one <domain> per literal IP. -->
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup policy for the NEXUS session.
+
+  The session token lives in EncryptedSharedPreferences ("nexus_secure_session").
+  The file is encrypted with a key held in the Android Keystore, so it is already
+  unreadable outside this device. It is excluded from backup anyway: a restored
+  copy of a keystore-encrypted file cannot be decrypted on another device, and
+  carrying it around only creates a stale-credential artifact. Restoring a backup
+  therefore never resurrects a session — the user signs in again.
+
+  Everything else (API base URL configuration) is plain, non-secret data.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="nexus_secure_session.xml" />
+</full-backup-content>

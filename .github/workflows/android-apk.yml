@@ -1,0 +1,197 @@
+name: Android APK build and network policy
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/android-apk.yml"
+      - "apps/mobile/**"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/android-apk.yml"
+      - "apps/mobile/**"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    name: Build debug/release APKs and verify network policy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK platform and build tools
+        # `--licenses` acceptance and idempotent installs: the runner image already
+        # ships some packages, and `sdkmanager --install` is safe to re-run.
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Show toolchain versions
+        run: |
+          java -version
+          sdkmanager --version
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up npm 11
+        run: npm install --global npm@11
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Verify the APK policy checker itself
+        # Runs the fixtures that pin the checker's verdicts, so a later failure in
+        # this job means the APK changed — not that the tool broke.
+        run: npx vitest run apps/mobile/src/test-support/apk-policy-verifier.test.ts
+
+      - name: Build web assets for the WebView
+        run: npm run build --workspace @nexus/mobile
+
+      - name: Sync Capacitor Android project
+        # Generates capacitor.build.gradle / capacitor.settings.gradle targets and the
+        # capacitor-cordova-android-plugins project, none of which are committed.
+        run: npx cap sync android
+        working-directory: apps/mobile
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        working-directory: apps/mobile/android
+
+      - name: Build release APK
+        # Unsigned on purpose: this job validates compilation and the packaged
+        # network policy, not distribution signing. No keystore or secret is used.
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        working-directory: apps/mobile/android
+
+      - name: Locate built APKs
+        id: apks
+        run: |
+          set -euo pipefail
+          debug_apk="$(find apps/mobile/android/app/build/outputs/apk/debug -name '*.apk' | head -1)"
+          release_apk="$(find apps/mobile/android/app/build/outputs/apk/release -name '*.apk' | head -1)"
+
+          for candidate in "$debug_apk" "$release_apk"; do
+            if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+              echo "::error::Expected APK was not produced"
+              exit 1
+            fi
+            printf 'built: %s (%s bytes)\n' "$candidate" "$(stat -c%s "$candidate")"
+          done
+
+          # Absolute paths: the verification steps run with a different working
+          # directory, so a repo-root-relative path would not resolve there.
+          echo "debug_apk=$(realpath "$debug_apk")" >> "$GITHUB_OUTPUT"
+          echo "release_apk=$(realpath "$release_apk")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify debug APK network policy
+        # Reporting lives inside the step on purpose: no outcome plumbing between
+        # steps, so the verdict printed here is always the one that was computed.
+        run: |
+          set +e
+          ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
+          status=$?
+          set -e
+          report="apk-policy-debug.txt"
+          if [ -f "$report" ]; then
+            echo "========== debug APK =========="
+            cat "$report"
+            # Annotation level must reflect the real verdict: a passing check that
+            # emits ::error leaves a misleading red mark on the run. Only a genuine
+            # failure is annotated as an error; success is a notice.
+            verdict="$(head -1 "$report")"
+            if [ "$status" -eq 0 ]; then
+              echo "::notice title=debug APK network policy::${verdict}"
+            else
+              echo "::error title=debug APK network policy::${verdict}"
+            fi
+            echo "## Debug APK network policy" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+        working-directory: apps/mobile/android
+
+      - name: Verify release APK network policy
+        run: |
+          set +e
+          ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
+          status=$?
+          set -e
+          report="apk-policy-release.txt"
+          if [ -f "$report" ]; then
+            echo "========== release APK =========="
+            cat "$report"
+            # Annotation level must reflect the real verdict: a passing check that
+            # emits ::error leaves a misleading red mark on the run. Only a genuine
+            # failure is annotated as an error; success is a notice.
+            verdict="$(head -1 "$report")"
+            if [ "$status" -eq 0 ]; then
+              echo "::notice title=release APK network policy::${verdict}"
+            else
+              echo "::error title=release APK network policy::${verdict}"
+            fi
+            echo "## Release APK network policy" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+        working-directory: apps/mobile/android
+
+      - name: Dump compiled policy for the reviewer
+        # Printed so the reviewer can see the actual packaged resource, not a claim
+        # about it. `|| true` is safe here: the steps above already decided the verdict.
+        run: |
+          aapt2="$(find "${ANDROID_HOME}/build-tools" -maxdepth 2 -name aapt2 -type f | sort -V | tail -1)"
+          entry="$(unzip -Z1 "${{ steps.apks.outputs.release_apk }}" | grep -E '^res/.*\.xml$' | while read -r f; do
+            if "$aapt2" dump xmltree --file "$f" "${{ steps.apks.outputs.release_apk }}" | grep -q 'E: network-security-config'; then echo "$f"; break; fi
+          done)"
+
+          echo "===== RELEASE manifest ====="
+          "$aapt2" dump xmltree --file AndroidManifest.xml "${{ steps.apks.outputs.release_apk }}" | grep -iE "networkSecurityConfig|usesCleartextTraffic|debuggable" || true
+
+          echo "===== RELEASE ${entry} ====="
+          "$aapt2" dump xmltree --file "$entry" "${{ steps.apks.outputs.release_apk }}" || true
+        working-directory: apps/mobile/android
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-apks
+          path: |
+            apps/mobile/android/app/build/outputs/apk/debug/*.apk
+            apps/mobile/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
