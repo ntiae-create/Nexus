@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ (API 31+) counterpart of backup_rules.xml.
+
+  The keystore-backed session store is excluded from both cloud backup and
+  device-to-device transfer: a token must be re-obtained by signing in on the new
+  device, never migrated silently.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="nexus_secure_session.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="nexus_secure_session.xml" />
+    </device-transfer>
+</data-extraction-rules>

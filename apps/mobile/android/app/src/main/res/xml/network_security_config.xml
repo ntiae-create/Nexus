@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Production network policy for NEXUS.
+
+  Cleartext HTTP is denied to every destination. With `targetSdkVersion 35` this is
+  already the platform default, but stating it explicitly means the APK keeps the
+  guarantee even if the target SDK or a future dependency changes the default.
+
+  Debug builds replace this file with `app/src/debug/res/xml/network_security_config.xml`,
+  which permits HTTP only for local development (see docs/MOBILE_AUTHENTICATION.md).
+  That override lives in the `debug` source set, so it is absent from release builds.
+
+  Consequence for production: the API address must be an `https://` URL. Plain
+  `http://` configuration is rejected by the platform before the request leaves the
+  device.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

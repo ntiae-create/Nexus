@@ -1,12 +1,176 @@
-export function getApiBaseUrl(): string {
-  if (typeof window !== "undefined") {
-    const stored = window.localStorage.getItem("nexus.apiBaseUrl");
-    if (stored) return stored.replace(/\/$/, "");
+import { Capacitor } from "@capacitor/core";
+
+/**
+ * Legacy key for the runtime override.
+ *
+ * Earlier builds stored the backend address here through `localStorage` on every
+ * platform — including inside the Android WebView. It holds an address only, never
+ * a credential, so keeping compatibility with it is safe. It is read (and, on
+ * Android, migrated) but never written by this version.
+ */
+export const API_BASE_URL_STORAGE_KEY = "nexus.apiBaseUrl";
+
+/**
+ * Capacitor preference key holding the API base URL configured from inside the
+ * app. It is a plain address, never a credential, so the (non-secret) native
+ * `Preferences` store is enough and no secure-storage plugin is needed for it.
+ */
+export const API_BASE_URL_PREFERENCE_KEY = "nexus.apiBaseUrl";
+
+/**
+ * Fallback used by `vite dev` in the browser. A physical Android device can never
+ * reach the development machine through `localhost` — that resolves to the device
+ * itself — so this value is used only for a browser on the same machine.
+ */
+export const DEVELOPMENT_API_BASE_URL = "http://localhost:3000";
+
+const trimTrailingSlashes = (value: string): string => value.replace(/\/+$/, "");
+
+/**
+ * Validates and normalizes a user-supplied backend address.
+ *
+ * Only absolute `http`/`https` URLs are accepted: a relative or malformed value
+ * would silently resolve against the WebView origin and produce confusing
+ * network failures on the device.
+ */
+export function normalizeApiBaseUrl(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const candidate = trimTrailingSlashes(raw.trim());
+  if (candidate.length === 0 || candidate.length > 2048) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
   }
-  return (
-    (import.meta.env.VITE_NEXUS_API_URL as string | undefined)?.replace(/\/$/, "") ||
-    "http://localhost:3000"
-  );
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!parsed.hostname) return null;
+  // Credentials in the URL would end up in logs and error messages.
+  if (parsed.username || parsed.password) return null;
+  if (parsed.search || parsed.hash) return null;
+
+  return trimTrailingSlashes(parsed.toString());
+}
+
+export interface ResolveApiBaseUrlInput {
+  /**
+   * Value persisted by the app configuration screen (Capacitor `Preferences`).
+   * Takes precedence over every legacy source.
+   */
+  readonly stored?: string | null;
+  /** Value coming from `VITE_NEXUS_API_URL` at build time. */
+  readonly fromEnv?: string | null;
+  /** `Capacitor.isNativePlatform()`. */
+  readonly native: boolean;
+}
+
+/**
+ * Turns configuration values into the single base URL used by the HTTP client.
+ *
+ * The physical-device case never falls back to `localhost`: on Android that would
+ * address the handset, not the development machine, so an unconfigured APK reports
+ * the backend as unconfigured instead of failing with an obscure network error.
+ */
+export function resolveApiBaseUrl(input: ResolveApiBaseUrlInput): string | null {
+  const stored = normalizeApiBaseUrl(input.stored);
+  if (stored) return stored;
+
+  const fromEnv = normalizeApiBaseUrl(input.fromEnv);
+  if (fromEnv) return fromEnv;
+
+  return input.native ? null : DEVELOPMENT_API_BASE_URL;
+}
+
+/**
+ * Decides whether a legacy address should be migrated into `Preferences`.
+ *
+ * Migration never overwrites a value that is already configured: the current
+ * preference always wins, and an unusable legacy value is simply ignored rather
+ * than propagated.
+ */
+export function shouldMigrateLegacyApiBaseUrl(input: {
+  readonly stored: string | null;
+  readonly legacy: string | null;
+}): boolean {
+  return normalizeApiBaseUrl(input.stored) === null && normalizeApiBaseUrl(input.legacy) !== null;
+}
+
+const isNativePlatform = (): boolean => {
+  try {
+    return Capacitor.isNativePlatform();
+  } catch {
+    // Outside Capacitor (plain browser, tests) the web platform applies.
+    return false;
+  }
+};
+
+/**
+ * Reads the legacy `localStorage` override.
+ *
+ * Kept for installations that stored the address in an earlier build. The value is
+ * an endpoint, not a secret; nothing else is ever read from or written to
+ * `localStorage` here.
+ */
+export function readLegacyApiBaseUrl(): string | null {
+  return normalizeApiBaseUrl(readStoredOverride());
+}
+
+const readStoredOverride = (): string | null => {
+  try {
+    return typeof window === "undefined"
+      ? null
+      : window.localStorage.getItem(API_BASE_URL_STORAGE_KEY);
+  } catch {
+    // Storage can be unavailable (private mode, WebView restrictions).
+    return null;
+  }
+};
+
+let configuredBaseUrl: string | null | undefined;
+
+/**
+ * Sets the base URL resolved by the session bootstrap (which can await the native
+ * preferences store). Passing `null` means "no backend configured".
+ */
+export function setApiBaseUrl(value: string | null): void {
+  configuredBaseUrl = value ? normalizeApiBaseUrl(value) : null;
+}
+
+/**
+ * Resolves the API base URL synchronously.
+ *
+ * Precedence: value configured during bootstrap > legacy runtime override
+ * (`nexus.apiBaseUrl` in localStorage) > `VITE_NEXUS_API_URL` > development default
+ * (browser only).
+ *
+ * This is the synchronous fallback used before/around bootstrap. The application
+ * graph is built by `bootstrapApp()`, which also awaits the native preference.
+ */
+export function getApiBaseUrl(): string | null {
+  if (configuredBaseUrl !== undefined) {
+    return (
+      configuredBaseUrl ??
+      normalizeApiBaseUrl(readStoredOverride()) ??
+      normalizeApiBaseUrl(import.meta.env.VITE_NEXUS_API_URL as string | undefined) ??
+      (isNativePlatform() ? null : DEVELOPMENT_API_BASE_URL)
+    );
+  }
+  return resolveApiBaseUrl({
+    stored: readStoredOverride(),
+    fromEnv: (import.meta.env.VITE_NEXUS_API_URL as string | undefined) ?? null,
+    native: isNativePlatform(),
+  });
+}
+
+/** True when the app is running inside the Capacitor Android/iOS shell. */
+export function isNativeApp(): boolean {
+  return isNativePlatform();
+}
+
+/** Test hook: restores the "not configured yet" state. */
+export function resetApiBaseUrl(): void {
+  configuredBaseUrl = undefined;
 }
 
 export const ASSISTANTS = [
