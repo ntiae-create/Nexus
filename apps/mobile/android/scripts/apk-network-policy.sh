@@ -21,8 +21,30 @@ set -euo pipefail
 # routable on the public internet.
 DEBUG_ALLOWED_DOMAINS="10.0.2.2 localhost 127.0.0.1"
 
+# Writes the human-readable report consumed by CI. Called on success and failure,
+# so a failure never ends the job without a diagnosis.
+write_report() {
+  local verdict="$1"
+  [[ -n "${DIAGNOSTIC_OUTPUT:-}" ]] || return 0
+  {
+    printf 'verdict: %s\n' "$verdict"
+    if [[ -n "${DIAGNOSTIC_MANIFEST:-}" && -f "${DIAGNOSTIC_MANIFEST}" ]]; then
+      printf '\n--- compiled manifest ---\n'
+      cat "${DIAGNOSTIC_MANIFEST}"
+    fi
+    if [[ -n "${DIAGNOSTIC_CONFIG:-}" && -f "${DIAGNOSTIC_CONFIG}" ]]; then
+      printf '\n--- compiled network security config ---\n'
+      cat "${DIAGNOSTIC_CONFIG}"
+    fi
+    if [[ -n "${DIAGNOSTIC_NOTE:-}" ]]; then
+      printf '\n--- notes ---\n%s\n' "${DIAGNOSTIC_NOTE}"
+    fi
+  } >"${DIAGNOSTIC_OUTPUT}" 2>&1 || true
+}
+
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
+  write_report "FAIL - $*"
   # Printing the compiled dumps turns a CI failure into a diagnosis instead of a
   # mystery: the reviewer sees exactly what the APK contains.
   if [[ -n "${DIAGNOSTIC_MANIFEST:-}" && -f "${DIAGNOSTIC_MANIFEST}" ]]; then
@@ -32,16 +54,6 @@ fail() {
   if [[ -n "${DIAGNOSTIC_CONFIG:-}" && -f "${DIAGNOSTIC_CONFIG}" ]]; then
     printf '\n--- compiled network security config ---\n' >&2
     cat "${DIAGNOSTIC_CONFIG}" >&2 || true
-  fi
-  # Written to a file as well, so CI can upload it as a readable artifact even
-  # when the job log is not accessible to the reviewer.
-  if [[ -n "${DIAGNOSTIC_OUTPUT:-}" ]]; then
-    {
-      printf 'verdict: FAIL - %s\n\n' "$*"
-      cat "${DIAGNOSTIC_MANIFEST:-/dev/null}" 2>/dev/null || true
-      printf '\n--- network security config ---\n'
-      cat "${DIAGNOSTIC_CONFIG:-/dev/null}" 2>/dev/null || true
-    } >"${DIAGNOSTIC_OUTPUT}" 2>&1 || true
   fi
   exit 1
 }
@@ -217,6 +229,7 @@ check() {
     fail "unknown variant '${variant}' (expected debug or release)"
   fi
 
+  write_report "PASS - $variant APK network policy is correct"
   printf '\nPASS: %s APK network policy is correct\n' "$variant"
 }
 
@@ -225,11 +238,16 @@ inspect() {
 
   # Set first, so even an early failure leaves a report behind for the reviewer.
   DIAGNOSTIC_OUTPUT="${DIAGNOSTIC_OUTPUT:-apk-policy-${variant}.txt}"
+  DIAGNOSTIC_NOTE="apk: $apk"
+  : >"$DIAGNOSTIC_OUTPUT"
 
   [[ -f "$apk" ]] || fail "APK not found: $apk"
 
   local aapt2
   aapt2="$(find_aapt2)" || fail "aapt2 not found (set AAPT2 or install Android build-tools)"
+  DIAGNOSTIC_NOTE="apk: $apk
+aapt2: $aapt2
+aapt2 version: $("$aapt2" version 2>&1 | head -1)"
 
   local workdir
   workdir="$(mktemp -d)"

@@ -116,10 +116,8 @@ jobs:
 
       - name: Verify debug APK network policy
         run: |
-          set +e
           ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
           status=$?
-          set -e
           if [[ $status -ne 0 ]]; then
             # Surface the diagnosis in the check run: the artifact upload below is
             # the durable copy, but this is what the reviewer sees directly.
@@ -139,10 +137,8 @@ jobs:
 
       - name: Verify release APK network policy
         run: |
-          set +e
           ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
           status=$?
-          set -e
           if [[ $status -ne 0 ]]; then
             report="apps/mobile/android/apk-policy-release.txt"
             if [[ -f "$report" ]]; then
