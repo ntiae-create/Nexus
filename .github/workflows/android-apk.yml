@@ -115,62 +115,42 @@ jobs:
           echo "release_apk=$(realpath "$release_apk")" >> "$GITHUB_OUTPUT"
 
       - name: Verify debug APK network policy
-        id: verify_debug
-        continue-on-error: true
-        run: ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
+        # Reporting lives inside the step on purpose: no outcome plumbing between
+        # steps, so the verdict printed here is always the one that was computed.
+        run: |
+          set +e
+          ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.debug_apk }}" debug
+          status=$?
+          set -e
+          report="apk-policy-debug.txt"
+          if [ -f "$report" ]; then
+            echo "========== debug APK =========="
+            cat "$report"
+            echo "## Debug APK network policy" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
         working-directory: apps/mobile/android
 
       - name: Verify release APK network policy
-        id: verify_release
-        continue-on-error: true
-        run: ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
-        working-directory: apps/mobile/android
-
-      - name: Report policy verification result
         run: |
-          status=0
-          for variant in debug release; do
-            report="apps/mobile/android/apk-policy-${variant}.txt"
-            echo "========== ${variant} =========="
-            if [[ -f "$report" ]]; then
-              cat "$report"
-            else
-              echo "(no report was produced)"
-            fi
-            echo
-          done
-
-          {
-            echo "## Android network policy verification"
-            echo
-            for variant in debug release; do
-              report="apps/mobile/android/apk-policy-${variant}.txt"
-              echo "### ${variant}"
-              echo '```'
-              if [[ -f "$report" ]]; then cat "$report"; else echo "(no report was produced)"; fi
-              echo '```'
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "debug outcome: ${{ steps.verify_debug.outcome }}"
-          echo "release outcome: ${{ steps.verify_release.outcome }}"
-
-          # One annotation per variant that actually failed, single line on purpose:
-          # multi-line annotations are unreliable and the full dumps are already in
-          # the log and the job summary above.
-          for variant in debug release; do
-            [ "${{ steps.verify_debug.outcome }}" = "success" ] &&               [ "${{ steps.verify_release.outcome }}" = "success" ] && break
-            if [ "$variant" = "debug" ] && [ "${{ steps.verify_debug.outcome }}" = "success" ]; then continue; fi
-            if [ "$variant" = "release" ] && [ "${{ steps.verify_release.outcome }}" = "success" ]; then continue; fi
-            verdict="no report"
-            report="apps/mobile/android/apk-policy-${variant}.txt"
-            if [ -f "$report" ]; then verdict="$(head -1 "$report")"; fi
-            echo "::error title=${variant} APK network policy::${verdict}"
-            status=1
-          done
-
-          echo "final status: ${status}"
+          set +e
+          ./scripts/apk-network-policy.sh inspect "${{ steps.apks.outputs.release_apk }}" release
+          status=$?
+          set -e
+          report="apk-policy-release.txt"
+          if [ -f "$report" ]; then
+            echo "========== release APK =========="
+            cat "$report"
+            echo "## Release APK network policy" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
           exit $status
+        working-directory: apps/mobile/android
 
       - name: Dump compiled policy for the reviewer
         # Printed so the reviewer can see the actual packaged resource, not a claim
