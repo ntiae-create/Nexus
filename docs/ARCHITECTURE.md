@@ -314,6 +314,16 @@ O aplicativo nunca contém credenciais de provedor. Chaves de API ficam exclusiv
 
 Ordem detalhada, critérios de aceite, cronograma e dimensionamento das fases são pendentes. Preparar modelos locais não significa implementar execução local agora.
 
+### 14.1 Registro das etapas implementadas
+
+- **Etapa 3A (provedores):** runtime free-only OpenRouter, catálogo, verificação de preço antes
+  da chamada, seleção automática/manual e contratos públicos, em
+  `apps/server/src/providers/**`.
+- **Etapa 3B (NEXUS CORE):** fluxo de execução autenticado, orquestração explícita
+  YUI -> ALICE/SCHWI, controle de contexto, cancelamento, linhagem pai-filho persistida e
+  rotas `/v1/conversations/*` e `/v1/executions/*`. Decisões, limites e lacunas conhecidas em
+  `docs/NEXUS_CORE.md`.
+
 ## 15. Decisões técnicas pendentes
 
 Esta lista registra questões não aprovadas; não se deve inferir fornecedores, preços, limites ou mecanismos específicos a partir do documento.

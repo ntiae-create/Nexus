@@ -1511,6 +1511,169 @@ describeIfPostgres("PostgreSQL 17 repositories: persistence and integrity", () =
     }
   });
 
+  it("persists parent-child execution lineage, cancels and lists executions additively", async () => {
+    const conversationId = await transact(async (repos) => {
+      const created = await repos.conversations.create({
+        title: "3B delegation lineage",
+        assistantIds: [YUI, ALICE],
+      });
+      return created.id;
+    });
+
+    const lineage = await transact(async (repos) => {
+      const input = await repos.messages.append(conversationId, userInput("lineage-input"));
+      const root: CoreRun = {
+        id: randomUUID(),
+        userId: OWNER_ID,
+        conversationId,
+        requestId: randomUUID(),
+        idempotencyKey: `lineage-root-${randomUUID()}`,
+        status: "running",
+        assistantIds: [YUI],
+        trace: [{ assistantId: YUI, assistantKey: "yui", configVersion: "1.0.0" }],
+        inputMessageId: input.id,
+        createdAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+        formatVersion: 1,
+        metadata: { requestedAssistantKey: "yui" },
+      };
+      const createdRoot = await repos.executions.create(root);
+      const parentStep = await repos.executions.appendStep({
+        id: randomUUID(),
+        userId: OWNER_ID,
+        runId: createdRoot.id,
+        order: 0,
+        assistant: { assistantId: YUI, assistantKey: "yui", configVersion: "1.0.0" },
+        status: "succeeded",
+        objective: "coordenação",
+        inputReferenceIds: [],
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        metadata: { phase: "coordination_plan" },
+      });
+
+      const child: CoreRun = {
+        id: randomUUID(),
+        userId: OWNER_ID,
+        conversationId,
+        requestId: randomUUID(),
+        idempotencyKey: `lineage-child-${randomUUID()}`,
+        status: "running",
+        assistantIds: [ALICE],
+        trace: [{ assistantId: ALICE, assistantKey: "alice", configVersion: "1.0.0" }],
+        inputMessageId: input.id,
+        parentRunId: createdRoot.id,
+        parentStepId: parentStep.id,
+        delegationDepth: 1,
+        createdAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+        formatVersion: 1,
+        metadata: { delegationDepth: 1 },
+      };
+      const createdChild = await repos.executions.create(child);
+
+      return {
+        root: createdRoot,
+        child: createdChild,
+        parentStep,
+        byKey: await repos.executions.getByIdempotencyKey(root.idempotencyKey),
+        children: await repos.executions.listChildRuns(createdRoot.id),
+        byConversation: await repos.executions.listByConversation(conversationId),
+      };
+    });
+
+    // Stage 2B rows stay byte-identical: the hierarchy fields are only emitted
+    // when present, so roots keep an unchanged shape at the repository boundary.
+    expect(lineage.root.parentRunId).toBeUndefined();
+    expect(lineage.root.delegationDepth).toBeUndefined();
+    expect(lineage.root.parentStepId).toBeUndefined();
+    expect(lineage.child.parentRunId).toBe(lineage.root.id);
+    expect(lineage.child.parentStepId).toBe(lineage.parentStep.id);
+    expect(lineage.child.delegationDepth).toBe(1);
+    expect(lineage.byKey?.id).toBe(lineage.root.id);
+    expect(lineage.children.map((item) => item.id)).toEqual([lineage.child.id]);
+    expect(lineage.byConversation.map((item) => item.id)).toEqual([
+      lineage.root.id,
+      lineage.child.id,
+    ]);
+
+    // The column itself always stores the additive default of 0 for roots.
+    // RLS is enforced, so the raw inspection must bind the owner context first.
+    const rawClient = await internalPool.connect();
+    let rawDepth: number | undefined;
+    try {
+      await rawClient.query("BEGIN");
+      await rawClient.query("SELECT set_config('nexus.owner_id', $1, true)", [OWNER_ID]);
+      await rawClient.query("SELECT set_config('nexus.actor_type', 'owner', true)");
+      const rawRoot = await rawClient.query<{ delegation_depth: number }>(
+        "SELECT delegation_depth FROM nexus.core_runs WHERE id = $1",
+        [lineage.root.id],
+      );
+      rawDepth = rawRoot.rows[0]?.delegation_depth;
+      await rawClient.query("ROLLBACK");
+    } finally {
+      rawClient.release();
+    }
+    expect(rawDepth).toBe(0);
+
+    // Cancellation is terminal and immutable afterwards.
+    const cancelled = await transact((repos) =>
+      repos.executions.cancel(lineage.child.id, {
+        metadata: { cancellationSource: "api" },
+      }),
+    );
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.metadata?.cancellationSource).toBe("api");
+    expect(cancelled.finishedAt).toBeDefined();
+    await expect(
+      transact((repos) => repos.executions.cancel(lineage.child.id)),
+    ).rejects.toThrow(/Terminal executions are immutable/);
+    await expect(
+      transact((repos) =>
+        repos.executions.update({ ...cancelled, status: "running" }),
+      ),
+    ).rejects.toThrow(/Terminal executions are immutable/);
+
+    // Step updates are allowed while the parent execution is mutable only.
+    const updatedStep = await transact((repos) =>
+      repos.executions.updateStep({
+        ...lineage.parentStep,
+        status: "succeeded",
+        metadata: { phase: "coordination_plan", decision: "delegate" },
+      }),
+    );
+    expect(updatedStep.metadata?.decision).toBe("delegate");
+
+    // The database blocks lineage outside the same conversation and self-parenting.
+    await expect(
+      transact(async (repos) => {
+        const other = await repos.conversations.create({
+          title: "3B other conversation",
+          assistantIds: [YUI],
+        });
+        const input = await repos.messages.append(other.id, userInput("other-input"));
+        return repos.executions.create({
+          id: randomUUID(),
+          userId: OWNER_ID,
+          conversationId: other.id,
+          requestId: randomUUID(),
+          idempotencyKey: `lineage-bad-${randomUUID()}`,
+          status: "queued",
+          assistantIds: [ALICE],
+          trace: [{ assistantId: ALICE, assistantKey: "alice", configVersion: "1.0.0" }],
+          inputMessageId: input.id,
+          parentRunId: lineage.root.id,
+          parentStepId: lineage.parentStep.id,
+          delegationDepth: 1,
+          createdAt: new Date().toISOString(),
+          formatVersion: 1,
+        });
+      }),
+    ).rejects.toThrow();
+
+    await transact((repos) => repos.executions.cancel(lineage.root.id));
+  }, 30_000);
+
   it("retains all scopes during concurrent preference updates without mixed selections", async () => {
     const preferenceA = await transact(async (repos) => {
       const conversations = await repos.conversations.list();

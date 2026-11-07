@@ -5,6 +5,7 @@ import {
   registerProviderRoutes,
   type ProviderRoutesOptions,
 } from "./routes/providers.js";
+import { registerCoreRoutes, type CoreRoutesOptions } from "./routes/core.js";
 
 export type DatabaseReadinessProbe = () => Promise<void>;
 
@@ -17,6 +18,7 @@ export interface BuildAppOptions {
   checkDatabase?: DatabaseReadinessProbe;
   auth?: AuthPluginOptions;
   providers?: ProviderRoutesOptions;
+  core?: CoreRoutesOptions;
   logger?: boolean;
 }
 
@@ -41,6 +43,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
   void app.register(authPlugin, options.auth ?? {});
   void registerProviderRoutes(app, options.providers ?? {});
+  void registerCoreRoutes(app, options.core ?? {});
 
   app.get("/v1/health", async () =>
     healthResponseSchema.parse({ status: "ok" }),

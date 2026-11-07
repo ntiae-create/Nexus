@@ -4,7 +4,15 @@ import {
   assistantMemorySchema,
   assistantProviderPreferenceSchema,
   conversationProviderPreferenceSchema,
+  coordinatorDecisionEnvelopeSchema,
+  coreContextReportSchema,
+  coreExecutionErrorCodeSchema,
+  coreExecutionRequestSchema,
+  coreExecutionResponseSchema,
+  coreExecutionInspectionSchema,
   coreRunSchema,
+  delegationOutcomeRecordSchema,
+  delegationTaskSpecSchema,
   effectiveModelSelectionResponseSchema,
   eligibleModelsResponseSchema,
   freeEligibilitySchema,
@@ -395,5 +403,169 @@ describe("sync and API errors", () => {
       scope: "global",
       selection: { mode: "automatic" },
     });
+  });
+});
+
+describe("NEXUS CORE execution and delegation contracts", () => {
+  it("keeps root executions free of delegation lineage and accepts consistent child lineage", () => {
+    const root = {
+      id: ids.run, userId: ids.user, conversationId: ids.conversation, requestId: ids.run,
+      idempotencyKey: "request-1", status: "running", assistantIds: [ids.assistant], trace: [],
+      inputMessageId: ids.message, createdAt: now, formatVersion: 1,
+    };
+    expect(coreRunSchema.safeParse({ ...root, delegationDepth: 0 }).success).toBe(true);
+    expect(coreRunSchema.safeParse({ ...root, delegationDepth: 1 }).success).toBe(false);
+    expect(coreRunSchema.safeParse({ ...root, parentRunId: ids.run }).success).toBe(false);
+
+    const child = {
+      ...root,
+      parentRunId: ids.result,
+      parentStepId: ids.step,
+      delegationDepth: 1,
+      metadata: { objective: "analisar" },
+    };
+    expect(coreRunSchema.safeParse(child).success).toBe(true);
+    expect(coreRunSchema.safeParse({ ...child, parentStepId: undefined }).success).toBe(false);
+    expect(coreRunSchema.safeParse({ ...child, parentRunId: child.id }).success).toBe(false);
+    expect(coreRunSchema.safeParse({ ...child, delegationDepth: 0 }).success).toBe(false);
+    expect(
+      coreRunSchema.safeParse({ ...child, metadata: { api_key: "leak" } }).success,
+    ).toBe(false);
+  });
+
+  it("validates the structured coordination envelope and rejects ad-hoc payloads", () => {
+    expect(
+      coordinatorDecisionEnvelopeSchema.safeParse({
+        kind: "nexus.core.coordination.v1",
+        action: "delegate",
+        delegations: [{ targetAssistant: "alice", objective: "comparar fontes" }],
+      }).success,
+    ).toBe(true);
+    expect(
+      coordinatorDecisionEnvelopeSchema.safeParse({
+        kind: "nexus.core.coordination.v1",
+        action: "respond",
+        response: "Resposta direta",
+      }).success,
+    ).toBe(true);
+    expect(
+      coordinatorDecisionEnvelopeSchema.safeParse({
+        kind: "nexus.core.coordination.v1",
+        action: "delegate",
+        delegations: [],
+      }).success,
+    ).toBe(false);
+    expect(
+      coordinatorDecisionEnvelopeSchema.safeParse({
+        kind: "nexus.core.coordination.v1",
+        action: "execute",
+        command: "/delegate alice",
+      }).success,
+    ).toBe(false);
+    expect(
+      delegationTaskSpecSchema.safeParse({ targetAssistant: "yui", objective: "loop" }).success,
+    ).toBe(true);
+    expect(
+      delegationTaskSpecSchema.safeParse({ targetAssistant: "alice", objective: "" }).success,
+    ).toBe(false);
+    expect(
+      delegationTaskSpecSchema.safeParse({
+        targetAssistant: "alice",
+        objective: "x",
+        subDelegations: [{ targetAssistant: "schwi", objective: "y" }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("enforces the execution request contract boundaries", () => {
+    const base = {
+      content: [{ type: "text", text: "Olá" }],
+      requestId: ids.run,
+      idempotencyKey: "client-key-1",
+    };
+    expect(coreExecutionRequestSchema.safeParse(base).success).toBe(true);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "yui" }).success).toBe(true);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "unknown" }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, idempotencyKey: "x".repeat(141) }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, content: [] }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, timeoutMs: 99 }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, unexpected: true }).success).toBe(false);
+    expect(
+      coreExecutionRequestSchema.safeParse({ ...base, metadata: { access_token: "nope" } }).success,
+    ).toBe(false);
+    expect(coreExecutionErrorCodeSchema.safeParse("DELEGATION_CYCLE_DETECTED").success).toBe(true);
+    expect(coreExecutionErrorCodeSchema.safeParse("SOMETHING_ELSE").success).toBe(false);
+  });
+
+  it("validates the persisted execution response and inspection contracts", () => {
+    const reference = { assistantId: ids.assistant, assistantKey: "yui", configVersion: "1.0.0" };
+    const run = {
+      id: ids.run, userId: ids.user, conversationId: ids.conversation, requestId: ids.run,
+      idempotencyKey: "request-1", status: "succeeded" as const, assistantIds: [ids.assistant],
+      trace: [reference], inputMessageId: ids.message, finalMessageId: ids.result,
+      startedAt: now, finishedAt: now, createdAt: now, formatVersion: 1,
+    };
+    const message = {
+      id: ids.message, userId: ids.user, conversationId: ids.conversation, sequence: 0,
+      role: "user" as const, status: "complete" as const,
+      content: [{ type: "text" as const, text: "olá" }], formatVersion: 1, createdAt: now,
+    };
+    const assistantMessage = {
+      ...message, id: ids.result, sequence: 1, role: "assistant" as const, assistantId: ids.assistant,
+    };
+    const contextReport = {
+      effectiveContextWindow: 8192, usedFallbackWindow: false, reservedOutputBudget: 1024,
+      availableInputBudget: 7168, estimatedInputUnits: 120, includedHistoryCount: 2,
+      omittedHistoryCount: 0,
+    };
+    expect(coreContextReportSchema.safeParse(contextReport).success).toBe(true);
+    expect(coreContextReportSchema.safeParse({ ...contextReport, effectiveContextWindow: 0 }).success).toBe(false);
+    expect(coreContextReportSchema.safeParse({ ...contextReport, extra: 1 }).success).toBe(false);
+
+    const response = {
+      execution: run,
+      inputMessage: message,
+      assistantMessage,
+      steps: [],
+      results: [],
+      delegations: [],
+      childExecutions: [],
+      modelSelection: {
+        resolvedScope: "global" as const,
+        providerId: ids.provider, providerKey: "openrouter", providerName: "OpenRouter",
+        modelId: ids.model, modelKey: "meta-llama/llama-3.3-70b-instruct:free",
+        modelName: "Llama 3.3 70B Free", contextWindow: 131072,
+        freeEligibility: {
+          eligible: true, costStatus: "free_confirmed", verifiedAt: now,
+          requiresPreCallVerification: true, reason: "verified_free",
+          pricingSummary: { promptPerToken: 0, completionPerToken: 0, requestFixed: null },
+        },
+      },
+      contextReport,
+      replayed: false,
+    };
+    expect(coreExecutionResponseSchema.safeParse(response).success).toBe(true);
+    expect(
+      coreExecutionResponseSchema.safeParse({ ...response, replayed: true, delegationOutcome: "x" }).success,
+    ).toBe(false);
+    expect(
+      coreExecutionInspectionSchema.safeParse({
+        execution: run, steps: [], results: [], childExecutions: [],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("requires explicit delegated outcome records to be fully traceable", () => {
+    const record = {
+      childRunId: ids.run, parentRunId: ids.result, parentStepId: ids.step,
+      childStepId: ids.memory, childResultId: ids.result,
+      assistant: { assistantId: ids.assistant, assistantKey: "alice", configVersion: "1.0.0" },
+      objective: "analisar fontes", status: "succeeded" as const, outputText: "síntese",
+      providerKey: "openrouter", modelKey: "qwen/qwen3-coder:free", delegationDepth: 1,
+    };
+    expect(delegationOutcomeRecordSchema.safeParse(record).success).toBe(true);
+    expect(delegationOutcomeRecordSchema.safeParse({ ...record, status: "failed" }).success).toBe(false);
+    expect(delegationOutcomeRecordSchema.safeParse({ ...record, delegationDepth: 0 }).success).toBe(false);
+    expect(delegationOutcomeRecordSchema.safeParse({ ...record, outputText: "" }).success).toBe(false);
   });
 });

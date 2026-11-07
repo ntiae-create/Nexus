@@ -3,6 +3,7 @@ export * from "./identity.js";
 export * from "./assistants.js";
 export * from "./conversations.js";
 export * from "./messages.js";
+export * from "./jsonb.js";
 export * from "./executions.js";
 export * from "./memories.js";
 export * from "./providers.js";
