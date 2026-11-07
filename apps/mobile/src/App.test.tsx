@@ -40,6 +40,8 @@ const { default: App } = await import("./App.js");
 const { createSessionManager } = await import("./lib/auth/session-manager.js");
 const { createAuthService } = await import("./services/auth-service.js");
 const { createApiClient } = await import("./services/api-client.js");
+const { createCoreService } = await import("./services/core-service.js");
+const { createConversationService } = await import("./services/conversation-service.js");
 const { createSecureStorage } = await import("./lib/auth/secure-storage.js");
 const { createMemoryStorage } = await import("./test-support/fakes.js");
 const { TEST_BASE_URL, TEST_TOKEN, TEST_OWNER_ID } = await import("./test-support/fakes.js");
@@ -95,6 +97,8 @@ function makeContainer(routes: Record<string, Route>, storage: SecureStorage | n
     storage: activeStorage,
   });
 
+  const coreService = createCoreService(client);
+
   return {
     calls,
     container: {
@@ -102,6 +106,9 @@ function makeContainer(routes: Record<string, Route>, storage: SecureStorage | n
       storage: activeStorage,
       apiBaseUrl: TEST_BASE_URL,
       configureApiBaseUrl: async () => ({ ok: true }),
+      apiClient: client,
+      createConversationService: (token: string) =>
+        createConversationService({ service: coreService, token }),
     },
   };
 }
@@ -173,7 +180,7 @@ describe("App authentication flow", () => {
       host.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
       await wait(20);
     });
-    await waitFor(() => text(host).includes("Sessão ativa"));
+    await waitFor(() => text(host).includes("Suas conversas"));
 
     expect(text(host)).toContain(OWNER_ID);
     // The token is what got persisted — never the password.
@@ -205,7 +212,7 @@ describe("App authentication flow", () => {
     await waitFor(() => text(host).includes("Invalid credentials"));
 
     expect(passwordInput(host)).not.toBeNull();
-    expect(text(host)).not.toContain("Sessão ativa");
+    expect(text(host)).not.toContain("Suas conversas");
     unmount();
   });
 
@@ -260,7 +267,7 @@ describe("App authentication flow", () => {
     );
     const { host, unmount } = renderApp(container);
 
-    await waitFor(() => text(host).includes("Sessão ativa"));
+    await waitFor(() => text(host).includes("Suas conversas"));
 
     expect(calls[0]!.url).toMatch(/\/v1\/auth\/me$/);
     expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe(
@@ -302,12 +309,13 @@ describe("App authentication flow", () => {
     );
     const { host, unmount } = renderApp(container);
 
-    await waitFor(() => text(host).includes("Sessão ativa"));
+    await waitFor(() => text(host).includes("Suas conversas"));
+    // Scoped to the footer: the screen also has a "new conversation" primary button.
     await act(async () => {
-      host.querySelector<HTMLButtonElement>(".button-secondary")!.click();
+      host.querySelector<HTMLButtonElement>(".home-footer .button-secondary")!.click();
     });
     await act(async () => {
-      host.querySelector<HTMLButtonElement>(".button-primary")!.click();
+      host.querySelector<HTMLButtonElement>(".home-footer .button-primary")!.click();
       await wait(20);
     });
     await waitFor(() => passwordInput(host) !== null);
@@ -330,12 +338,12 @@ describe("App authentication flow", () => {
     );
     const { host, unmount } = renderApp(container);
 
-    await waitFor(() => text(host).includes("Sessão ativa"));
+    await waitFor(() => text(host).includes("Suas conversas"));
     await act(async () => {
-      host.querySelector<HTMLButtonElement>(".button-secondary")!.click();
+      host.querySelector<HTMLButtonElement>(".home-footer .button-secondary")!.click();
     });
     await act(async () => {
-      host.querySelector<HTMLButtonElement>(".button-primary")!.click();
+      host.querySelector<HTMLButtonElement>(".home-footer .button-primary")!.click();
       await wait(20);
     });
     await waitFor(() => passwordInput(host) !== null);

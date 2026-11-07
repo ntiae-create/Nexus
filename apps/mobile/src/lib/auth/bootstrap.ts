@@ -8,8 +8,10 @@ import {
   setApiBaseUrl,
   shouldMigrateLegacyApiBaseUrl,
 } from "../config.js";
-import { createApiClient } from "../../services/api-client.js";
+import { createApiClient, type ApiClient } from "../../services/api-client.js";
 import { createAuthService } from "../../services/auth-service.js";
+import { createCoreService } from "../../services/core-service.js";
+import { createConversationService } from "../../services/conversation-service.js";
 import { createSecureStorage, type SecureStorage } from "./secure-storage.js";
 import { createSessionManager, type SessionManager } from "./session-manager.js";
 
@@ -20,6 +22,14 @@ export interface AppContainer {
   readonly apiBaseUrl: string | null;
   /** Persists a new API base URL and applies it to the HTTP client. */
   readonly configureApiBaseUrl: (value: string) => Promise<{ ok: boolean; message?: string }>;
+  readonly apiClient: ApiClient;
+  /**
+   * Builds a conversation service bound to one session token.
+   *
+   * The token is passed in (never stored here) so the CORE calls always use the session the
+   * manager currently considers valid, and a screen unmount cannot leave a token behind.
+   */
+  readonly createConversationService: (token: string) => ReturnType<typeof createConversationService>;
 }
 
 /**
@@ -99,12 +109,17 @@ export async function bootstrapApp(): Promise<AppContainer> {
   const client = createApiClient({ getBaseUrl: () => currentBaseUrl });
   const authService = createAuthService(client);
   const sessionManager = createSessionManager({ authService, storage });
+  const coreService = createCoreService(client);
 
   return {
     sessionManager,
     storage,
+    apiClient: client,
     get apiBaseUrl() {
       return currentBaseUrl;
+    },
+    createConversationService(token: string) {
+      return createConversationService({ service: coreService, token });
     },
     async configureApiBaseUrl(value: string) {
       const normalized = normalizeApiBaseUrl(value);

@@ -16,7 +16,7 @@ npm install
 npm run dev
 ```
 
-O comando `dev` inicia o servidor Fastify e o aplicativo Vite para desenvolvimento. A arquitetura prevê que clientes conversem somente com o backend autenticado; não conectam diretamente ao PostgreSQL. O backend funcional e o fluxo privado de autenticação ainda estão em etapas futuras.
+O comando `dev` inicia o servidor Fastify e o aplicativo Vite para desenvolvimento. A arquitetura prevê que clientes conversem somente com o backend autenticado; não conectam diretamente ao PostgreSQL. O fluxo privado de autenticação está documentado em [`docs/MOBILE_AUTHENTICATION.md`](docs/MOBILE_AUTHENTICATION.md) e o chat móvel integrado ao NEXUS CORE em [`docs/MOBILE_CHAT.md`](docs/MOBILE_CHAT.md).
 
 ## Verificações
 
