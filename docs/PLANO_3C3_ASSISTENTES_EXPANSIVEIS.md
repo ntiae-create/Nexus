@@ -71,7 +71,10 @@ Quatro decisões estruturais que este plano fixa **antes** de qualquer implement
   sem cobrança inesperada, sem consumo financeiro automático (§5.7).
 - **Tarefas longas não rodam no ciclo HTTP.** Fila de jobs, workers independentes, estados
   persistidos, cancelamento, retomada após falha, progresso e limites por usuário são infra
-  obrigatória, especificada aqui e não improvisada na fase de ferramentas (§5.8).
+  obrigatória, especificada aqui e não improvisada na fase de ferramentas (§5.8). O claim é
+  **privilegiado mas cego**: uma função `SECURITY DEFINER` devolve só metadados para o worker
+  descobrir o owner, e **toda** a execução seguinte roda em `withOwnerTransaction` com RLS
+  (§5.8.1–5.8.2).
 - **Catálogo global ≠ configuração pessoal.** Identidade, capacidades, ferramentas compatíveis,
   política de coordenação e configuração padrão são **globais**; preferências de modelo e de
   assistente, grants, configurações individuais e preferências por conversa são **por owner**,
@@ -236,6 +239,13 @@ O que já existe é **persistência e schema prontos**: tabela `nexus.tool_event
   exige `ownerId` e um `actor` (`DatabaseActor = {type:"owner"} | {type:"assistant", assistantId}`),
   e grava `nexus.owner_id`/`nexus.actor_type`. Esse `actor` **é a base pronta para auditoria**
   de ações por assistente.
+- O contexto é **transaction-local**: não sobrevive ao `COMMIT` nem pode ser fixado por sessão do
+  worker. Consequência direta para a fila: o claim **não** pode acontecer "depois de abrir a
+  transação do owner", porque o owner ainda é desconhecido (§5.8.1).
+- Toda política combina `nexus.current_owner_id()` **com** `nexus.configured_owner_id()`, e esta
+  última resolve para o **único** registro de `nexus.owner_identity` (`singleton boolean PRIMARY
+  KEY CHECK (singleton)`, semeado com uma linha). O esquema é por owner, mas a instalação é
+  **single-owner** hoje — ver L15.
 - `nexus.core_run_assistants` (`00003`) já registra a linhagem de participantes de um run e tem
   índice `(owner_id, assistant_id, run_id)`.
 - Não existe tabela de jobs, fila, lease de worker, progresso de tarefa ou artefato.
@@ -338,6 +348,11 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
   de concessão por owner (§5.9).
 - L14. Não existe limite de concorrência/quotas por usuário, assistente ou ferramenta, nem
   limite de jobs simultâneos.
+- L15. O isolamento por owner **existe em esquema, mas não é multi-tenant de fato**: as políticas
+  exigem `owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id()`, e
+  `configured_owner_id()` lê `nexus.owner_identity`, hoje um **registro singleton**
+  (`CHECK (singleton)` + uma linha semeada). Qualquer worker de fila, hoje, só poderia servir um
+  owner. É pré-requisito da fase 7 (§5.8.1), não um detalhe de implementação.
 
 ---
 
@@ -554,29 +569,199 @@ antes da fase de ferramentas.
 **Arquitetura**
 
 ```
-POST /v1/jobs            ──► cria nexus.jobs (status=queued) + enfileira  ──► 202 { jobId }
+POST /v1/jobs            ──► cria nexus.jobs (status=queued)                 ──► 202 { jobId }
 GET  /v1/jobs/:id        ──► estado, progresso, artefatos (polling do cliente)
 POST /v1/jobs/:id/cancel ──► grava cancelamento persistido (padrão 3B)
 
 worker (processo separado, `apps/worker`)
-   claim  : UPDATE ... WHERE status='queued' FOR UPDATE SKIP LOCKED  (lease + heartbeat)
-   exec   : ToolExecutor / MediaService / builder, com AbortSignal
-   report : progresso monotônico + resultado/erro normalizado
-   finish : succeeded | partial | failed | cancelled (+ artefatos)
+   Etapa A — claim controlado (§5.8.1): localiza e reivindica um job
+             devolvendo SOMENTE (job_id, owner_id, assistant_id, kind, attempts)
+   Etapa B — execução isolada (§5.8.2): withOwnerTransaction(owner_id, actor)
+             lê o payload, executa, renova lease, reporta progresso e conclui
+   finish   : succeeded | partial | failed | cancelled (+ artefatos)
 ```
+
+### 5.8.1 Etapa A — claim controlado
+
+**O problema de circularidade (explícito).** O worker precisa reivindicar jobs de **qualquer**
+usuário, mas só descobre `ownerId` **depois** de ler a linha. Toda operação de dados passa por
+`withOwnerTransaction(ownerId, actor)`, que exige `ownerId` na entrada — e cujo
+`set_config(..., true)` é **transaction-local** (não pode ser fixado uma vez por sessão do
+worker). Logo, "claim dentro de `withOwnerTransaction`" é impossível como primeira operação: não
+há `ownerId` para abrir a transação, e abrir com um owner arbitrário só para descobrir outro
+violaria a própria regra. A resolução é separar o **claim** da **execução**.
+
+**Mecanismo mínimo: `nexus.claim_next_job(...)`, `SECURITY DEFINER`.**
+
+```sql
+CREATE FUNCTION nexus.claim_next_job(
+  p_worker_id text,
+  p_kinds     text[],
+  p_lease_ms  integer
+) RETURNS TABLE (job_id uuid, owner_id uuid, assistant_id uuid, kind text, attempts integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, nexus
+AS $$ ... $$;
+
+REVOKE ALL ON FUNCTION nexus.claim_next_job(text, text[], integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION nexus.claim_next_job(text, text[], integer) TO nexus_worker;
+```
+
+Propriedades que **limitam** o mecanismo:
+
+| Limite | Como é imposto |
+| --- | --- |
+| Superfície mínima | uma única função, sem parâmetro de SQL/texto livre, sem `ownerId` de entrada: o chamador **não escolhe** quem está reivindicando — recebe o que a fila der |
+| Retorno mínimo | **somente** `job_id`, `owner_id`, `assistant_id`, `kind`, `attempts`. Nunca `payload`, `result`, `error_code`, `messages`, `run_results` ou qualquer conteúdo pessoal. `assistant_id` entra porque é **identificador de catálogo** (não conteúdo) e é indispensável para escolher o `DatabaseActor` **antes** de abrir a transação da Etapa B — sem ele, a primeira operação não teria como declarar o actor correto |
+| Sem leitura em massa | é uma reivindicação de **uma** linha por chamada; não existe variante "lista jobs" nem "conte jobs de todos" |
+| Retorno controlado em dois níveis | o `RETURNING` do `UPDATE` lista colunas nomeadas, e o corpo da função devolve **apenas** as cinco variáveis de metadados — nunca `RETURNING *` nem `RETURN QUERY SELECT *`, que arrastariam `payload`/`result` para o retorno |
+| Escrita restrita | só altera a própria linha reivindicada: `status → running`, `lease_owner`, `lease_expires_at`, `heartbeat_at`, `attempts+1` |
+| Atômico | `FOR UPDATE SKIP LOCKED` em CTE + `UPDATE ... RETURNING`: dois workers nunca recebem o mesmo `job_id` |
+| Respeita estado | só `status = 'queued'` (e órfãos promovidos antes, ver recuperação) |
+| Respeita cancelamento | job com `cancel_requested_at` preenchido **não** é entregue; é finalizado como `cancelled` |
+| Respeita tentativas | `attempts >= max_attempts` → `failed` com `error_code = 'JOB_ATTEMPTS_EXHAUSTED'`, nunca reivindicado |
+| Respeita limites por owner | `max_active_jobs_per_owner` contado **dentro do próprio claim**, considerando apenas linhas `running` do mesmo `owner_id` |
+| Não bloqueia a fila | `SKIP LOCKED` ignora linhas travadas por outros workers; sem espera global |
+
+**Exemplo conceitual do claim (SQL válido).** A forma correta é CTE com `SELECT ... FOR UPDATE
+SKIP LOCKED` seguida de `UPDATE ... RETURNING` — e não `UPDATE ... WHERE ... FOR UPDATE SKIP
+LOCKED`, que não é sintaxe PostgreSQL (`FOR UPDATE` é cláusula de `SELECT`, não de `UPDATE`):
+
+```sql
+WITH candidate AS (
+  SELECT j.id, j.owner_id, j.assistant_id, j.kind, j.attempts
+  FROM nexus.jobs AS j
+  WHERE j.status = 'queued'
+    AND j.kind = ANY (p_kinds)
+    AND j.cancel_requested_at IS NULL
+    AND j.attempts < j.max_attempts
+    -- limite por owner: não reivindica se o owner já tem jobs ativos
+    AND (
+      SELECT count(*) FROM nexus.jobs AS active
+      WHERE active.owner_id = j.owner_id AND active.status = 'running'
+    ) < j.max_active_jobs_per_owner
+  ORDER BY j.priority DESC, j.created_at ASC
+  FOR UPDATE OF j SKIP LOCKED          -- pula linhas travadas por outro worker
+  LIMIT 1
+)
+UPDATE nexus.jobs AS target
+SET status           = 'running',
+    lease_owner      = p_worker_id,
+    lease_expires_at = now() + make_interval(secs => p_lease_ms / 1000.0),
+    heartbeat_at     = now(),
+    attempts         = target.attempts + 1,
+    started_at       = COALESCE(target.started_at, now())
+FROM candidate
+WHERE target.id = candidate.id
+RETURNING target.id, target.owner_id, target.assistant_id, target.kind, target.attempts;
+```
+
+**O que este SQL garante e o que ele *não* garante:**
+
+| Garante | Não garante |
+| --- | --- |
+| um único worker por linha: `FOR UPDATE` + `UPDATE` na mesma transação; o segundo worker recebe 0 linhas | que o worker **terminará** o job — isso é papel do lease |
+| atomicidade: ou a linha vira `running`, ou nada acontece | exclusão de job já travado por outro fluxo (é justamente o que `SKIP LOCKED` ignora) |
+| `attempts` incrementado na mesma operação | que `attempts < max_attempts` continue válido sob concorrência sem o predicado acima — o predicado precisa estar no `SELECT` do CTE, não só no `UPDATE` |
+| retorno restrito a metadados | proteção contra starvation: sem índice em `(status, priority DESC, created_at)` o `ORDER BY` degrada, mas a corretude se mantém |
+| avaliação do limite por owner no momento do claim | que o limite seja globalmente justo entre owners (o `LIMIT 1` pode servir sempre o mesmo owner enquanto ele tiver jobs) |
+
+Sobre o `count(*)` do limite por owner: ele conta apenas linhas `running`, com leitura feita na
+mesma transação do claim. Isso respeita o limite **de forma aproximada sob concorrência**: dois
+workers reivindicando jobs de owners diferentes não se veem, e dois do mesmo owner podem, em
+teoria, passar juntos se as transações forem simultâneas. A garantia exata exigiria
+`SERIALIZABLE` ou uma tabela de contadores com `UPDATE ... RETURNING` por owner. O plano adota o
+contador (`nexus.job_owner_counters`) como opção obrigatória **se** o teste de concorrência
+demonstrar estouro; até lá, o limite é "best effort com teste de regressão que falha se houver
+estouro reproduzível" — e não uma promessa.
+
+**Por que isso não vira bypass geral de RLS.** A função é o único ponto privilegiado, e o
+privilégio é de **reivindicação**, não de leitura:
+
+1. `SECURITY DEFINER` roda como o dono da função, então é preciso garantir que o **corpo** não
+   exponha dados. Ele faz exatamente um `UPDATE ... RETURNING` das cinco colunas de metadados e
+   nada mais; nenhuma cláusula retorna `payload` ou junta tabelas pessoais.
+2. O `GRANT EXECUTE` é para o role do worker (`nexus_worker`), **não** para o role da API nem para
+   um role genérico. A API não consegue chamar a função; o worker não ganha `BYPASSRLS`.
+3. Nenhuma política RLS é relaxada: as tabelas pessoais continuam com `ENABLE`/`FORCE ROW LEVEL
+   SECURITY`. O privilégio extra existe só na função, sobre **uma** tabela (`nexus.jobs`) e **uma**
+   operação (claim).
+4. `SET search_path = pg_catalog, nexus` na função fecha o vetor clássico de `SECURITY DEFINER`
+   sequestrado por `search_path`; a função não recebe SQL dinâmico.
+5. O worker continua **sem** acesso direto a `messages`, `run_results`, `tool_events`,
+   `artifacts` ou `provider_authorizations`: para qualquer leitura de conteúdo ele precisa da
+   Etapa B, e a Etapa B exige o `ownerId` que só veio no claim.
+6. Regressão obrigatória: um teste tenta chamar `claim_next_job` com o role da API e espera
+   `insufficient_privilege`; outro tenta `SELECT payload FROM nexus.jobs` como `nexus_worker` e
+   espera zero linhas (ou erro) — provando que o privilégio **não** vaza para a tabela.
+
+**Dois riscos que este desenho *não* resolve sozinho.** (a) O claim respeita os limites gravados
+na linha (`max_active_jobs_per_owner`), mas quem **enfileira** escolhe esses valores: a rota de
+enfileiramento precisa derivá-los do servidor (política), nunca do corpo da requisição, senão o
+próprio cliente contorna o limite. (b) O claim é cego ao *conteúdo* do job, não à sua
+*existência*: um worker malicioso ainda descobre quantos jobs cada owner tem. Isso é vazamento de
+metadado — aceitável para operar a fila, mas deve estar declarado, e a operação só é exposta a
+processos autenticados como worker, nunca a requisições de usuário.
+
+**Limite honesto deste desenho:** `SECURITY DEFINER` é um privilégio real e concentra risco. A
+mitigação não é "confiar na intenção", e sim (a) corpo mínimo e auditável, (b) `GRANT` restrito a
+um único role, (c) `search_path` fixo, (d) testes negativos que falham se o retorno ganhar coluna
+nova, e (e) revisão obrigatória de qualquer alteração na função, que é tratada como código de
+segurança.
+
+**Fato do repositório que condiciona este desenho.** As políticas atuais exigem
+`owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id()`, e
+`configured_owner_id()` lê `nexus.owner_identity`, hoje um **registro singleton**. Ou seja, a
+multi-tenancy por owner **já existe em esquema**, mas a política **ainda não** aceita vários
+owners simultâneos na mesma instalação. Enquanto esse singleton existir, o claim privilegiado é
+quase inócuo (só há um owner possível). A função só passa a ser necessária de fato quando
+`owner_identity` deixar de ser singleton — e essa mudança de política é **pré-requisito
+explícito** da fase 7, não um detalhe (§10.1).
+
+### 5.8.2 Etapa B — execução isolada
+
+Depois do claim, tudo volta ao caminho normal:
+
+```ts
+const claim = await jobClaims.claimNext({ workerId, kinds, leaseMs }); // Etapa A
+if (!claim) return;                                                   // nada a fazer
+
+await database.withOwnerTransaction(
+  { ownerId: claim.ownerId, actor: { type: "assistant", assistantId: claim.assistantId } },
+  async (repos) => {
+    const job = await repos.jobs.getForExecution(claim.jobId, workerId); // RLS: só este owner
+    // ... executa com AbortSignal, renova lease e reporta progresso AQUI DENTRO
+  },
+);
+```
+
+| Requisito | Como |
+| --- | --- |
+| Leitura do payload | só na Etapa B, com RLS ativa; `getForExecution` filtra por `(owner_id, job_id, lease_owner)` |
+| `DatabaseActor` | `{ type: "assistant", assistantId }` quando o job executa em nome de uma assistente; `{ type: "owner" }` para jobs administrativos. O actor é gravado em `set_config` e alimenta auditoria |
+| Renovação de lease / progresso / resultado / falha | todas em transações de **curta duração** abertas com o mesmo `ownerId`, nunca em uma transação longa que atravessa a execução inteira |
+| Isolamento | o worker não tem como montar uma transação de outro owner: o `ownerId` vem do claim, e cada operação revalida `lease_owner = :workerId` — se o lease foi roubado, a escrita afeta 0 linhas e o worker aborta o trabalho |
+| Conclusão | `complete`/`fail` só aceitam transição a partir de `running` com o lease ainda válido; `cancelled` só é publicado pelo worker |
+
+**A garantia real, sem exagero:** a Etapa B garante que (1) nenhuma consulta de conteúdo roda sem
+`ownerId` definido, e (2) toda escrita é condicionada ao lease vigente. Ela **não** garante por si
+só que o worker seja confiável: um worker comprometido que chame `claim_next_job` em laço pode
+consumir jobs de todos os owners (recebe `owner_id`, não conteúdo). Contra isso valem autenticação
+do worker, `lease_owner` auditado e limite de concorrência por owner — não a RLS.
 
 **Requisitos obrigatórios**
 
 | Requisito | Como |
 | --- | --- |
-| Fila de jobs | `nexus.jobs` durável no PostgreSQL; ordem FIFO com prioridade; sem fila em memória |
+| Fila de jobs | `nexus.jobs` durável no PostgreSQL; ordenação por `(priority DESC, created_at ASC)` — FIFO **dentro** da mesma prioridade, não FIFO global; sem fila em memória |
 | Workers independentes do HTTP | processo `apps/worker` separado da API; escala horizontal; a API nunca executa o trabalho |
 | Estados e acompanhamento | `queued → running → succeeded \| partial \| failed \| cancelled`; progresso 0–100 monotônico; `job_events` append-only |
 | Cancelamento | `POST /v1/jobs/:id/cancel` grava intenção; worker observa via `AbortSignal` + watcher (mesmo padrão do `cancellation-watcher` de 3B); estado só muda para `cancelled` quando o worker confirma |
 | Recuperação após falha/reinício | **lease** com `heartbeat_at`/`lease_expires_at`; job órfão (lease vencido) volta a `queued` com `attempts+1`; limite de tentativas e backoff; nenhum job fica preso em `running` |
 | Persistência de progresso e resultados | progresso em coluna + `job_events`; resultado em `run_results`/`artifacts`; idempotência por `requestId` |
 | Concorrência e limites por usuário | `max_active_jobs_per_owner`, `max_jobs_per_tool`, concorrência global do worker; verificação **no claim** (não no enfileiramento) para não furar o limite |
-| Segurança e isolamento entre usuários | todo claim/execução em `withOwnerTransaction(ownerId, actor)` → RLS aplicada; job nunca é lido nem executado por outro owner; payload sem credenciais (`jsonb_has_credential_key`) |
+| Segurança e isolamento entre usuários | **claim privilegiado mínimo** (§5.8.1) devolve apenas metadados; **toda** leitura de conteúdo, progresso e escrita roda em `withOwnerTransaction(ownerId, actor)` → RLS aplicada (§5.8.2); job nunca é executado por outro owner; payload sem credenciais (`jsonb_has_credential_key`) |
 
 **Regras de consistência com o que já existe**
 
@@ -662,6 +847,9 @@ mobile ──HTTP──► routes/assistants (registro)   routes/core (chat)   r
                        │                              ├─ delegation (dados)   ▼
                        ▼                              ▼              worker (apps/worker)
               nexus.assistants (espelho)      ToolRuntime ─► policy ─► grants/limits
+                                                                      │
+                                          Etapa A: claim_next_job ◄───┤ (metadados só)
+                                          Etapa B: withOwnerTransaction(ownerId, actor)
                        │                              │                    │
                        │                              ▼                    ▼
                        │                        executors/sandbox     media services
@@ -705,9 +893,9 @@ mobile ──HTTP──► routes/assistants (registro)   routes/core (chat)   r
 
 | Tabela | Objetivo | Notas |
 | --- | --- | --- |
-| `nexus.jobs` | fila durável: `owner_id`, `kind`, `status`, `payload`, `progress`, `attempts`, `lease_owner`, `lease_expires_at`, `heartbeat_at`, `error_code`, `core_run_id?`, `request_id` único | índice parcial `WHERE status='queued'`; claim com `FOR UPDATE SKIP LOCKED` |
+| `nexus.jobs` | fila durável: `owner_id`, `assistant_id`, `kind`, `status`, `payload`, `progress`, `attempts`, `max_attempts`, `max_active_jobs_per_owner`, `priority`, `lease_owner`, `lease_expires_at`, `heartbeat_at`, `cancel_requested_at`, `error_code`, `core_run_id?`, `request_id` único | índice parcial `WHERE status='queued'` em `(priority DESC, created_at)`; claim por `nexus.claim_next_job` (§5.8.1), não por SQL solto no worker |
 | `nexus.job_events` | progresso append-only (`job_id`, `sequence`, `kind`, `data`) | histórico monotônico |
-| `nexus.job_limits` (ou colunas) | `max_active_jobs_per_owner`, concorrência por `kind` | verificado **no claim** |
+| `nexus.job_owner_counters` | contador de jobs ativos por `owner_id` (`active_count`), para limites exatos sob concorrência | **opcional até** o teste de concorrência reprovar o `count(*)` de §5.8.1; atualizado na mesma transação do claim/finish |
 
 **Mídia e artefatos (fases 10–11)**
 
@@ -731,6 +919,12 @@ mobile ──HTTP──► routes/assistants (registro)   routes/core (chat)   r
 texto; índice por `(owner_id, …)`. Tabelas de **catálogo global** (`assistant_capabilities`,
 `tool_definitions`, `media_services`) não têm `owner_id` nem RLS — mesma decisão já tomada para
 `nexus.assistants`.
+
+Exceção **única e explicitamente delimitada**: `nexus.jobs` recebe `GRANT EXECUTE` de
+`nexus.claim_next_job` (SECURITY DEFINER) para o role do worker, e **nada mais**. Isso não é
+relaxamento de política: a tabela continua com `FORCE ROW LEVEL SECURITY`, e o único alívio é a
+função de claim, que devolve metadados (§5.8.1). Qualquer outra tabela — inclusive `job_events` e
+`artifacts` — **não** tem função privilegiada; o worker as acessa apenas na Etapa B, com RLS.
 
 ### 6.5 Fronteira global × pessoal (resumo executável)
 
@@ -817,28 +1011,62 @@ Nenhum `MediaService` importa `ProviderAdapter`, `selection.ts` ou o catálogo O
 
 ### 7.5 Job: contrato de fila e worker (G11)
 
+O contrato é **partido em dois**, espelhando as duas etapas de §5.8: um claim privilegiado que
+enxerga a fila inteira **sem conteúdo**, e um repositório por owner que faz todo o resto.
+
 ```ts
 export type JobStatus = "queued" | "running" | "succeeded" | "partial" | "failed" | "cancelled";
 
+/** Etapa A — único ponto privilegiado. Não recebe ownerId: devolve o que a fila der. */
+export interface JobClaim {
+  readonly jobId: string;
+  readonly ownerId: UserId;
+  readonly assistantId: AssistantReference["assistantId"];
+  readonly kind: JobKind;
+  readonly attempts: number;
+}
+
+export interface JobClaimService {
+  /** Chama nexus.claim_next_job (SECURITY DEFINER). Retorno restrito a metadados. */
+  claimNext(input: {
+    workerId: string;
+    kinds: readonly JobKind[];
+    leaseMs: number;
+  }): Promise<JobClaim | null>;
+}
+
+/** Etapa B — tudo aqui exige ownerId e roda em withOwnerTransaction (RLS ativa). */
+export interface JobRepository {
+  getForExecution(jobId: string, workerId: string): Promise<JobExecution | null>; // payload só aqui
+  heartbeat(jobId: string, workerId: string, leaseMs: number): Promise<boolean>;  // false = lease perdido
+  reportProgress(jobId: string, workerId: string, progress: number, event: JobEventPayload): Promise<void>;
+  complete(jobId: string, workerId: string, result: JobCompletion): Promise<void>;
+  fail(jobId: string, workerId: string, error: ToolError): Promise<void>;
+  acknowledgeCancellation(jobId: string, workerId: string): Promise<void>;
+}
+
 export interface JobQueue {
-  enqueue(input: EnqueueJobInput): Promise<Job>;          // idempotente por requestId
-  claim(input: { workerId: string; kinds: readonly JobKind[] }): Promise<Job | null>;
-  heartbeat(jobId: string, workerId: string): Promise<void>;
-  reportProgress(jobId: string, progress: number, event: JobEventPayload): Promise<void>;
-  complete(jobId: string, result: JobCompletion): Promise<void>;
-  fail(jobId: string, error: ToolError): Promise<void>;
+  enqueue(input: EnqueueJobInput): Promise<Job>;                 // idempotente por requestId
   requestCancellation(jobId: string, ownerId: UserId): Promise<void>;
 }
 
 export interface JobWorker {
   readonly id: string;
-  run(signal: AbortSignal): Promise<void>;   // laço: claim → executar → reportar
+  run(signal: AbortSignal): Promise<void>;   // claimNext → withOwnerTransaction(repos.jobs.*) → fim
 }
 ```
 
-Garantias contratuais: `claim` respeita `max_active_jobs_per_owner`; job com lease vencido
-retorna a `queued`; `cancelled` só é publicado após confirmação do worker; toda operação roda em
-`withOwnerTransaction`, então RLS é aplicada mesmo no worker.
+**Garantias contratuais (o que cada camada promete):**
+
+| Camada | Promete | Deliberadamente **não** promete |
+| --- | --- | --- |
+| `JobClaimService.claimNext` | exclusividade por `job_id`; retorno só de metadados; respeita estado, cancelamento, tentativas e limite por owner (§5.8.1) | ler payload ou qualquer dado pessoal; escolher o owner |
+| `JobRepository.*` | RLS sempre aplicada; toda escrita condicionada a `lease_owner = workerId`; `heartbeat` devolve `false` quando o lease foi perdido | continuar valendo após o lease expirar |
+| `JobQueue` (API) | idempotência por `requestId`; cancelamento persistido | executar trabalho: a API nunca roda job |
+| `JobWorker` | ordem claim → transação por owner → conclusão | garantir que o job termine: quem garante retomada é o lease |
+
+`cancelled` só é publicado após o worker confirmar (`acknowledgeCancellation`); job com lease
+vencido volta a `queued` por uma rotina de manutenção, não pelo worker que caiu.
 
 ### 7.6 Orçamentos
 
@@ -956,12 +1184,33 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
 
 ### Fase 7 — Infraestrutura de execução assíncrona (G11)
 
-- `nexus.jobs`, `nexus.job_events`, lease/heartbeat, `apps/worker` separado, `JobQueue`/
-  `JobWorker`, rotas `POST/GET/cancel` de jobs, limites por owner no claim.
-- **Testes:** `202` + `jobId` sem trabalho no HTTP; worker consome e publica progresso
-  monotônico; **job órfão volta a `queued`** após lease vencido e conclui na retomada;
-  cancelamento só vira `cancelled` com confirmação; owner não vê job de outro; limite de
-  concorrência por owner respeitado no claim; `requestId` duplicado não cria dois jobs.
+- Ordem interna desta fase (não inverter): **7a** esquema + `nexus.claim_next_job` com `GRANT`
+  restrito ao role do worker; **7b** `JobClaimService`/`JobRepository`/`JobWorker`; **7c** rotas
+  `POST/GET/cancel`; **7d** manutenção de lease vencido.
+- Pré-requisito explícito: revisar `configured_owner_id()` (hoje singleton) — o claim privilegiado
+  só tem função real quando a política aceitar mais de um owner (§5.8.1).
+- **Testes (todos obrigatórios):**
+  - **concorrência:** dois workers chamando `claimNext` simultaneamente **nunca** recebem o mesmo
+    `job_id` (N jobs, M workers, soma de claims distintos = N);
+  - **claim não vaza conteúdo:** o retorno de `claimNext` não contém `payload`, `result` nem
+    qualquer campo pessoal — teste de tipo **e** teste SQL que falha se a função passar a retornar
+    coluna nova;
+  - **privilégio não vaza para a tabela:** role da API chamando `claim_next_job` →
+    `insufficient_privilege`; role do worker fazendo `SELECT payload FROM nexus.jobs` → 0 linhas
+    (ou erro), provando que o `GRANT` é só da função;
+  - **limite por owner** respeitado no claim, com teste que reproduz o cenário de estouro sob
+    concorrência (e que obriga o contador de §5.8.1 se falhar);
+  - **worker não executa job de outro owner:** `getForExecution`/`heartbeat`/`complete` com
+    `jobId` de outro owner afetam 0 linhas e não vazam erro diferenciado;
+  - **operações pós-claim respeitam RLS:** toda leitura de conteúdo falha sem `ownerId` definido;
+    `heartbeat` de worker cujo lease expirou devolve `false` e a escrita não passa;
+  - **lease vencido recupera com segurança:** job órfão volta a `queued`, é reivindicado por outro
+    worker e conclui **uma única vez** (sem duplicar efeito nem artefato);
+  - **falha durante o claim não deixa estado inconsistente:** exceção entre o `SELECT` e o
+    `UPDATE` (ou no meio da função) → transação revertida, job continua `queued`, nenhum lease
+    órfão;
+  - `202` + `jobId` sem trabalho no HTTP; progresso monotônico; cancelamento só vira `cancelled`
+    com confirmação; `requestId` duplicado não cria dois jobs.
 
 ### Fase 8 — Primeira ferramenta real de baixo risco (leitura de arquivo em sandbox)
 
@@ -1007,7 +1256,7 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
 | 4 | E2E de conversa; `:free`; delegação YUI→nova; app sem código novo |
 | 5 | isolamento de grants entre owners; grant ausente; grant não amplia catálogo; coexistência de preferências |
 | 6 | ausência de executor; grant ausente; limites; evento de auditoria; `executionMode: job` sem fila |
-| 7 | 202/`jobId`; progresso monotônico; **retomada após lease vencido**; cancelamento confirmado; isolamento entre owners no claim; concorrência por owner; idempotência por `requestId` |
+| 7 | 202/`jobId`; progresso monotônico; **dois workers nunca pegam o mesmo job**; **claim não expõe payload nem dado pessoal** (inclui guard de retorno e de privilégio); limite por owner no claim; **worker não executa job de outro owner**; operações pós-claim sob RLS; **retomada segura de lease vencido**; **falha no meio do claim não deixa job preso**; cancelamento confirmado; `requestId` idempotente |
 | 8 | path traversal; isolamento de sandbox; cota; **prompt injection não altera instruções** |
 | 9 | fuga de FS/rede; fork bomb; timeout; memória; env sem segredos; cancelamento encerra processo |
 | 10 | `paid`/`unknown` bloqueados; ausência de serviço gratuito → indisponível; ownership e TTL de artefato; **zero acoplamento com o catálogo de chat** |
@@ -1031,7 +1280,9 @@ sandbox local (as integrações PostgreSQL seguem no workflow `database-postgres
 | Acoplar mídia ao catálogo de chat e à política `:free` de modelos | **alta** | `packages/media` próprio, sem import de `providers/`; testes que falham se houver acoplamento |
 | Custo de mídia: serviço pago acionado sem intenção | **alta** | só `costStatus: free_confirmed` executa; `paid`/`unknown` bloqueados; sem fallback pago |
 | Job preso em `running` após queda do worker | **alta** | lease + heartbeat; job órfão volta a `queued`; teste de retomada obrigatório |
-| Vazamento entre usuários no worker | **crítica** | claim e execução sempre em `withOwnerTransaction`; RLS aplicada; teste de isolamento |
+| Vazamento entre usuários no worker | **crítica** | claim privilegiado devolve só metadados; execução inteira em `withOwnerTransaction`; RLS aplicada; testes de isolamento e de privilégio (§5.8) |
+| Função `SECURITY DEFINER` de claim virar bypass de RLS | **crítica** | corpo mínimo de uma tabela/uma operação; `GRANT` só ao role do worker; `search_path` fixo; testes negativos que falham se o retorno crescer ou se o worker ler a tabela direto |
+| Claim entregar job cujo owner não corresponde à política vigente (singleton) | **alta** | revisar `configured_owner_id()` antes da fase 7; sem isso, a multi-tenancy de jobs não é real |
 | Estouro de concorrência/quota por usuário | alta | limites verificados **no claim**, não no enfileiramento |
 | Ferramenta maliciosa ou conteúdo hostil manipulando o modelo | **alta** | envelope de dado não confiável, `evaluateToolPolicy`, sandbox sem rede, auditoria |
 | Execução de código do usuário no servidor | **crítica** | proibida por arquitetura; só sandbox isolado e **sempre** via job |
@@ -1043,6 +1294,9 @@ sandbox local (as integrações PostgreSQL seguem no workflow `database-postgres
 
 - **Internas (sequenciais):** 1→2→3; 4 depende de 1–3; 5 depende de 2; 6→7 (jobs antes de
   ferramentas lentas); 8 depois de 6 e 7; 9, 10 e 11 depois de 8.
+- **Pré-requisito da fase 7:** decisão sobre `configured_owner_id()` (hoje singleton, L15). Sem
+  isso a fila só serve um owner e o claim privilegiado é desnecessário; com mais de um owner, a
+  função de claim passa a ser obrigatória.
 - **Externas (nenhuma obrigatória):** serviço gratuito de imagem/vídeo (fase 10) e runtime de
   sandbox/contêiner (fases 8–9). Sem serviço gratuito compatível, a funcionalidade fica
   **indisponível** de forma explícita — nunca paga.
@@ -1059,7 +1313,10 @@ sandbox local (as integrações PostgreSQL seguem no workflow `database-postgres
 5. Mídia funciona por `MediaService` **independente** de chat; sem serviço gratuito, permanece
    indisponível, sem fallback pago e sem consumo financeiro automático.
 6. Toda tarefa longa roda em job com fila durável, worker separado, progresso persistido,
-   cancelamento confirmado e **retomada após falha/reinício**, com isolamento entre owners.
+   cancelamento confirmado e **retomada após falha/reinício**, com isolamento entre owners. O
+   claim é privilegiado **apenas** para reivindicar (metadados mínimos, `GRANT` restrito) e a
+   execução inteira roda em `withOwnerTransaction` com RLS — provado por testes de concorrência,
+   de não-exposição de payload e de privilégio.
 7. Todo uso de ferramenta gera `tool_events` auditável com dono, run, versão e
    `contains_untrusted_external_data = true`.
 8. Saída de ferramenta entra no contexto como dado delimitado, com teste de prompt injection.
@@ -1083,7 +1340,7 @@ sandbox local (as integrações PostgreSQL seguem no workflow `database-postgres
 | Seleção de modelo de **chat** | 3 níveis + `free_only` rígido | expor escrita de preferência | — |
 | **Mídia** | **não existe** | — | `MediaService` independente, custo próprio (fase 10) |
 | Ferramentas | catálogo + política + tabela de auditoria, **sem execução** | registry de executores e limites | sandbox, arquivos, código, imagem, vídeo, Three.js |
-| **Execução assíncrona** | **não existe** (tudo síncrono no HTTP) | — | fila, worker, lease, progresso, retomada (fase 7) |
+| **Execução assíncrona** | **não existe** (tudo síncrono no HTTP) | — | fila, worker, lease, progresso, retomada (fase 7); claim privilegiado mínimo + execução sob RLS (§5.8.1–5.8.2) |
 | Catálogo global × config. pessoal | parcial (prefs de provedor nos 3 níveis); sem grants por owner | `tool_grants`, prefs pessoais (fase 5) | — |
 | Artefatos de mídia | **não existe** | — | `nexus.artifacts` + storage (fase 10) |
 | Isolamento de conteúdo externo | regra no prompt + coluna de marcação | envelope estrutural no contexto | — |
