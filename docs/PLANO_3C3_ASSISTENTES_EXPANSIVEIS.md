@@ -281,7 +281,7 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
 | 3 | `apps/server/src/core/delegation.ts:17` | `Record<InitialAssistantKey, …>` literal | mapa fechado |
 | 4 | `apps/server/src/core/engine.ts:911` | `["alice","schwi"]` literal | duplica a regra 3 |
 | 5 | `apps/server/src/routes/core.ts:38` | `z.enum([...])` local | **redefine** o domínio na rota |
-| 6 | `apps/server/src/routes/assistants.ts:4` | array literal de 3 | **quarta cópia**, divergente; a rota **não está registrada** em `buildApp` (L9) |
+| 6 | `apps/server/src/routes/assistants.ts:4` | array literal de 3 | **quarta cópia**, divergente; `registerAssistantRoutes` **não é chamada** por `buildApp` (L9) |
 | 7 | `apps/mobile/src/lib/config.ts:177` | array literal de 3 | rótulos/cores |
 | 8 | `apps/mobile/src/lib/assistants.ts:25` | array literal de 3 | espelho validado por texto |
 | 9 | `apps/mobile/src/services/core-service.ts:92` | união literal | tipo duplicado |
@@ -321,20 +321,30 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
 
 - **L9 (defeito conhecido, não comportamento a preservar).** A implementação de
   `GET /v1/assistants` em `apps/server/src/routes/assistants.ts` mantém um array literal
-  **independente** de `packages/assistant-profiles`, e esse array **divergiu** do catálogo
-  canônico. Dois fatos distintos, verificados na Fase 0:
+  **independente** de `packages/assistant-profiles`. A Fase 0 separa explicitamente o que foi
+  verificado do que não foi.
 
-  1. **A rota não está conectada.** `registerAssistantRoutes` é exportada, mas `buildApp`
-     (`apps/server/src/app.ts`) não a chama. A rota, portanto, não participa da aplicação
-     servida no estado analisado — o cliente recebe **404** em `GET /v1/assistants`.
-  2. **A implementação não registrada divergiria.** Se fosse conectada sem correção, serviria
-     valores diferentes dos perfis (tabela abaixo).
+  **Comprovado por inspeção do código-fonte:**
 
-  Ambos são **defeitos a corrigir na Fase 2**, não comportamentos a preservar. A Fase 0 apenas os
-  registra aqui: **não existe teste automatizado sobre L9** — nem de caracterização, nem de
-  contrato. Um teste que exigisse "a rota continua fora do `buildApp`" ou "o payload continua
-  divergente" passaria a bloquear exatamente a correção. A Fase 2 conecta a rota e deriva o
-  payload do registro, com testes de paridade que devem falhar antes da correção.
+  1. `registerAssistantRoutes` é **exportada** por `apps/server/src/routes/assistants.ts`, mas
+     **não é chamada** por `buildApp` (`apps/server/src/app.ts`) no estado analisado. A rota,
+     portanto, não participa da aplicação montada por essa função.
+  2. A implementação da rota contém um array **independente e divergente** do catálogo canônico —
+     os valores estão na tabela abaixo, conferidos campo a campo na fonte.
+
+  **Não comprovado nesta fase:** o status HTTP efetivamente retornado pelo endpoint em execução.
+  A Fase 0 não executou requisição HTTP contra a aplicação; não há teste de integração nem
+  observação de `404`. A inferência de que a ausência de registro resulta em `404` é plausível,
+  mas **não é evidência desta fase** e não deve ser citada como fato consumado.
+
+  **Planejado para a Fase 2:** conectar a rota e derivar seu payload do registro canônico, com
+  testes de integração e de paridade que comprovem o comportamento — inclusive o status — antes e
+  depois da correção.
+
+  Ambos os achados são **defeitos a corrigir na Fase 2**, não comportamentos a preservar. A Fase 0
+  apenas os registra aqui: **não existe teste automatizado sobre L9** — nem de caracterização,
+  nem de contrato. Um teste que exigisse "a rota continua fora do `buildApp`" ou "o payload
+  continua divergente" passaria a bloquear exatamente a correção.
 
   Valores conferidos no código:
 
@@ -445,8 +455,10 @@ packages/assistant-profiles/
 - `nexus.assistants` + `assistant_config_versions` passam a ser **espelho** sincronizado
   (`source: 'static_code'` hoje; `'managed_future'` se a edição em runtime for aprovada).
 - Teste de paridade obrigatório: perfis ⇄ seed SQL ⇄ `GET /v1/assistants` ⇄ catálogo móvel.
-- **`GET /v1/assistants` é correção de defeito**, não apenas refatoração: a rota não está
-  registrada em `buildApp` e, quando registrada, serviria de um array divergente (L9).
+- **`GET /v1/assistants` é correção de defeito**, não apenas refatoração: a rota não é chamada
+  por `buildApp` no estado analisado e sua implementação atual diverge do catálogo canônico (L9).
+  O comportamento em execução — inclusive o status HTTP — não foi observado na Fase 0; a Fase 2
+  o comprova com testes de integração.
 
 ### 5.3 Especialidades e capacidades declarativas
 

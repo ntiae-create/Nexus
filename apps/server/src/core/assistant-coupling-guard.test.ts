@@ -139,6 +139,18 @@ const KEY_TOKEN = new RegExp(`^["'\`](${INITIAL_KEYS.join("|")})["'\`]$`);
  * tipo (`as const`), ou conteúdo de array. Qualquer outro token (por exemplo `:` seguido de
  * valor, ou uma propriedade de objeto entre as chaves) encerra o grupo.
  */
+/**
+ * Linha (1-based) de um offset. Calculada sob demanda — o tokenizador de listas antes fazia isso
+ * de forma incremental, mas separar em uma função única evita duas noções divergentes de linha.
+ */
+function lineOf(source: string, offset: number): number {
+  let line = 1;
+  for (let index = 0; index < offset && index < source.length; index += 1) {
+    if (source[index] === "\n") line += 1;
+  }
+  return line;
+}
+
 export interface CouplingGroup {
   readonly keys: readonly string[];
   readonly line: number;
@@ -202,28 +214,149 @@ export function findCouplingGroups(rawSource: string): CouplingGroup[] {
 /**
  * Segundo padrão de acoplamento: **catálogo de objetos**.
  *
- * `apps/mobile/src/lib/config.ts` e `routes/assistants.ts` não têm lista literal — têm uma
- * sequência de objetos `{ key: "yui", … }, { key: "alice", … }`. Uma leitura por "lista de
- * strings" não os vê, e é justamente isso que os torna cópias silenciosas da fonte de verdade.
+ * `apps/mobile/src/lib/config.ts`, `apps/mobile/src/lib/assistants.ts`, `routes/assistants.ts` e
+ * `packages/assistant-profiles/src/catalog.ts` não têm lista literal de chaves — têm uma
+ * sequência de objetos `{ key: "yui", … }, { key: "alice", … }`. Um detector de lista de strings
+ * não os vê, e é justamente isso que os torna cópias silenciosas da fonte de verdade.
  *
- * Este detector conta chaves distintas declaradas como **propriedade** `key:` / `assistantKey:`
- * no mesmo arquivo. Duas ou mais distintas caracterizam catálogo recriado. Um arquivo que cita
- * uma única chave (fixture, permissão de ferramenta) não é acoplamento.
+ * **Cada declaração é uma ocorrência independente.** A implementação anterior juntava todas as
+ * propriedades `key:` do arquivo num único grupo, e a assinatura `catalog:arquivo::chaves` ficava
+ * idêntica para duas listas distintas com o mesmo conjunto de chaves — ou seja, declarar uma
+ * liberava a outra. Aqui cada objeto/array é delimitado estruturalmente e recebe **âncora de
+ * contexto**: o encadeamento de identificadores que o contém (`ASSISTANTS`, `profiles`, …).
+ *
+ * A âncora é estável por construção: não usa número de linha, então reformatar o arquivo não
+ * muda a identidade — renomear o container, sim, e nesse caso a revisão da allowlist é
+ * desejável.
  */
-export function findCatalogDeclarations(rawSource: string): CouplingGroup[] {
-  const source = stripComments(rawSource);
-  const property = /\b(?:key|assistantKey)\s*:\s*(["'`])(yui|alice|schwi)\1/g;
-  const keys: string[] = [];
-  let firstLine = 0;
+export interface CatalogOccurrence {
+  readonly keys: readonly string[];
+  readonly line: number;
+  readonly offset: number;
+  /** Encadeamento de containers que delimita a ocorrência: `PROFILES`, `a.b`, `<expr>`. */
+  readonly anchor: string;
+}
 
-  for (const match of source.matchAll(property)) {
-    const line = source.slice(0, match.index ?? 0).split("\n").length;
-    if (keys.length === 0) firstLine = line;
-    keys.push(match[2]!);
+const CATALOG_KEY_PROPERTY = /\b(?:key|assistantKey)\s*:\s*(["'`])(yui|alice|schwi)\1/g;
+
+/** Índices dos delimitadores de abertura/fechamento, respeitando strings e template literals. */
+function matchingDelimiter(source: string, openIndex: number): number {
+  const open = source[openIndex]!;
+  const close = open === "[" ? "]" : open === "{" ? "}" : null;
+  if (close === null) return -1;
+
+  let depth = 0;
+  for (let index = openIndex; index < source.length; index += 1) {
+    const char = source[index]!;
+    if (char === '"' || char === "'" || char === "`") {
+      index += 1;
+      while (index < source.length && source[index] !== char) {
+        if (source[index] === "\\") index += 1;
+        index += 1;
+      }
+      continue;
+    }
+    if (char === open) depth += 1;
+    else if (char === close) {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+/** Delimitador que contém `index`, do mais interno para o mais externo. */
+function enclosingDelimiter(source: string, index: number): { open: number; close: number } | null {
+  let depth = 0;
+  for (let cursor = index; cursor >= 0; cursor -= 1) {
+    const char = source[cursor]!;
+    if (char === "]") depth += 1;
+    else if (char === "[") {
+      if (depth === 0) {
+        const close = matchingDelimiter(source, cursor);
+        if (close > index) return { open: cursor, close };
+      } else depth -= 1;
+    }
+  }
+  return null;
+}
+
+/**
+ * Nome do container que abre `source` antes de `openIndex`.
+ *
+ * Usa a última declaração (`const|let|var`) anterior ao delimitador, e não o texto imediatamente
+ * à esquerda: `const RAW_CATALOG: readonly {…}[] = [` tem uma anotação de tipo entre o nome e o
+ * `[`, e uma leitura do vizinho imediato devolveria `<expr>`. É esse nome que distingue
+ * `ASSISTANTS` de `ASSISTANTS_MIRROR` — e o que faz a identidade sobreviver a reformatação,
+ * porque não depende de linha nem de offset.
+ */
+function anchorBefore(source: string, openIndex: number): string {
+  const prefix = source.slice(0, openIndex);
+  if (/\bexport\s+default\s*$/.test(prefix)) return "export default";
+
+  let name: string | null = null;
+  for (const match of prefix.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) {
+    name = match[1]!;
+  }
+  if (name !== null) return name;
+
+  // Sem declaração: ainda pode ser uma propriedade (`assistants: [`, `return [`).
+  const chain = /([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*:\s*$/.exec(prefix);
+  return chain ? chain[1]!.replace(/\s+/g, "") : "<expr>";
+}
+
+/**
+ * Extrai as ocorrências de catálogo de um arquivo.
+ *
+ * Uma ocorrência é o **menor delimitador** (array ou objeto) que contém uma propriedade de chave
+ * — exceto uma chave solta dentro de um objeto que não é entrada de catálogo, como
+ * `{ assistantKey: "yui" }` numa chamada: um único objeto sem irmãos não é catálogo. Agrupar por
+ * delimitador é o que separa duas listas no mesmo arquivo mesmo quando uma é filha da outra.
+ */
+export function findCatalogDeclarations(rawSource: string): CatalogOccurrence[] {
+  const source = stripComments(rawSource);
+
+  const occurrences = new Map<number, { offset: number; keys: string[] }>();
+  for (const match of source.matchAll(CATALOG_KEY_PROPERTY)) {
+    const offset = match.index ?? 0;
+    const delimiter = enclosingDelimiter(source, offset);
+    if (delimiter === null) continue;
+    const existing = occurrences.get(delimiter.open);
+    if (existing) {
+      existing.keys.push(match[2]!);
+    } else {
+      occurrences.set(delimiter.open, { offset, keys: [match[2]!] });
+    }
   }
 
-  const distinct = [...new Set(keys)];
-  return distinct.length >= 2 ? [{ keys: distinct, line: firstLine }] : [];
+  const result: CatalogOccurrence[] = [];
+  for (const [openIndex, occurrence] of occurrences) {
+    const distinct = [...new Set(occurrence.keys)];
+    // Um único objeto `{ key: "yui" }` é dado pontual, não catálogo: exige 2+ chaves distintas.
+    if (distinct.length < 2) continue;
+    result.push({
+      keys: distinct,
+      line: lineOf(source, occurrence.offset),
+      offset: occurrence.offset,
+      anchor: anchorBefore(source, openIndex),
+    });
+  }
+  result.sort((a, b) => a.offset - b.offset);
+
+  // Dois catálogos com o MESMO nome no mesmo arquivo (`const CATALOG` duplicado) ainda precisam
+  // ser distinguíveis. O ordinal dentro do arquivo resolve isso e continua estável sob
+  // reformatação; só é aplicado quando há colisão, então o caso normal fica com o nome puro.
+  const total = new Map<string, number>();
+  for (const occurrence of result) {
+    total.set(occurrence.anchor, (total.get(occurrence.anchor) ?? 0) + 1);
+  }
+  const seen = new Map<string, number>();
+  return result.map((occurrence) => {
+    if ((total.get(occurrence.anchor) ?? 0) < 2) return occurrence;
+    const ordinal = (seen.get(occurrence.anchor) ?? 0) + 1;
+    seen.set(occurrence.anchor, ordinal);
+    return { ...occurrence, anchor: `${occurrence.anchor}#${ordinal}` };
+  });
 }
 
 function collectSourceFiles(directory: string): string[] {
@@ -259,6 +392,13 @@ export interface AllowedOccurrence {
   readonly file: string;
   readonly keys: readonly string[];
   readonly pattern: CouplingPattern;
+  /**
+   * Onde a ocorrência vive dentro do arquivo, para o padrão `catalog`: o container que a delimita
+   * (`ASSISTANTS`, `profiles`, …). Sem isso, duas listas de objetos com as mesmas chaves no mesmo
+   * arquivo teriam a mesma assinatura. Ignorado no padrão `list`, onde o conjunto de chaves já
+   * distingue as ocorrências.
+   */
+  readonly anchor?: string;
   readonly reason: string;
   /**
    * Fase responsável por eliminar esta ocorrência — ou `"permanente"` quando a ocorrência **não
@@ -269,12 +409,21 @@ export interface AllowedOccurrence {
   readonly removedIn: string;
 }
 
+/**
+ * Identidade de uma ocorrência: padrão + arquivo + **container** + conjunto de chaves.
+ *
+ * O container entra apenas em `catalog`, onde duas listas de objetos podem ter exatamente as
+ * mesmas chaves. Não entra número de linha: reformatar o arquivo não pode invalidar a allowlist,
+ * mas renomear o container deve — é uma mudança estrutural e merece revisão.
+ */
 export function signatureOf(
   file: string,
   keys: readonly string[],
   pattern: CouplingPattern,
+  anchor?: string,
 ): string {
-  return `${pattern}:${file}::${[...keys].sort().join(",")}`;
+  const base = `${pattern}:${file}::${[...keys].sort().join(",")}`;
+  return pattern === "catalog" ? `${base}@${anchor ?? "<expr>"}` : base;
 }
 
 export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
@@ -319,6 +468,7 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     file: "apps/mobile/src/lib/assistants.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "catalog",
+    anchor: "RAW_CATALOG",
     reason: "espelho do catálogo congelado — proteção válida, não cópia de lógica",
     removedIn: "Fase 1",
   },
@@ -326,6 +476,7 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     file: "apps/mobile/src/lib/config.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "catalog",
+    anchor: "ASSISTANTS",
     reason: "catálogo de apresentação do mobile (rótulos/cores) — Fase 1 unifica (G4)",
     removedIn: "Fase 1",
   },
@@ -333,6 +484,7 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     file: "apps/server/src/routes/assistants.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "catalog",
+    anchor: "ASSISTANTS",
     reason: "array literal da rota L9 — corrigido por derivação do registro na Fase 2",
     removedIn: "Fase 2",
   },
@@ -340,6 +492,7 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     file: "packages/assistant-profiles/src/catalog.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "catalog",
+    anchor: "profiles",
     reason: "catálogo canônico dos perfis — é a fonte de verdade, não uma cópia",
     // Não é remoção: quando `InitialAssistantKey` for generalizado (Fase 1), o catálogo
     // continua sendo o catálogo. Marcar uma fase aqui prometeria uma remoção que não acontece.
@@ -350,7 +503,9 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
 /** Todas as ocorrências (lista e catálogo) com a assinatura que as identifica. */
 function allSignatures(): Set<string> {
   return new Set(
-    ALLOWED_OCCURRENCES.map((entry) => signatureOf(entry.file, entry.keys, entry.pattern)),
+    ALLOWED_OCCURRENCES.map((entry) =>
+      signatureOf(entry.file, entry.keys, entry.pattern, entry.anchor),
+    ),
   );
 }
 
@@ -472,14 +627,18 @@ describe("Fase 0 — testes negativos obrigatórios (entradas sintéticas)", () 
   it("6. continua aceitando as ocorrências legítimas inventariadas", () => {
     for (const entry of ALLOWED_OCCURRENCES) {
       const source = readFileSync(resolve(REPO_ROOT, entry.file), "utf8");
-      const groups =
-        entry.pattern === "list" ? findCouplingGroups(source) : findCatalogDeclarations(source);
+      const expected = signatureOf(entry.file, entry.keys, entry.pattern, entry.anchor);
+      const found =
+        entry.pattern === "list"
+          ? findCouplingGroups(source).some(
+              (group) => signatureOf(entry.file, group.keys, "list") === expected,
+            )
+          : findCatalogDeclarations(source).some(
+              (occurrence) =>
+                signatureOf(entry.file, occurrence.keys, "catalog", occurrence.anchor) === expected,
+            );
       expect(
-        groups.some(
-          (group) =>
-            signatureOf(entry.file, group.keys, entry.pattern) ===
-            signatureOf(entry.file, entry.keys, entry.pattern),
-        ),
+        found,
         `ocorrência legítima deixou de ser reconhecida: ${entry.file}`,
       ).toBe(true);
     }
@@ -589,32 +748,226 @@ describe("Fase 0 — o guard FALHA quando aparece acoplamento novo (ponta a pont
   });
 });
 
+describe("Fase 0 — catálogos de objetos: uma ocorrência, uma identidade", () => {
+  // Todos os casos abaixo passam por `findUndeclaredCoupling`, que é exatamente a validação que a
+  // varredura do repositório usa. Comparar assinaturas não provaria nada sobre o guard real.
+  const validate = (
+    source: string,
+    file: string,
+    allowed: ReadonlySet<string>,
+  ): UndeclaredCoupling[] => {
+    const root = mkdtempSync(join(tmpdir(), "nexus-catalog-"));
+    const path = join(root, file);
+    writeFileSync(path, source, "utf8");
+    try {
+      return findUndeclaredCoupling([path], root, allowed);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  const catalog = (name: string, keys: readonly string[]): string =>
+    [
+      `export const ${name} = [`,
+      ...keys.map((key) => `  { key: "${key}", name: "${key.toUpperCase()}" },`),
+      "] as const;",
+    ].join("\n");
+
+  const THREE = ["yui", "alice", "schwi"] as const;
+  const LEGIT = signatureOf("catalogo.ts", THREE, "catalog", "LEGIT");
+
+  it("1. catálogo legítimo declarado uma vez é aceito", () => {
+    expect(validate(catalog("LEGIT", THREE), "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+  });
+
+  it("2. segunda declaração independente com as MESMAS três chaves é bloqueada", () => {
+    // Núcleo do requisito: a ocorrência nova é idêntica em arquivo, padrão e chaves. Só o
+    // container a distingue — que é o que a identidade anterior não capturava.
+    const source = [catalog("LEGIT", THREE), "", catalog("COPIA", THREE)].join("\n");
+    const found = validate(source, "catalogo.ts", new Set([LEGIT]));
+    expect(found).toHaveLength(1);
+    expect(found[0]!.anchor).toBe("COPIA");
+    expect(found[0]!.keys).toEqual([...THREE]);
+  });
+
+  it("3. segunda declaração independente com duas chaves é bloqueada", () => {
+    const source = [catalog("LEGIT", THREE), "", catalog("ALVOS", ["yui", "alice"])].join("\n");
+    const found = validate(source, "catalogo.ts", new Set([LEGIT]));
+    expect(found).toHaveLength(1);
+    expect(found[0]!.anchor).toBe("ALVOS");
+  });
+
+  it("4. ocorrência nova no mesmo arquivo não é liberada pela legítima", () => {
+    // Mesmo arquivo, mesmas chaves, nomes de container diferentes: só a assinatura exata passa.
+    const allowed = new Set([LEGIT]);
+    expect(validate(catalog("LEGIT", THREE), "catalogo.ts", allowed)).toEqual([]);
+    const comExtra = [catalog("LEGIT", THREE), catalog("ESPELHO", THREE)].join("\n");
+    expect(validate(comExtra, "catalogo.ts", allowed)).toHaveLength(1);
+  });
+
+  it("5. catálogos distintos no mesmo arquivo são reconhecidos separadamente", () => {
+    const source = [catalog("PRIMEIRO", THREE), "", catalog("SEGUNDO", ["yui", "alice"])].join(
+      "\n",
+    );
+    const root = mkdtempSync(join(tmpdir(), "nexus-catalog-"));
+    const path = join(root, "catalogo.ts");
+    writeFileSync(path, source, "utf8");
+    try {
+      const occurrences = findCatalogDeclarations(readFileSync(path, "utf8"));
+      expect(occurrences.map((occurrence) => occurrence.anchor)).toEqual(["PRIMEIRO", "SEGUNDO"]);
+      expect(occurrences.map((occurrence) => occurrence.keys)).toEqual([
+        [...THREE],
+        ["yui", "alice"],
+      ]);
+      // Cada um tem assinatura própria: liberar um não libera o outro.
+      expect(
+        findUndeclaredCoupling(
+          [path],
+          root,
+          new Set([signatureOf("catalogo.ts", THREE, "catalog", "PRIMEIRO")]),
+        ).map((entry) => entry.anchor),
+      ).toEqual(["SEGUNDO"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("6. comentários, documentação e exemplos textuais não criam ocorrências", () => {
+    const source = [
+      "// catálogo antigo: [{ key: \"yui\" }, { key: \"alice\" }]",
+      "/**",
+      " * Exemplo: `[{ key: \"yui\" }, { key: \"alice\" }, { key: \"schwi\" }]`",
+      " */",
+      "export const DOC =",
+      '  "use [{ key: \\"yui\\" }, { key: \\"schwi\\" }] para ilustrar";',
+      catalog("LEGIT", THREE),
+    ].join("\n");
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+
+    // E o analisador cru também não vê nada além da ocorrência real.
+    const path = join(tmpdir(), "nexus-catalog-doc.ts");
+    writeFileSync(path, source, "utf8");
+    try {
+      expect(findCatalogDeclarations(readFileSync(path, "utf8")).map((o) => o.anchor)).toEqual([
+        "LEGIT",
+      ]);
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+
+  it("7. uma propriedade isolada key: \"yui\" não constitui catálogo", () => {
+    expect(validate('run({ assistantKey: "yui" });', "uso.ts", new Set())).toEqual([]);
+    expect(validate('const p = { key: "yui" };', "uso.ts", new Set())).toEqual([]);
+    // Duas chaves no MESMO objeto também não são catálogo: é um objeto com duas propriedades.
+    expect(validate('const p = { key: "yui", fallbackKey: "alice" };', "uso.ts", new Set())).toEqual(
+      [],
+    );
+  });
+
+  it("a identidade não depende do número de linha", () => {
+    // Reformatar (linhas em branco, uma propriedade por linha) desloca a ocorrência, mas não
+    // muda a assinatura: a âncora é o nome do container, não a posição.
+    const compact = catalog("LEGIT", THREE);
+    const spread = [
+      "",
+      "",
+      "export const LEGIT = [",
+      ...THREE.map(
+        (key) => `\n  {\n    key: "${key}",\n    name: "${key.toUpperCase()}",\n  },`,
+      ),
+      "\n] as const;",
+      "",
+    ].join("\n");
+
+    const compactLine = findCatalogDeclarations(compact)[0]!.line;
+    const spreadLine = findCatalogDeclarations(spread)[0]!.line;
+    expect(spreadLine).not.toBe(compactLine);
+
+    const allowed = new Set([LEGIT]);
+    expect(validate(compact, "catalogo.ts", allowed)).toEqual([]);
+    expect(validate(spread, "catalogo.ts", allowed)).toEqual([]);
+  });
+});
+
+describe("Fase 0 — duplicata dentro de um arquivo real do inventário", () => {
+  // Usa o conteúdo real de um arquivo inventariado e acrescenta, em memória, um segundo catálogo
+  // idêntico. Nenhum arquivo em disco é alterado: a validação lê o texto injetado.
+  it("bloqueia um segundo catálogo com as mesmas chaves em routes/assistants.ts", () => {
+    const real = readFileSync(resolve(REPO_ROOT, "apps/server/src/routes/assistants.ts"), "utf8");
+    const duplicated = `${real}\nconst ASSISTANTS_MIRROR = [\n  { id: "1", key: "yui" },\n  { id: "2", key: "alice" },\n  { id: "3", key: "schwi" },\n] as const;\n`;
+    const occurrences = findCatalogDeclarations(duplicated);
+    expect(occurrences.map((occurrence) => occurrence.anchor)).toEqual([
+      "ASSISTANTS",
+      "ASSISTANTS_MIRROR",
+    ]);
+
+    const root = mkdtempSync(join(tmpdir(), "nexus-real-"));
+    const path = join(root, "assistants.ts");
+    try {
+      writeFileSync(path, real, "utf8");
+      const allowed = new Set(
+        ALLOWED_OCCURRENCES.map((entry) =>
+          signatureOf("assistants.ts", entry.keys, entry.pattern, entry.anchor),
+        ),
+      );
+      expect(findUndeclaredCoupling([path], root, allowed), "arquivo real").toEqual([]);
+
+      writeFileSync(path, duplicated, "utf8");
+      const blocked = findUndeclaredCoupling([path], root, allowed);
+      expect(blocked.map((entry) => entry.anchor)).toEqual(["ASSISTANTS_MIRROR"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Fase 0 — prova de regressão: legítima, duplicata, remoção", () => {
+  // Sequência completa no mesmo arquivo, pelo caminho de validação real. É o cenário que a
+  // identidade antiga (`catalog:arquivo::chaves`) deixava passar: as duas listas tinham chaves
+  // idênticas, então declarar uma liberava a outra.
+  it("aceita a legítima, bloqueia a duplicata idêntica e volta a aceitar ao removê-la", () => {
+    const root = mkdtempSync(join(tmpdir(), "nexus-regressao-"));
+    const path = join(root, "catalog.ts");
+    const legit = [
+      'export const LEGIT = [',
+      '  { key: "yui" },',
+      '  { key: "alice" },',
+      '  { key: "schwi" },',
+      "] as const;",
+    ].join("\n");
+    const duplicate = [
+      "",
+      "export const COPIA = [",
+      '  { key: "yui" },',
+      '  { key: "alice" },',
+      '  { key: "schwi" },',
+      "] as const;",
+    ].join("\n");
+    const allowed = new Set([
+      signatureOf("catalog.ts", ["yui", "alice", "schwi"], "catalog", "LEGIT"),
+    ]);
+
+    try {
+      writeFileSync(path, legit, "utf8");
+      expect(findUndeclaredCoupling([path], root, allowed), "1. legítima isolada").toEqual([]);
+
+      writeFileSync(path, legit + duplicate, "utf8");
+      const blocked = findUndeclaredCoupling([path], root, allowed);
+      expect(blocked, "2. duplicata idêntica precisa falhar").toHaveLength(1);
+      expect(blocked[0]!.anchor).toBe("COPIA");
+
+      writeFileSync(path, legit, "utf8");
+      expect(findUndeclaredCoupling([path], root, allowed), "3. após remover a duplicata").toEqual(
+        [],
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
-  it("a mesma assinatura de uma ocorrência legítima está liberada", () => {
-    const allowed = allSignatures();
-    expect(
-      allowed.has(
-        signatureOf("packages/shared/src/schemas/assistants.ts", ["yui", "alice", "schwi"], "list"),
-      ),
-    ).toBe(true);
-  });
-
-  it("uma lista nova no MESMO arquivo de uma ocorrência legítima não é liberada", () => {
-    // Simula o relatório do scanner: o arquivo já permitido ganha um grupo adicional de duas
-    // chaves que não corresponde à assinatura declarada.
-    const allowed = allSignatures();
-    // Mesmo arquivo, mesma ocorrência legítima já declarada…
-    expect(
-      allowed.has(
-        signatureOf("packages/shared/src/schemas/assistants.ts", ["yui", "alice", "schwi"], "list"),
-      ),
-    ).toBe(true);
-    // …mas uma lista adicional, com outro conjunto de chaves, não está coberta.
-    expect(
-      allowed.has(signatureOf("packages/shared/src/schemas/assistants.ts", ["yui", "alice"], "list")),
-    ).toBe(false);
-  });
-
   it("cada ocorrência declara motivo e fase responsável pela remoção", () => {
     for (const entry of ALLOWED_OCCURRENCES) {
       expect(entry.reason.length).toBeGreaterThan(10);
@@ -633,9 +986,23 @@ describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
     expect(ALLOWED_OCCURRENCES).toHaveLength(9);
   });
 
+  it("toda ocorrência de catálogo declara o container que a identifica", () => {
+    // Sem âncora, duas listas de objetos com as mesmas chaves no mesmo arquivo voltariam a ter a
+    // mesma identidade — exatamente a brecha corrigida nesta rodada.
+    for (const entry of ALLOWED_OCCURRENCES.filter((item) => item.pattern === "catalog")) {
+      expect(entry.anchor, `ocorrência de catálogo sem âncora: ${entry.file}`).toBeDefined();
+      expect(entry.anchor).not.toBe("<expr>");
+    }
+  });
+
+  it("duas ocorrências não compartilham a mesma assinatura", () => {
+    const signatures = ALLOWED_OCCURRENCES.map((entry) =>
+      signatureOf(entry.file, entry.keys, entry.pattern, entry.anchor),
+    );
+    expect(new Set(signatures).size).toBe(signatures.length);
+  });
+
   it("a allowlist não declara um arquivo inteiro: cada entrada tem padrão definido", () => {
-    // Sem `pattern`, uma entrada liberaria qualquer formato naquele arquivo — exatamente a
-    // exceção ampla que este guard evita.
     for (const entry of ALLOWED_OCCURRENCES) {
       expect(["list", "catalog"]).toContain(entry.pattern);
     }
@@ -648,23 +1015,37 @@ describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
  * Extraído do teste para que o negativo possa exercitar exatamente o mesmo caminho de código
  * com uma entrada sintética, sem escrever em disco nem tocar em arquivos de produção.
  */
+export interface UndeclaredCoupling {
+  readonly file: string;
+  readonly line: number;
+  readonly keys: readonly string[];
+  readonly pattern: string;
+  readonly anchor?: string;
+}
+
 export function findUndeclaredCoupling(
   files: readonly string[],
   repoRoot: string,
   allowed: ReadonlySet<string>,
-): { file: string; line: number; keys: readonly string[]; pattern: string }[] {
+): UndeclaredCoupling[] {
   return files.flatMap((file) => {
     const relativePath = relative(repoRoot, file);
     const source = readFileSync(file, "utf8");
-    const found: { file: string; line: number; keys: readonly string[]; pattern: string }[] = [];
+    const found: UndeclaredCoupling[] = [];
     for (const group of findCouplingGroups(source)) {
       if (!allowed.has(signatureOf(relativePath, group.keys, "list"))) {
         found.push({ file: relativePath, line: group.line, keys: group.keys, pattern: "list" });
       }
     }
-    for (const group of findCatalogDeclarations(source)) {
-      if (!allowed.has(signatureOf(relativePath, group.keys, "catalog"))) {
-        found.push({ file: relativePath, line: group.line, keys: group.keys, pattern: "catalog" });
+    for (const occurrence of findCatalogDeclarations(source)) {
+      if (!allowed.has(signatureOf(relativePath, occurrence.keys, "catalog", occurrence.anchor))) {
+        found.push({
+          file: relativePath,
+          line: occurrence.line,
+          keys: occurrence.keys,
+          pattern: "catalog",
+          anchor: occurrence.anchor,
+        });
       }
     }
     return found;
@@ -703,12 +1084,16 @@ describe("Fase 0 — varredura do repositório", () => {
     // a allowlist não pode acumular permissões mortas.
     for (const entry of ALLOWED_OCCURRENCES) {
       const source = readFileSync(resolve(REPO_ROOT, entry.file), "utf8");
-      const groups =
-        entry.pattern === "list" ? findCouplingGroups(source) : findCatalogDeclarations(source);
-      const signature = signatureOf(entry.file, entry.keys, entry.pattern);
-      const found = groups.some(
-        (group) => signatureOf(entry.file, group.keys, entry.pattern) === signature,
-      );
+      const signature = signatureOf(entry.file, entry.keys, entry.pattern, entry.anchor);
+      const found =
+        entry.pattern === "list"
+          ? findCouplingGroups(source).some(
+              (group) => signatureOf(entry.file, group.keys, "list") === signature,
+            )
+          : findCatalogDeclarations(source).some(
+              (occurrence) =>
+                signatureOf(entry.file, occurrence.keys, "catalog", occurrence.anchor) === signature,
+            );
       expect(found, `ocorrência declarada não encontrada em ${entry.file}`).toBe(true);
     }
   });
