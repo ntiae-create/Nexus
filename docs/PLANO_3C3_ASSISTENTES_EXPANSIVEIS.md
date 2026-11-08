@@ -281,7 +281,7 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
 | 3 | `apps/server/src/core/delegation.ts:17` | `Record<InitialAssistantKey, …>` literal | mapa fechado |
 | 4 | `apps/server/src/core/engine.ts:911` | `["alice","schwi"]` literal | duplica a regra 3 |
 | 5 | `apps/server/src/routes/core.ts:38` | `z.enum([...])` local | **redefine** o domínio na rota |
-| 6 | `apps/server/src/routes/assistants.ts:4` | array literal de 3 | **quarta cópia**, já divergente |
+| 6 | `apps/server/src/routes/assistants.ts:4` | array literal de 3 | **quarta cópia**, divergente; a rota **não está registrada** em `buildApp` (L9) |
 | 7 | `apps/mobile/src/lib/config.ts:177` | array literal de 3 | rótulos/cores |
 | 8 | `apps/mobile/src/lib/assistants.ts:25` | array literal de 3 | espelho validado por texto |
 | 9 | `apps/mobile/src/services/core-service.ts:92` | união literal | tipo duplicado |
@@ -319,9 +319,22 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
 
 **Operacionais e de consistência**
 
-- **L9 (defeito conhecido, não comportamento a preservar).** `GET /v1/assistants` responde de um
-  array literal em `apps/server/src/routes/assistants.ts`, **independente** de
-  `packages/assistant-profiles`, e **já divergiu**:
+- **L9 (defeito conhecido, não comportamento a preservar).** A implementação de
+  `GET /v1/assistants` em `apps/server/src/routes/assistants.ts` mantém um array literal
+  **independente** de `packages/assistant-profiles`, e esse array **divergiu** do catálogo
+  canônico. Dois fatos distintos, verificados na Fase 0:
+
+  1. **A rota não está conectada.** `registerAssistantRoutes` é exportada, mas `buildApp`
+     (`apps/server/src/app.ts`) não a chama. A rota, portanto, não participa da aplicação
+     servida no estado analisado — o cliente recebe **404** em `GET /v1/assistants`.
+  2. **A implementação não registrada divergiria.** Se fosse conectada sem correção, serviria
+     valores diferentes dos perfis (tabela abaixo).
+
+  Ambos são **defeitos a corrigir na Fase 2**, não comportamentos a preservar. A Fase 0 apenas os
+  registra aqui: **não existe teste automatizado sobre L9** — nem de caracterização, nem de
+  contrato. Um teste que exigisse "a rota continua fora do `buildApp`" ou "o payload continua
+  divergente" passaria a bloquear exatamente a correção. A Fase 2 conecta a rota e deriva o
+  payload do registro, com testes de paridade que devem falhar antes da correção.
 
   Valores conferidos no código:
 
@@ -432,8 +445,8 @@ packages/assistant-profiles/
 - `nexus.assistants` + `assistant_config_versions` passam a ser **espelho** sincronizado
   (`source: 'static_code'` hoje; `'managed_future'` se a edição em runtime for aprovada).
 - Teste de paridade obrigatório: perfis ⇄ seed SQL ⇄ `GET /v1/assistants` ⇄ catálogo móvel.
-- **`GET /v1/assistants` é correção de defeito**, não apenas refatoração: hoje responde de um
-  array divergente (L9).
+- **`GET /v1/assistants` é correção de defeito**, não apenas refatoração: a rota não está
+  registrada em `buildApp` e, quando registrada, serviria de um array divergente (L9).
 
 ### 5.3 Especialidades e capacidades declarativas
 
@@ -1289,9 +1302,11 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
 - Testes de caracterização **somente** para comportamento desejado: projeção de perfil em
   `buildAssistantSystemInstructions`, ordem/limites de delegação, códigos de erro
   (`ASSISTANT_NOT_FOUND`, `DELEGATION_*`), política `free_only`.
-- **O defeito L9 não é congelado.** Nenhum teste desta fase pode afirmar o payload divergente de
-  `GET /v1/assistants`. O defeito é **documentado** (§2 L9, com a tabela de divergências) e
-  vira especificação de comportamento correto na Fase 2.
+- **O defeito L9 não é congelado — e não tem teste.** A Fase 0 **não** cria teste de
+  caracterização para L9: nenhum teste pode afirmar que a rota segue fora do `buildApp` ou que o
+  payload segue divergente, porque isso viraria bloqueio da própria correção. O defeito é
+  **documentado** (§2 L9, com a tabela de divergências) e vira especificação de comportamento
+  correto na Fase 2.
 - **Testes:** suíte atual verde (507 testes; 28 integrações PostgreSQL no workflow dedicado);
   guards de acoplamento; caracterização do comportamento intencional. Nenhum teste asserta bug.
 
