@@ -43,18 +43,79 @@ export interface DelegationPolicy {
 }
 
 /**
+ * Falha de configuração da política.
+ *
+ * Erro próprio (em vez de `Error` genérico) para que a origem seja distinguível em log e em
+ * teste: isto é defeito de programação/configuração, não condição de execução.
+ */
+export class DelegationPolicyConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DelegationPolicyConfigurationError";
+  }
+}
+
+/**
+ * Valida e congela uma política.
+ *
+ * **Por que validar em vez de confiar no tipo.** O TypeScript não sobrevive a fronteira de dados:
+ * uma política pode vir de configuração lida em runtime, e um objeto forjado (`as DelegationPolicy`)
+ * entra no sistema sem passar por checagem nenhuma. Os três campos abaixo falham de formas
+ * silenciosas, que é a pior categoria:
+ *
+ * - `maxTargetsPerCoordinator: NaN` — `allowed.length >= NaN` é **sempre falso**, então o laço
+ *   nunca para pelo teto e o limite simplesmente deixa de existir, sem erro;
+ * - `maxTargetsPerCoordinator: 0` — não há cenário legítimo em que um coordenador tenha zero
+ *   alvos efetivos e ainda declare coordenação; um teto zero é erro de quem configurou, e deve
+ *   ser dito agora, não descoberto como "coordenação silenciosamente vazia";
+ * - `Infinity` — é a representação de "sem teto". O contrato não oferece esse jeito de propósito:
+ *   desativar o próprio limite precisa ser uma decisão explícita, não o resultado de um valor
+ *   mágico;
+ * - `allowsTarget` que não é função — estoura em runtime, no meio de uma execução, convertendo
+ *   um erro de configuração em falha de conversa do usuário.
+ *
+ * @throws DelegationPolicyConfigurationError descrevendo o campo inválido.
+ */
+export function defineDelegationPolicy(config: DelegationPolicy): DelegationPolicy {
+  if (typeof config.id !== "string" || config.id.trim().length === 0) {
+    throw new DelegationPolicyConfigurationError(
+      "Delegation policy 'id' must be a non-empty string",
+    );
+  }
+
+  if (typeof config.allowsTarget !== "function") {
+    throw new DelegationPolicyConfigurationError(
+      "Delegation policy 'allowsTarget' must be a function",
+    );
+  }
+
+  const cap = config.maxTargetsPerCoordinator;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || !Number.isInteger(cap) || cap <= 0) {
+    throw new DelegationPolicyConfigurationError(
+      `Delegation policy 'maxTargetsPerCoordinator' must be a finite positive integer; received ${String(cap)}`,
+    );
+  }
+
+  return Object.freeze({
+    id: config.id,
+    allowsTarget: config.allowsTarget,
+    maxTargetsPerCoordinator: cap,
+  });
+}
+
+/**
  * Política de produção.
  *
  * Deliberadamente **permissiva**: nesta fase nenhuma restrição adicional de servidor é aplicada
  * além do teto de volume, e o comportamento observável permanece o aprovado (YUI coordena ALICE e
- * SCHWI; as folhas não coordenam). A camada existe para que a restrição seja *possível e
- * testável*, não para inventar uma agora — criar uma denylist de servidor sem requisito seria
- * antecipar decisão de produto e, pior, voltaria a codificar nomes de assistente no servidor.
+ * SCHWI; as folhas não coordenam). A camada existe para que a restrição seja *possível e testável*,
+ * não para inventar uma agora — criar uma denylist de servidor sem requisito seria antecipar
+ * decisão de produto e, pior, voltaria a codificar nomes de assistente no servidor.
  *
  * `maxTargetsPerCoordinator` reaproveita o limite de 10 alvos do schema de perfil (§7.2), para
  * que o plano não tenha dois números diferentes para a mesma ideia.
  */
-export const SERVER_DELEGATION_POLICY: DelegationPolicy = Object.freeze({
+export const SERVER_DELEGATION_POLICY: DelegationPolicy = defineDelegationPolicy({
   id: "nexus.delegation.server.v1",
   maxTargetsPerCoordinator: 10,
   allowsTarget: () => true,

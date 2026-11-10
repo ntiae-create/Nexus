@@ -14,6 +14,7 @@ import {
   delegationTargetsFor,
   validateDelegationPlan,
 } from "./delegation.js";
+import { SERVER_DELEGATION_POLICY } from "./delegation-policy.js";
 import { CoreExecutionError } from "./errors.js";
 
 /**
@@ -124,12 +125,12 @@ describe("Fase 3 — política derivada do perfil (YUI, ALICE, SCHWI)", () => {
     // A asserção é contra o perfil, não contra um literal. Se a declaração mudar, o teste
     // acompanha; se a derivação mentir, o teste falha.
     expect(declared.length).toBeGreaterThan(0);
-    expect([...delegationTargetsFor("yui")]).toEqual([...declared]);
-    expect(canDelegate("yui")).toBe(true);
+    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual([...declared]);
+    expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
   });
 
   it("YUI continua coordenando ALICE e SCHWI, e só elas", () => {
-    const targets = delegationTargetsFor("yui");
+    const targets = delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY);
     expect(targets).toContain("alice");
     expect(targets).toContain("schwi");
     expect(targets).toHaveLength(2);
@@ -140,8 +141,8 @@ describe("Fase 3 — política derivada do perfil (YUI, ALICE, SCHWI)", () => {
       const profile = CANONICAL_PROFILE_REGISTRY.getByKey(key)!;
       expect(profile.coordination.canCoordinate).toBe(false);
       expect(profile.coordination.delegateTo).toBeUndefined();
-      expect(delegationTargetsFor(key)).toEqual([]);
-      expect(canDelegate(key)).toBe(false);
+      expect(delegationTargetsFor(key, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+      expect(canDelegate(key, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
     }
   });
 
@@ -159,16 +160,16 @@ describe("Fase 3 — política derivada do perfil (YUI, ALICE, SCHWI)", () => {
   });
 
   it("um identificador fora do catálogo não delega, sem quebrar", () => {
-    expect(delegationTargetsFor("nao-registrado")).toEqual([]);
-    expect(canDelegate("nao-registrado")).toBe(false);
+    expect(delegationTargetsFor("nao-registrado", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(canDelegate("nao-registrado", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
   });
 });
 
 describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
   it("o perfil sintético coordena outro perfil", () => {
     const registry = extendedRegistry();
-    expect([...delegationTargetsFor("delta", registry)]).toEqual(["yui"]);
-    expect(canDelegate("delta", registry)).toBe(true);
+    expect([...delegationTargetsFor("delta", registry, SERVER_DELEGATION_POLICY)]).toEqual(["yui"]);
+    expect(canDelegate("delta", registry, SERVER_DELEGATION_POLICY)).toBe(true);
   });
 
   it("o perfil sintético é alvo de coordenação de outra assistente", () => {
@@ -179,8 +180,8 @@ describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
     ]);
     // `epsilon` é coordenado por `delta`; e `yui` não conhece `delta` porque não o declara —
     // ser alvo exige declaração explícita de quem coordena, não o contrário.
-    expect([...delegationTargetsFor("delta", registry)]).toEqual(["epsilon"]);
-    expect(delegationTargetsFor("yui", registry)).toEqual(["alice", "schwi"]);
+    expect([...delegationTargetsFor("delta", registry, SERVER_DELEGATION_POLICY)]).toEqual(["epsilon"]);
+    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual(["alice", "schwi"]);
   });
 
   it("a quarta assistente funciona sem estar em enum, lista ou condicional de produção", () => {
@@ -199,7 +200,7 @@ describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
 
     // E ainda assim funciona, porque a política vem do registro injetado.
     const registry = extendedRegistry();
-    expect(canDelegate("delta", registry)).toBe(true);
+    expect(canDelegate("delta", registry, SERVER_DELEGATION_POLICY)).toBe(true);
     expect(() =>
       validateDelegationPlan({
         specs: [spec("yui")],
@@ -207,6 +208,8 @@ describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
         baseDepth: 0,
         limits: LIMITS,
         registry,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     ).not.toThrow();
   });
@@ -233,6 +236,8 @@ describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
         baseDepth: 0,
         limits: LIMITS,
         registry,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     ).not.toThrow();
 
@@ -243,6 +248,8 @@ describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_NOT_ALLOWED");
@@ -258,6 +265,8 @@ describe("Fase 3 — limites preservados (item 6)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: { ...LIMITS, maxDelegationsPerExecution: 2, maxTotalDelegations: 10 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_LIMIT_EXCEEDED");
@@ -271,6 +280,8 @@ describe("Fase 3 — limites preservados (item 6)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: { ...LIMITS, maxDelegationsPerExecution: 10, maxTotalDelegations: 1 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_LIMIT_EXCEEDED");
@@ -286,6 +297,8 @@ describe("Fase 3 — limites preservados (item 6)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: { ...LIMITS, maxDelegationDepth: 2, maxDelegationsPerExecution: 10, maxTotalDelegations: 10 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_DEPTH_EXCEEDED");
@@ -298,6 +311,8 @@ describe("Fase 3 — limites preservados (item 6)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     ).not.toThrow();
   });
@@ -311,6 +326,8 @@ describe("Fase 3 — ciclos continuam rejeitados (item 7)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_CYCLE_DETECTED");
@@ -323,6 +340,8 @@ describe("Fase 3 — ciclos continuam rejeitados (item 7)", () => {
         chainKeys: ["yui", "alice"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_CYCLE_DETECTED");
@@ -337,6 +356,8 @@ describe("Fase 3 — ciclos continuam rejeitados (item 7)", () => {
         chainKeys: ["yui", "alice"],
         baseDepth: 0,
         limits: { ...LIMITS, maxDelegationDepth: 0 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_CYCLE_DETECTED");
@@ -355,7 +376,9 @@ describe("Fase 3 — autorização vem do perfil (item 8 do escopo)", () => {
           chainKeys: [key],
           baseDepth: 0,
           limits: LIMITS,
-        }),
+        
+        policy: SERVER_DELEGATION_POLICY,
+      }),
       );
       expect(errorCode(error), `${key} não deveria delegar`).toBe("DELEGATION_NOT_ALLOWED");
     }
@@ -368,6 +391,8 @@ describe("Fase 3 — autorização vem do perfil (item 8 do escopo)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_NOT_ALLOWED");
@@ -388,7 +413,7 @@ describe("Fase 3 — alvos inativos não são oferecidos", () => {
       CANONICAL_PROFILE_REGISTRY.getByKey("schwi")!,
     ]);
 
-    expect(delegationTargetsFor("yui", registry)).toEqual(["schwi"]);
+    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual(["schwi"]);
   });
 
   it("um coordenador desabilitado não coordena", () => {
@@ -404,8 +429,8 @@ describe("Fase 3 — alvos inativos não são oferecidos", () => {
       CANONICAL_PROFILE_REGISTRY.getByKey("schwi")!,
     ]);
 
-    expect(delegationTargetsFor("yui", registry)).toEqual([]);
-    expect(canDelegate("yui", registry)).toBe(false);
+    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(canDelegate("yui", registry, SERVER_DELEGATION_POLICY)).toBe(false);
   });
 });
 
@@ -470,7 +495,7 @@ describe("Fase 3 — não existe segunda lista literal de alvos (item 9)", () =>
   it("`DELEGATION_TARGETS` continua exportado e reflete o registro", () => {
     // Compatibilidade: o símbolo é público desde a Etapa 3B. Ele muda de origem, não de nome.
     return import("./delegation.js").then(({ DELEGATION_TARGETS }) => {
-      expect([...DELEGATION_TARGETS.yui!]).toEqual([...delegationTargetsFor("yui")]);
+      expect([...DELEGATION_TARGETS.yui!]).toEqual([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]);
       expect([...DELEGATION_TARGETS.alice!]).toEqual([]);
       expect([...DELEGATION_TARGETS.schwi!]).toEqual([]);
     });

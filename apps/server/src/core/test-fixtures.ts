@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Conversation, CoreRun, Message } from "@nexus/shared";
+import type { DelegationPolicy } from "./delegation-policy.js";
 import { NexusCoreEngine, type CoreEngineLimits } from "./engine.js";
 import { InMemoryNexusDatabase } from "./in-memory-database.js";
 import {
@@ -49,6 +50,8 @@ export function createHarness(options: {
   seedConversation?: Conversation;
   history?: readonly HarnessHistoryEntry[];
   limits?: Partial<CoreEngineLimits>;
+  /** Política de coordenação injetada no motor, para testar o caminho real de produção. */
+  delegationPolicy?: DelegationPolicy;
 }): Harness {
   const db = new InMemoryNexusDatabase();
   const seed = options.seedConversation ?? conversation();
@@ -74,6 +77,7 @@ export function createHarness(options: {
     providers: createMockProviderRuntime(options.adapter),
     now: () => new Date(NOW),
     ...(options.limits ? { limits: options.limits } : {}),
+    ...(options.delegationPolicy ? { delegationPolicy: options.delegationPolicy } : {}),
   });
 
   return {

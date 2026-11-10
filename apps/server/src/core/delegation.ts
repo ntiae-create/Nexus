@@ -46,6 +46,11 @@ function snapshotDelegationTargets(
 /**
  * Policy snapshot of the production catalog.
  *
+ * Este é o **único** ponto de compatibilidade que não recebe política por argumento, e ele não é
+ * um caminho que possa esquecê-la: o snapshot é construído uma única vez, no carregamento do
+ * módulo, chamando `effectiveDelegationTargets` com `SERVER_DELEGATION_POLICY`. Não há parâmetro
+ * a omitir, e o valor é congelado. Testado em `delegation-policy.hardening.phase3.test.ts`.
+ *
  * Keys are assistant keys, not `InitialAssistantKey`: a fourth assistant appears here as soon as
  * it declares coordination, without widening a closed enum in a contract.
  */
@@ -72,10 +77,19 @@ export const COORDINATOR_ASSISTANT_KEY: AssistantKey | undefined =
  *
  * @param registry Omitted -> the sealed production registry.
  */
+/**
+ * Alvos efetivos de um coordenador.
+ *
+ * `policy` é **obrigatória**. Antes ela tinha valor padrão (`SERVER_DELEGATION_POLICY`), o que
+ * parecia conveniente e criava um risco real: um caminho de produção podia chamar com dois
+ * argumentos e, sem perceber, operar com uma política que não era a que ele pretendia usar — o
+ * mesmo tipo de divergência silenciosa entre prompt e validação que a fase corrigiu. Quem quiser
+ * a política de produção agora diz isso explicitamente.
+ */
 export function delegationTargetsFor(
   key: AssistantKey,
-  registry: AssistantProfileRegistry = CANONICAL_PROFILE_REGISTRY,
-  policy: DelegationPolicy = SERVER_DELEGATION_POLICY,
+  registry: AssistantProfileRegistry,
+  policy: DelegationPolicy,
 ): readonly AssistantKey[] {
   const profile = registry.getByKey(key);
   if (!profile) return [];
@@ -84,8 +98,8 @@ export function delegationTargetsFor(
 
 export function canDelegate(
   key: AssistantKey,
-  registry: AssistantProfileRegistry = CANONICAL_PROFILE_REGISTRY,
-  policy: DelegationPolicy = SERVER_DELEGATION_POLICY,
+  registry: AssistantProfileRegistry,
+  policy: DelegationPolicy,
 ): boolean {
   return delegationTargetsFor(key, registry, policy).length > 0;
 }
@@ -119,10 +133,12 @@ export interface ValidateDelegationPlanInput {
   /**
    * Política do servidor aplicada à relação coordenador → alvo (§5.5).
    *
-   * Omitida -> a política de produção. É aqui que a terceira condição da interseção age: um alvo
-   * declarado no perfil e existente no catálogo ainda é recusado se a política não o admitir.
+   * **Obrigatória.** É aqui que a terceira condição da interseção age: um alvo declarado no
+   * perfil e existente no catálogo ainda é recusado se a política não o admitir. Se tivesse valor
+   * padrão, um chamador distraído validaria com uma política diferente da que apresentou ao
+   * coordenador — e a divergência entre prometer e aceitar voltaria, agora invisível.
    */
-  readonly policy?: DelegationPolicy;
+  readonly policy: DelegationPolicy;
 }
 
 /** Flattens the structured plan (including nested sub-delegations) deterministically. */
@@ -152,8 +168,8 @@ export function flattenDelegationPlan(
  */
 export function validateDelegationPlan(input: ValidateDelegationPlanInput): void {
   const { specs, chainKeys, baseDepth, limits } = input;
+  const { policy } = input;
   const registry = input.registry ?? CANONICAL_PROFILE_REGISTRY;
-  const policy = input.policy ?? SERVER_DELEGATION_POLICY;
   const owner = chainKeys[chainKeys.length - 1];
 
   if (!owner) {

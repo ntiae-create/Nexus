@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AssistantProfile } from "@nexus/assistant-profiles";
+import { CANONICAL_PROFILE_REGISTRY, type AssistantProfile } from "@nexus/assistant-profiles";
 import type {
   AssistantKey,
   Conversation,
@@ -45,6 +45,7 @@ import {
   extractCoordinatorDecision,
   validateDelegationPlan,
 } from "./delegation.js";
+import { SERVER_DELEGATION_POLICY, defineDelegationPolicy, type DelegationPolicy } from "./delegation-policy.js";
 import { CoreExecutionError } from "./errors.js";
 import {
   deriveChildRunId,
@@ -105,6 +106,15 @@ export interface NexusCoreEngineOptions {
   readonly cancellationPollIntervalMs?: number;
   readonly logger?: CoreLogger;
   readonly limits?: Partial<CoreEngineLimits>;
+  /**
+   * Política de coordenação aplicada a **todos** os pontos de decisão deste motor.
+   *
+   * Existe para que os testes possam exercitar o caminho de produção com uma política restritiva,
+   * em vez de reimplementá-lo. Em produção a opção é omitida e vale
+   * `SERVER_DELEGATION_POLICY` — mas a escolha é feita **aqui, uma vez**, e não em cada chamada:
+   * assim não há como um ponto usar a política padrão enquanto outro usa uma injetada.
+   */
+  readonly delegationPolicy?: DelegationPolicy;
 }
 
 export interface ExecuteCoreInput {
@@ -250,6 +260,12 @@ export class NexusCoreEngine {
   private readonly watcher: ExecutionCancellationWatcher;
   private readonly logger?: CoreLogger;
   private readonly limits: CoreEngineLimits;
+  /**
+   * Política única da coordenação neste motor. Ver `NexusCoreEngineOptions.delegationPolicy`.
+   * É repassada explicitamente a todo ponto que apresenta ou autoriza alvos — a mesma instância,
+   * nunca um default implícito em cada chamada.
+   */
+  private readonly delegationPolicy: DelegationPolicy;
 
   constructor(options: NexusCoreEngineOptions) {
     this.database = options.database;
@@ -258,6 +274,11 @@ export class NexusCoreEngine {
     this.registry = options.registry ?? new ExecutionCancellationRegistry();
     this.logger = options.logger;
     this.limits = { ...DEFAULT_CORE_LIMITS, ...(options.limits ?? {}) };
+    // `defineDelegationPolicy` valida: uma política injetada por teste (ou por configuração) com
+    // teto inválido falha na construção do motor, e não no meio de uma execução.
+    this.delegationPolicy = defineDelegationPolicy(
+      options.delegationPolicy ?? SERVER_DELEGATION_POLICY,
+    );
     this.watcher =
       options.cancellationWatcher ??
       new ExecutionCancellationWatcher({
@@ -915,7 +936,11 @@ export class NexusCoreEngine {
       // registro canônico selado, porque é produção. Se um dia o engine passar uma política
       // própria, `validateDelegationPlan` precisa receber a **mesma** — o contrato de
       // `ValidateDelegationPlanInput.policy` existe para isso.
-      const canDelegateTo = delegationTargetsFor(profileKey);
+      const canDelegateTo = delegationTargetsFor(
+        profileKey,
+        CANONICAL_PROFILE_REGISTRY,
+        this.delegationPolicy,
+      );
       const coordinator = canDelegateTo.length > 0;
       const instructions = buildAssistantSystemInstructions(profile, {
         mode: coordinator ? "coordinator_planning" : "direct",
@@ -1001,6 +1026,7 @@ export class NexusCoreEngine {
           chainKeys: [profileKey],
           baseDepth: 0,
           limits: this.limits,
+          policy: this.delegationPolicy,
         });
       }
 
@@ -1129,6 +1155,9 @@ export class NexusCoreEngine {
       chainKeys: [assistantKeyOf(profile)],
       baseDepth: 0,
       limits: this.limits,
+      // Mesma instância usada para montar o prompt em `executeWithProfile`: apresentar com uma
+      // política e autorizar com outra é a divergência que a fase existe para eliminar.
+      policy: this.delegationPolicy,
     });
 
     const conversation = await this.tx(ownerId, async (repos) =>

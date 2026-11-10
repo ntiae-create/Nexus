@@ -139,11 +139,16 @@ describe("Fase 3 — a política do servidor é uma camada independente", () => 
     expect(source).not.toMatch(/["']schwi["']/);
   });
 
-  it("produz o mesmo resultado que a política permissiva no catálogo canônico", () => {
+  it("produz o resultado aprovado no catálogo canônico", () => {
     // A camada nova não pode mudar o comportamento aprovado: YUI continua com os seus dois alvos.
+    //
+    // Antes este teste comparava "com política" × "sem política" — e a comparação só fazia
+    // sentido porque omitir a política significava "sem restrição". Depois do endurecimento a
+    // omissão é erro, então o teste passou a afirmar o resultado direto, que é o que importa.
     const yui = CANONICAL_PROFILE_REGISTRY.getByKey("yui")!;
-    expect([...effectiveDelegationTargets(yui, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)])
-      .toEqual([...effectiveDelegationTargets(yui, CANONICAL_PROFILE_REGISTRY)]);
+    expect(
+      effectiveDelegationTargets(yui, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY),
+    ).toEqual(["alice", "schwi"]);
   });
 });
 
@@ -257,6 +262,8 @@ describe("Fase 3 — a validação usa a mesma interseção", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(errorCode(error)).toBe("DELEGATION_NOT_ALLOWED");
@@ -269,6 +276,8 @@ describe("Fase 3 — a validação usa a mesma interseção", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: LIMITS,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     ).not.toThrow();
   });
@@ -303,14 +312,14 @@ describe("Fase 3 — a validação usa a mesma interseção", () => {
 
 describe("Fase 3 — compatibilidade preservada após a correção", () => {
   it("YUI continua coordenando ALICE e SCHWI", () => {
-    expect([...delegationTargetsFor("yui")]).toEqual(["alice", "schwi"]);
-    expect(canDelegate("yui")).toBe(true);
+    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual(["alice", "schwi"]);
+    expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
   });
 
   it("ALICE e SCHWI continuam sem poder iniciar delegações", () => {
     for (const key of ["alice", "schwi"] as const) {
-      expect(delegationTargetsFor(key)).toEqual([]);
-      expect(canDelegate(key)).toBe(false);
+      expect(delegationTargetsFor(key, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+      expect(canDelegate(key, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
       expect(
         errorCode(
           captureError(() =>
@@ -319,7 +328,9 @@ describe("Fase 3 — compatibilidade preservada após a correção", () => {
               chainKeys: [key],
               baseDepth: 0,
               limits: LIMITS,
-            }),
+            
+        policy: SERVER_DELEGATION_POLICY,
+      }),
           ),
         ),
       ).toBe("DELEGATION_NOT_ALLOWED");
@@ -328,8 +339,8 @@ describe("Fase 3 — compatibilidade preservada após a correção", () => {
 
   it("a quarta assistente sintética continua coordenando sem tocar produção", () => {
     const registry = extendedRegistry();
-    expect([...delegationTargetsFor("delta", registry)]).toEqual(["yui"]);
-    expect(canDelegate("delta", registry)).toBe(true);
+    expect([...delegationTargetsFor("delta", registry, SERVER_DELEGATION_POLICY)]).toEqual(["yui"]);
+    expect(canDelegate("delta", registry, SERVER_DELEGATION_POLICY)).toBe(true);
     // E a política de produção não a bloqueia: a chave não aparece em lugar nenhum do código.
     expect(
       effectiveDelegationTargets(registry.getByKey("delta")!, registry, SERVER_DELEGATION_POLICY),
@@ -348,7 +359,9 @@ describe("Fase 3 — compatibilidade preservada após a correção", () => {
             chainKeys: ["yui"],
             baseDepth: 0,
             limits: { ...LIMITS, maxDelegationDepth: 2, maxDelegationsPerExecution: 10, maxTotalDelegations: 10 },
-          }),
+          
+        policy: SERVER_DELEGATION_POLICY,
+      }),
         ),
       ),
     ).toBe("DELEGATION_DEPTH_EXCEEDED");
@@ -362,7 +375,9 @@ describe("Fase 3 — compatibilidade preservada após a correção", () => {
             chainKeys: ["yui"],
             baseDepth: 0,
             limits: { ...LIMITS, maxDelegationsPerExecution: 1, maxTotalDelegations: 10 },
-          }),
+          
+        policy: SERVER_DELEGATION_POLICY,
+      }),
         ),
       ),
     ).toBe("DELEGATION_LIMIT_EXCEEDED");
@@ -376,7 +391,9 @@ describe("Fase 3 — compatibilidade preservada após a correção", () => {
             chainKeys: ["yui"],
             baseDepth: 0,
             limits: LIMITS,
-          }),
+          
+        policy: SERVER_DELEGATION_POLICY,
+      }),
         ),
       ),
     ).toBe("DELEGATION_CYCLE_DETECTED");

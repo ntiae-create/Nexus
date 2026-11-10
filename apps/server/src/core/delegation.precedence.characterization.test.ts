@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { validateDelegationPlan } from "./delegation.js";
+import { SERVER_DELEGATION_POLICY } from "./delegation-policy.js";
 import { CoreExecutionError } from "./errors.js";
 
 /**
@@ -24,9 +25,13 @@ const limits = {
   maxTotalDelegations: 6,
 };
 
-function rejectionOf(input: Parameters<typeof validateDelegationPlan>[0]): string {
+function rejectionOf(
+  input: Omit<Parameters<typeof validateDelegationPlan>[0], "policy">,
+): string {
   try {
-    validateDelegationPlan(input);
+    // A política de produção é fornecida em um só lugar para todos os casos: este arquivo
+    // testa **precedência entre as regras**, não a política (coberta à parte).
+    validateDelegationPlan({ ...input, policy: SERVER_DELEGATION_POLICY });
   } catch (error) {
     expect(error).toBeInstanceOf(CoreExecutionError);
     return (error as CoreExecutionError).code;
@@ -134,6 +139,8 @@ describe("Fase 0 — precedência dos erros de delegação", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     ).not.toThrow();
   });

@@ -61,33 +61,66 @@ export interface DelegationTargetPolicy {
  * O resultado preserva a **ordem de declaração** do perfil, truncada pelo teto da política.
  * Ordem importa: o prompt do coordenador apresenta os alvos nessa sequência.
  *
- * @param policy Omitida -> nenhuma restrição de servidor além do que o perfil declara. Isso é
- *   intencional: quem chama sem política (testes de schema, ferramentas de inspeção) enxerga a
- *   projeção pura do dado; o servidor sempre passa a própria política explicitamente.
+ * **A política é obrigatória — de propósito.** Antes ela era opcional, e a omissão significava
+ * `Number.POSITIVE_INFINITY`, isto é, "sem restrição de servidor". Um caminho de produção que
+ * esquecesse o argumento ignorava a camada independente **sem erro nenhum**: a interseção do
+ * plano voltava a ter duas condições, e nada acusava. Obrigar o parâmetro transforma esse
+ * esquecimento em erro de tipo (na compilação) e em erro de execução (se o valor chegar nulo por
+ * uma fronteira de dados).
+ *
+ * @throws Error quando a política não é fornecida ou não satisfaz o contrato mínimo. A validação
+ *   é repetida aqui — e não apenas em `defineDelegationPolicy` — porque este pacote não pode
+ *   importar de `apps/server`, e um objeto forjado pode chegar sem passar pelo construtor.
  */
 export function effectiveDelegationTargets(
   profile: AssistantProfile,
   registry: AssistantProfileRegistry,
-  policy?: DelegationTargetPolicy,
+  policy: DelegationTargetPolicy,
 ): readonly string[] {
+  // A checagem de contrato vem antes de qualquer leitura: uma política inválida não pode
+  // influenciar a lista nem por acidente. Vale também para objetos que escaparam do
+  // `defineDelegationPolicy` do servidor.
+  assertDelegationTargetPolicy(policy);
+
   if (profile.status !== "active") return [];
   if (!profile.coordination.canCoordinate) return [];
 
-  const cap = policy?.maxTargetsPerCoordinator ?? Number.POSITIVE_INFINITY;
-
   const allowed: string[] = [];
   for (const key of profile.coordination.delegateTo ?? []) {
-    if (allowed.length >= cap) break;
+    if (allowed.length >= policy.maxTargetsPerCoordinator) break;
 
     const target = registry.getByKey(key);
     if (!target) continue;
     if (target.status !== "active") continue;
-    if (policy && !policy.allowsTarget({ coordinator: profile, target })) continue;
+    if (!policy.allowsTarget({ coordinator: profile, target })) continue;
 
     allowed.push(key);
   }
 
   return allowed;
+}
+
+/**
+ * Contrato mínimo de uma política, validado no ponto de uso.
+ *
+ * Existe separado de `defineDelegationPolicy` (no servidor) porque o pacote de perfis precisa
+ * poder recusar sozinho uma política malformada: ele é a fronteira por onde todo alvo passa, e
+ * aceitar um `maxTargetsPerCoordinator` inválido aqui reintroduziria exatamente o defeito que o
+ * endurecimento fecha.
+ */
+function assertDelegationTargetPolicy(policy: DelegationTargetPolicy): void {
+  if (policy === null || policy === undefined || typeof policy !== "object") {
+    throw new Error("A delegation policy is required to compute effective delegation targets");
+  }
+  if (typeof policy.allowsTarget !== "function") {
+    throw new Error("Delegation policy 'allowsTarget' must be a function");
+  }
+  const cap = policy.maxTargetsPerCoordinator;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || !Number.isInteger(cap) || cap <= 0) {
+    throw new Error(
+      `Delegation policy 'maxTargetsPerCoordinator' must be a finite positive integer; received ${String(cap)}`,
+    );
+  }
 }
 
 /**
