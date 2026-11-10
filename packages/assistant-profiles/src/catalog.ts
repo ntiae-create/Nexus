@@ -75,6 +75,11 @@ const profiles = assistantProfileCatalogSchema.parse([
       ],
       profileSchemaVersion: 1,
     },
+    coordination: {
+      // Fase 3 (G2): YUI é a coordenadora. Os alvos são dado do perfil, não lista no servidor.
+      canCoordinate: true,
+      delegateTo: ["alice", "schwi"],
+    },
   },
   {
     id: "00000000-0000-4000-8000-000000000002",
@@ -120,6 +125,10 @@ const profiles = assistantProfileCatalogSchema.parse([
       ],
       profileSchemaVersion: 1,
     },
+    coordination: {
+      // Folha: ALICE executa o próprio trabalho e nunca inicia delegação.
+      canCoordinate: false,
+    },
   },
   {
     id: "00000000-0000-4000-8000-000000000003",
@@ -164,6 +173,10 @@ const profiles = assistantProfileCatalogSchema.parse([
         "Declare limites e incertezas; não afirme execução de ferramenta sem confirmação do backend.",
       ],
       profileSchemaVersion: 1,
+    },
+    coordination: {
+      // Folha: SCHWI executa o próprio trabalho e nunca inicia delegação.
+      canCoordinate: false,
     },
   },
 ]);

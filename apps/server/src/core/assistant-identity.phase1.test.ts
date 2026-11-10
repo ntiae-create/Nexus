@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
+import { CANONICAL_PROFILE_REGISTRY,
   getAssistantProfileByKey,
   listAssistantProfiles,
   type AssistantProfile,
@@ -11,6 +11,7 @@ import {
   initialAssistantKeySchema,
 } from "@nexus/shared";
 import { canDelegate, delegationTargetsFor, validateDelegationPlan } from "./delegation.js";
+import { SERVER_DELEGATION_POLICY } from "./delegation-policy.js";
 import { CoreExecutionError } from "./errors.js";
 import { assistantKeyOf, resolveCanonicalAssistantProfile } from "./instructions.js";
 
@@ -146,19 +147,19 @@ describe("Fase 1 — fronteira de escopo: delegação intacta (Fase 3)", () => {
   it("a política de delegação continua exatamente a mesma", () => {
     // Fase 1 muda o TIPO da chave, não a política. Derivar DELEGATION_TARGETS dos perfis é
     // Fase 3 (G2); este teste congela a política atual para provar que não avançamos.
-    expect([...delegationTargetsFor("yui")]).toEqual(["alice", "schwi"]);
-    expect(delegationTargetsFor("alice")).toEqual([]);
-    expect(delegationTargetsFor("schwi")).toEqual([]);
-    expect(canDelegate("yui")).toBe(true);
-    expect(canDelegate("alice")).toBe(false);
-    expect(canDelegate("schwi")).toBe(false);
+    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual(["alice", "schwi"]);
+    expect(delegationTargetsFor("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(delegationTargetsFor("schwi", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
+    expect(canDelegate("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
+    expect(canDelegate("schwi", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
   });
 
   it("um identificador fora do catálogo não delega e não quebra", () => {
     // O tipo passou a aceitar a chave; a política responde com "nenhum alvo". Antes do tipo
     // novo, esta chamada nem poderia ser escrita.
-    expect(delegationTargetsFor(UNREGISTERED_KEY)).toEqual([]);
-    expect(canDelegate(UNREGISTERED_KEY)).toBe(false);
+    expect(delegationTargetsFor(UNREGISTERED_KEY, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(canDelegate(UNREGISTERED_KEY, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
   });
 
   it("delegar para um identificador fora do catálogo é recusado pela política", () => {
@@ -168,6 +169,8 @@ describe("Fase 1 — fronteira de escopo: delegação intacta (Fase 3)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: { maxDelegationDepth: 1, maxDelegationsPerExecution: 3, maxTotalDelegations: 6 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(error).toBeInstanceOf(CoreExecutionError);
@@ -185,6 +188,8 @@ describe("Fase 1 — fronteira de escopo: delegação intacta (Fase 3)", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     ).not.toThrow();
   });

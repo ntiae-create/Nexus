@@ -1,3 +1,4 @@
+import { CANONICAL_PROFILE_REGISTRY } from "@nexus/assistant-profiles";
 import { describe, expect, it } from "vitest";
 import { COORDINATION_ENVELOPE_KIND } from "@nexus/shared";
 import {
@@ -9,6 +10,7 @@ import {
   flattenDelegationPlan,
   validateDelegationPlan,
 } from "./delegation.js";
+import { SERVER_DELEGATION_POLICY } from "./delegation-policy.js";
 import { CoreExecutionError } from "./errors.js";
 import { buildAssistantSystemInstructions, resolveCanonicalAssistantProfile } from "./instructions.js";
 
@@ -30,11 +32,11 @@ function planError(fn: () => void): CoreExecutionError {
 
 describe("NEXUS CORE delegation policy", () => {
   it("only authorizes YUI as coordinator of ALICE and SCHWI", () => {
-    expect(canDelegate("yui")).toBe(true);
-    expect(canDelegate("alice")).toBe(false);
-    expect(canDelegate("schwi")).toBe(false);
-    expect(delegationTargetsFor("yui")).toEqual(["alice", "schwi"]);
-    expect(delegationTargetsFor("alice")).toEqual([]);
+    expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
+    expect(canDelegate("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
+    expect(canDelegate("schwi", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
+    expect(delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual(["alice", "schwi"]);
+    expect(delegationTargetsFor("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
   });
 
   it("accepts a valid plan and flattens nested sub-delegations with depth", () => {
@@ -43,7 +45,9 @@ describe("NEXUS CORE delegation policy", () => {
       chainKeys: ["yui"],
       baseDepth: 0,
       limits,
-    });
+    
+        policy: SERVER_DELEGATION_POLICY,
+      });
 
     const flattened = flattenDelegationPlan(
       [
@@ -68,6 +72,8 @@ describe("NEXUS CORE delegation policy", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(cycle.code).toBe("DELEGATION_CYCLE_DETECTED");
@@ -79,6 +85,8 @@ describe("NEXUS CORE delegation policy", () => {
         chainKeys: ["yui", "alice", "schwi"],
         baseDepth: 0,
         limits,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(deepCycle.code).toBe("DELEGATION_CYCLE_DETECTED");
@@ -103,6 +111,8 @@ describe("NEXUS CORE delegation policy", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(error.code).toBe("DELEGATION_DEPTH_EXCEEDED");
@@ -119,6 +129,8 @@ describe("NEXUS CORE delegation policy", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: { ...limits, maxDelegationsPerExecution: 1 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(perExecution.code).toBe("DELEGATION_LIMIT_EXCEEDED");
@@ -132,6 +144,8 @@ describe("NEXUS CORE delegation policy", () => {
         chainKeys: ["yui"],
         baseDepth: 0,
         limits: { ...limits, maxTotalDelegations: 1 },
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(global.code).toBe("DELEGATION_LIMIT_EXCEEDED");
@@ -144,6 +158,8 @@ describe("NEXUS CORE delegation policy", () => {
         chainKeys: ["alice"],
         baseDepth: 0,
         limits,
+      
+        policy: SERVER_DELEGATION_POLICY,
       }),
     );
     expect(error.code).toBe("DELEGATION_NOT_ALLOWED");
