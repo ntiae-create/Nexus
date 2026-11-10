@@ -369,6 +369,71 @@ describe("Fase 3 — as sete garantias obrigatórias (ponto 3)", () => {
     ).toBeInstanceOf(Error);
   });
 
+  it("o contrato no ponto de uso valida `id`, não só função e teto", () => {
+    // Defeito encontrado na auditoria de revisão: `assertDelegationTargetPolicy` validava
+    // `allowsTarget` e `maxTargetsPerCoordinator`, mas **não** `id`. Uma política forjada com
+    // `id` vazio — ou de tipo inválido — e função/teto corretos atravessava a projeção inteira.
+    //
+    // Por que isso importa: `id` existe para diagnosticar qual política agiu. Um `id` inválido
+    // não quebra nada visivelmente, então o erro apareceria longe da causa, num log sem
+    // identificação. É o mesmo padrão de falha silenciosa dos outros campos.
+    const yui = CANONICAL_PROFILE_REGISTRY.getByKey("yui")!;
+
+    const forgedIds: readonly unknown[] = ["", "   ", "\t\n  ", null, 42];
+
+    for (const badId of forgedIds) {
+      const forged = {
+        id: badId,
+        maxTargetsPerCoordinator: 10,
+        allowsTarget: () => true,
+      } as unknown as DelegationPolicy;
+
+      const error = captureError(() =>
+        effectiveDelegationTargets(yui, CANONICAL_PROFILE_REGISTRY, forged),
+      );
+
+      // Não basta "lançou": um `TypeError` incidental de chamar algo inexistente também lança.
+      // O teste exige erro de **contrato**, com mensagem que nomeia o campo.
+      expect(error, `id forjado não rejeitado: ${JSON.stringify(badId)}`).toBeInstanceOf(Error);
+      expect((error as Error).name, `erro incidental para id ${JSON.stringify(badId)}`).not.toBe(
+        "TypeError",
+      );
+      expect((error as Error).message).toContain("id");
+    }
+  });
+
+  it("a rejeição de `id` inválido ocorre antes de consultar o registro", () => {
+    // Ordem exigida: o contrato é verificado antes de qualquer consulta ou avaliação de alvo.
+    // Prova por observação: um registro que explode ao ser lido não pode ser tocado.
+    const yui = CANONICAL_PROFILE_REGISTRY.getByKey("yui")!;
+    let registryTouched = false;
+    const tripwire = {
+      list: () => {
+        registryTouched = true;
+        return [];
+      },
+      getByKey: () => {
+        registryTouched = true;
+        return yui;
+      },
+      getById: () => {
+        registryTouched = true;
+        return undefined;
+      },
+    };
+
+    const forged = {
+      id: "",
+      maxTargetsPerCoordinator: 10,
+      allowsTarget: () => true,
+    } as unknown as DelegationPolicy;
+
+    expect(captureError(() => effectiveDelegationTargets(yui, tripwire, forged))).toBeInstanceOf(
+      Error,
+    );
+    expect(registryTouched, "o registro foi consultado antes da validação do contrato").toBe(false);
+  });
+
   it("6. prompt e validação usam a mesma política", () => {
     // A propriedade que fecha a divergência original: dada a mesma política, a lista apresentada
     // ao coordenador e a lista aceita pela validação coincidem exatamente.

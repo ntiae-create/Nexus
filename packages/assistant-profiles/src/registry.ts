@@ -107,10 +107,21 @@ export function effectiveDelegationTargets(
  * poder recusar sozinho uma política malformada: ele é a fronteira por onde todo alvo passa, e
  * aceitar um `maxTargetsPerCoordinator` inválido aqui reintroduziria exatamente o defeito que o
  * endurecimento fecha.
+ *
+ * O contrato é **integral**: os três campos (`id`, `allowsTarget`, `maxTargetsPerCoordinator`)
+ * são verificados, e a verificação vem antes de qualquer leitura do registro. Validar apenas
+ * parte do contrato é pior que não validar, porque dá a impressão de que a política foi checada.
  */
 function assertDelegationTargetPolicy(policy: DelegationTargetPolicy): void {
   if (policy === null || policy === undefined || typeof policy !== "object") {
     throw new Error("A delegation policy is required to compute effective delegation targets");
+  }
+  // `id` primeiro, e antes de qualquer consulta ao registro: é o identificador que dá sentido a
+  // qualquer diagnóstico posterior. Um `id` vazio não quebra nada visivelmente — a política
+  // funciona igual —, então o erro só apareceria muito depois, num log sem identificação. É o
+  // mesmo padrão de falha silenciosa de `NaN` no teto e de `allowsTarget` que não é função.
+  if (typeof policy.id !== "string" || policy.id.trim().length === 0) {
+    throw new Error("Delegation policy 'id' must be a non-empty string");
   }
   if (typeof policy.allowsTarget !== "function") {
     throw new Error("Delegation policy 'allowsTarget' must be a function");
