@@ -41,7 +41,7 @@ import { buildExecutionContext, renderMessagePartsToText } from "./context-build
 import {
   buildDelegationUserPrompt,
   buildSynthesisUserPrompt,
-  canDelegate,
+  delegationTargetsFor,
   extractCoordinatorDecision,
   validateDelegationPlan,
 } from "./delegation.js";
@@ -905,12 +905,16 @@ export class NexusCoreEngine {
       const currentUserContent = renderMessagePartsToText(inputMessage.content);
 
       const profileKey = assistantKeyOf(profile);
-      const coordinator = canDelegate(profileKey);
+      // Fase 3 (G2): o prompt do coordenador recebe a **mesma** lista que a validação usa.
+      // Antes desta fase este ponto tinha `["alice", "schwi"]` escrito à mão, uma segunda cópia
+      // da política que `validateDelegationPlan` consultava em outro arquivo. As duas podiam
+      // divergir sem que nada falhasse — e a quarta assistente só apareceria na validação, nunca
+      // no prompt (ou o contrário).
+      const canDelegateTo = delegationTargetsFor(profileKey);
+      const coordinator = canDelegateTo.length > 0;
       const instructions = buildAssistantSystemInstructions(profile, {
         mode: coordinator ? "coordinator_planning" : "direct",
-        ...(coordinator
-          ? { canDelegateTo: ["alice", "schwi"] as const }
-          : {}),
+        ...(coordinator ? { canDelegateTo } : {}),
       });
 
       const context = buildExecutionContext({

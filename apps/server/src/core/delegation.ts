@@ -1,41 +1,86 @@
-import type { AssistantProfile } from "@nexus/assistant-profiles";
+import {
+  CANONICAL_PROFILE_REGISTRY,
+  effectiveDelegationTargets,
+  type AssistantProfile,
+  type AssistantProfileRegistry,
+} from "@nexus/assistant-profiles";
 import {
   COORDINATION_ENVELOPE_KIND,
   coordinatorDecisionEnvelopeSchema,
   type AssistantKey,
   type DelegationTaskSpec,
-  type InitialAssistantKey,
 } from "@nexus/shared";
 import { CoreExecutionError } from "./errors.js";
 
 /**
- * Explicit, catalog-driven delegation policy.
+ * Delegation policy, derived from the profile registry.
  *
- * Only YUI holds the coordinator role in Etapa 3B. ALICE and SCHWI are leaves:
- * they never self-initiate delegation and never receive authority to reinterpret
- * another assistant's instructions.
+ * Etapa 3C.3, Fase 3 (G2): until this phase the policy was a literal map in this file —
+ * `{ yui: ["alice","schwi"], alice: [], schwi: [] }` — and `engine.ts` kept a second copy of the
+ * same list to build the coordinator prompt. Two sources of truth for one rule meant a fourth
+ * assistant could never take part in coordination without editing production code in two places.
+ *
+ * Now the rule is **data**: each profile declares `coordination`, and this module only projects
+ * it. There is no list of assistants here to add a key to.
+ *
+ * The exported record is kept for compatibility (it is public since Etapa 3B and callers read
+ * `DELEGATION_TARGETS.yui`), but it is computed from the registry rather than written by hand.
+ * It is intentionally **sealed**: `Object.freeze` on a record produced at module load means a
+ * later catalog cannot mutate it, and tests that need another composition call
+ * `delegationTargetsFor(key, registry)` explicitly.
  */
-export const DELEGATION_TARGETS: Readonly<
-  Record<InitialAssistantKey, readonly InitialAssistantKey[]>
-> = Object.freeze({
-  yui: Object.freeze(["alice", "schwi"] as const),
-  alice: Object.freeze([] as const),
-  schwi: Object.freeze([] as const),
-});
-
-export const COORDINATOR_ASSISTANT_KEY: InitialAssistantKey = "yui";
-
-/**
- * Fase 1: the *policy* is still the frozen three-key map (deriving it from the profile registry
- * is Fase 3 / G2), but the functions accept any valid identifier so that an assistant outside the
- * initial catalog can ask the question and get a truthful "no targets" instead of a crash.
- */
-export function delegationTargetsFor(key: AssistantKey): readonly InitialAssistantKey[] {
-  return DELEGATION_TARGETS[key as InitialAssistantKey] ?? [];
+function snapshotDelegationTargets(
+  registry: AssistantProfileRegistry,
+): Readonly<Record<string, readonly string[]>> {
+  const entries = registry
+    .list()
+    .map((profile) => [profile.key, Object.freeze([...effectiveDelegationTargets(profile, registry)])] as const);
+  return Object.freeze(Object.fromEntries(entries));
 }
 
-export function canDelegate(key: AssistantKey): boolean {
-  return delegationTargetsFor(key).length > 0;
+/**
+ * Policy snapshot of the production catalog.
+ *
+ * Keys are assistant keys, not `InitialAssistantKey`: a fourth assistant appears here as soon as
+ * it declares coordination, without widening a closed enum in a contract.
+ */
+export const DELEGATION_TARGETS: Readonly<Record<string, readonly AssistantKey[]>> =
+  snapshotDelegationTargets(CANONICAL_PROFILE_REGISTRY);
+
+/**
+ * Kept for compatibility. No longer the *authority*: it is derived from the profile that declares
+ * coordination, and is `null` if the catalog ever has no coordinator. Callers that branch on a
+ * coordinator existing must handle that case instead of assuming YUI.
+ */
+export const COORDINATOR_ASSISTANT_KEY: AssistantKey | undefined =
+  (Object.entries(DELEGATION_TARGETS).find(([, targets]) => targets.length > 0)?.[0] as
+    | AssistantKey
+    | undefined) ?? undefined;
+
+/**
+ * Effective delegation targets for an assistant.
+ *
+ * Fase 1 generalized the *type* so an assistant outside the initial catalog could ask the
+ * question and get a truthful "no targets". Fase 3 generalizes the *source*: the answer comes
+ * from the profile, through the registry, so a profile declared only in a test is answered just
+ * as truthfully as YUI.
+ *
+ * @param registry Omitted -> the sealed production registry.
+ */
+export function delegationTargetsFor(
+  key: AssistantKey,
+  registry: AssistantProfileRegistry = CANONICAL_PROFILE_REGISTRY,
+): readonly AssistantKey[] {
+  const profile = registry.getByKey(key);
+  if (!profile) return [];
+  return effectiveDelegationTargets(profile, registry) as readonly AssistantKey[];
+}
+
+export function canDelegate(
+  key: AssistantKey,
+  registry: AssistantProfileRegistry = CANONICAL_PROFILE_REGISTRY,
+): boolean {
+  return delegationTargetsFor(key, registry).length > 0;
 }
 
 export interface DelegationPlanNode {
@@ -56,6 +101,14 @@ export interface ValidateDelegationPlanInput {
   /** Delegation depth of the run that owns this plan. */
   readonly baseDepth: number;
   readonly limits: DelegationLimits;
+  /**
+   * Registro de perfis usado para autorizar os alvos.
+   *
+   * Omitido -> o registro de produção selado. Existe para que um teste componha um catálogo
+   * isolado (uma quarta assistente, por exemplo) e prove que a política é dado, sem que a
+   * produção precise conhecer essa chave.
+   */
+  readonly registry?: AssistantProfileRegistry;
 }
 
 /** Flattens the structured plan (including nested sub-delegations) deterministically. */
@@ -85,6 +138,7 @@ export function flattenDelegationPlan(
  */
 export function validateDelegationPlan(input: ValidateDelegationPlanInput): void {
   const { specs, chainKeys, baseDepth, limits } = input;
+  const registry = input.registry ?? CANONICAL_PROFILE_REGISTRY;
   const owner = chainKeys[chainKeys.length - 1];
 
   if (!owner) {
@@ -132,8 +186,8 @@ export function validateDelegationPlan(input: ValidateDelegationPlanInput): void
 
     // 3. Authorization: only catalog-authorized coordinator targets are accepted.
     // O alvo pode ser qualquer identificador válido (Fase 1); quem decide se ele é autorizado
-    // continua sendo o mapa de política, por comparação de chave.
-    const allowedTargets = delegationTargetsFor(owner);
+    // é o **perfil do coordenador** (Fase 3), projetado pelo registro — não uma lista aqui.
+    const allowedTargets = delegationTargetsFor(owner, registry);
     if (!allowedTargets.some((allowed) => allowed === target)) {
       throw new CoreExecutionError(
         "DELEGATION_NOT_ALLOWED",

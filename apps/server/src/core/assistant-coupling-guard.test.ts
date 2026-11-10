@@ -448,22 +448,6 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     removedIn: "Fase 1",
   },
   {
-    file: "apps/server/src/core/delegation.ts",
-    // O analisador encontra a lista de ALVOS (`yui: ["alice","schwi"]`), não as chaves do mapa:
-    // é essa lista que precisa deixar de existir para a quarta assistente entrar em coordenação.
-    keys: ["alice", "schwi"],
-    pattern: "list",
-    reason: "mapa estático de alvos de delegação — resolvido por dados (G2)",
-    removedIn: "Fase 3",
-  },
-  {
-    file: "apps/server/src/core/engine.ts",
-    keys: ["alice", "schwi"],
-    pattern: "list",
-    reason: "duplica a lista de alvos ao montar o prompt do coordenador (G2)",
-    removedIn: "Fase 3",
-  },
-  {
     file: "packages/assistant-profiles/src/catalog.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "catalog",
@@ -471,6 +455,17 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     reason: "catálogo canônico dos perfis — é a fonte de verdade, não uma cópia",
     // Não é remoção: quando `InitialAssistantKey` for generalizado (Fase 1), o catálogo
     // continua sendo o catálogo. Marcar uma fase aqui prometeria uma remoção que não acontece.
+    removedIn: "permanente",
+  },
+  {
+    file: "packages/assistant-profiles/src/catalog.ts",
+    // O `delegateTo: ["alice", "schwi"]` do perfil da YUI. O guard o vê como lista literal, e
+    // ele **é** uma lista literal — mas da política declarada na fonte de verdade, que é
+    // exatamente onde a Fase 3 (G2) mandou que ela vivesse. Declarar aqui é o oposto de
+    // duplicar: é o único lugar do repositório onde os alvos são nomeados.
+    keys: ["alice", "schwi"],
+    pattern: "list",
+    reason: "política de coordenação declarada no perfil canônico — a fonte de verdade (G2)",
     removedIn: "permanente",
   },
 ];
@@ -886,11 +881,16 @@ describe("Fase 2 — duplicata dentro de um arquivo real do inventário", () => 
     // O caminho escrito é relativo à raiz varrida (`catalog.ts`), como faz a varredura real;
     // por isso a assinatura é montada com o nome relativo, e não com o caminho do repositório.
     const path = join(root, "catalog.ts");
-    const canonical = ALLOWED_OCCURRENCES.find((entry) => entry.file === file);
-    expect(canonical, `ocorrência canônica de ${file}`).toBeDefined();
-    const allowed = new Set([
-      signatureOf("catalog.ts", canonical!.keys, canonical!.pattern, canonical!.anchor),
-    ]);
+    // O catálogo canônico tem DUAS ocorrências legítimas desde a Fase 3: a identidade dos perfis
+    // (`catalog`) e a política de coordenação declarada (`list` em `delegateTo`). O teste precisa
+    // liberar as duas — senão acusaria a própria fonte de verdade.
+    const canonical = ALLOWED_OCCURRENCES.filter((entry) => entry.file === file);
+    expect(canonical.length, `ocorrências canônicas de ${file}`).toBeGreaterThanOrEqual(2);
+    const allowed = new Set(
+      canonical.map((entry) =>
+        signatureOf("catalog.ts", entry.keys, entry.pattern, entry.anchor),
+      ),
+    );
     try {
       writeFileSync(path, real, "utf8");
       expect(findUndeclaredCoupling([path], root, allowed), "arquivo real").toEqual([]);
@@ -1244,10 +1244,14 @@ describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
   });
 
   it("só a fonte de verdade pode ser marcada como permanente", () => {
+    // Fase 3: a fonte de verdade declara duas coisas — a identidade dos perfis (`catalog`) e a
+    // política de coordenação (`delegateTo`). Ambas são permanentes porque ambas **são** o dado;
+    // nenhum outro arquivo pode reivindicar permanência para uma cópia.
     const permanent = ALLOWED_OCCURRENCES.filter((entry) => entry.removedIn === "permanente");
-    expect(permanent.map((entry) => entry.file)).toEqual([
-      "packages/assistant-profiles/src/catalog.ts",
-    ]);
+    expect(new Set(permanent.map((entry) => entry.file))).toEqual(
+      new Set(["packages/assistant-profiles/src/catalog.ts"]),
+    );
+    expect(permanent).toHaveLength(2);
   });
 
   it("o inventário não cresce silenciosamente: tamanho é explícito", () => {
@@ -1257,8 +1261,12 @@ describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
     //   Fase 2: 4 — G4 serviu `routes/assistants.ts` do registro; G6 unificou o mobile
     //               (`lib/assistants.ts` derivado dos perfis, `config.ts` e a união de
     //               `core-service.ts` eliminados)
+    //   Fase 3: 3 — G2 removeu as DUAS cópias da política de delegação (`delegation.ts` e
+    //               `engine.ts`) e acrescentou UMA ocorrência na fonte de verdade
+    //               (`delegateTo` do perfil da YUI). Saldo -1: a política passou a existir
+    //               em um lugar só.
     // O número é explícito para que toda saída e entrada exija revisão consciente.
-    expect(ALLOWED_OCCURRENCES).toHaveLength(4);
+    expect(ALLOWED_OCCURRENCES).toHaveLength(3);
   });
 
   it("toda ocorrência de catálogo declara o container que a identifica", () => {
