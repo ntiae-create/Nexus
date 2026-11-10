@@ -1,4 +1,5 @@
 import {
+  assistantKeySchema,
   coreExecutionRequestSchema,
   createConversationSchema,
   sendMessageSchema,
@@ -35,7 +36,9 @@ const appendMessageBodySchema = z
     /** When true (default) the message starts a NEXUS CORE execution. */
     execute: z.boolean().optional(),
     assistantId: sendMessageSchema.shape.assistantId,
-    assistantKey: z.enum(["yui", "alice", "schwi"]).optional(),
+    // Fase 1 (G5): o identificador vem do schema compartilhado. Um enum local redefinia o
+    // domínio de chaves na rota e voltaria a fechá-lo a cada assistente novo.
+    assistantKey: assistantKeySchema.optional(),
   })
   .strict();
 

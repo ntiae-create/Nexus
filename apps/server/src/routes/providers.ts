@@ -3,7 +3,7 @@ import {
   getAssistantProfileByKey,
 } from "@nexus/assistant-profiles";
 import {
-  initialAssistantKeySchema,
+  assistantKeySchema,
   modelCapabilitySchema,
   modelParameterNameSchema,
   uuidSchema,
@@ -187,7 +187,10 @@ function resolveCanonicalAssistantId(rawAssistantRef: string): string {
     return profile.id;
   }
 
-  const keyParsed = initialAssistantKeySchema.safeParse(
+  // Fase 1 (G3): mesma regra do CORE — o formato é validado pelo schema compartilhado e a
+  // existência é decidida pelo registro. Chave bem formada de assistente inexistente continua
+  // resultando em ASSISTANT_NOT_FOUND.
+  const keyParsed = assistantKeySchema.safeParse(
     rawAssistantRef.toLowerCase(),
   );
   if (keyParsed.success) {

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { jsonObjectSchema, nonEmptyStringSchema, schemaVersionSchema, timestampSchema, uuidSchema } from "./common.js";
 import { normalizedDataSchema, toolEventMetadataSchema } from "./jsonb.js";
-import { assistantReferenceSchema, initialAssistantKeySchema } from "./assistants.js";
+import { assistantKeySchema, assistantReferenceSchema, type AssistantKey } from "./assistants.js";
 import { userIdSchema } from "./identity.js";
 import { messageContentPartSchema, messageSchema } from "./messages.js";
 import { selectionScopeSchema } from "./preferences.js";
@@ -144,7 +144,12 @@ export const runResultsSchema = z.object({
 });
 
 export interface DelegationTaskSpec {
-  targetAssistant: z.infer<typeof initialAssistantKeySchema>;
+  /**
+   * Identifier of the assistant that receives the task. `AssistantKey`, not the frozen enum:
+   * which assistants may actually be delegated to is a policy decision (Fase 3 derives it from
+   * the profile registry), not a property of the identifier format.
+   */
+  targetAssistant: AssistantKey;
   objective: string;
   contextNotes?: string;
   inputReferenceIds?: string[];
@@ -154,7 +159,7 @@ export interface DelegationTaskSpec {
 
 export const delegationTaskSpecSchema: z.ZodType<DelegationTaskSpec> = z.lazy(() =>
   z.object({
-    targetAssistant: initialAssistantKeySchema,
+    targetAssistant: assistantKeySchema,
     objective: nonEmptyStringSchema.max(2_000),
     contextNotes: nonEmptyStringSchema.max(4_000).optional(),
     inputReferenceIds: z.array(uuidSchema).max(50).optional(),
@@ -199,7 +204,7 @@ export const coreExecutionRequestSchema = z.object({
   requestId: uuidSchema,
   idempotencyKey: nonEmptyStringSchema.max(140),
   assistantId: uuidSchema.optional(),
-  assistantKey: initialAssistantKeySchema.optional(),
+  assistantKey: assistantKeySchema.optional(),
   delegations: z.array(delegationTaskSpecSchema).min(1).max(10).optional(),
   parameters: generationParametersSchema.optional(),
   timeoutMs: z.number().int().min(100).max(120_000).optional(),

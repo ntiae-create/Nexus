@@ -464,13 +464,6 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     removedIn: "Fase 3",
   },
   {
-    file: "apps/server/src/routes/core.ts",
-    keys: ["yui", "alice", "schwi"],
-    pattern: "list",
-    reason: "redefine o domínio de chaves na rota em vez de reutilizar o schema (G1)",
-    removedIn: "Fase 1",
-  },
-  {
     file: "apps/mobile/src/services/core-service.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "list",
@@ -1233,7 +1226,10 @@ describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
   });
 
   it("o inventário não cresce silenciosamente: tamanho é explícito", () => {
-    expect(ALLOWED_OCCURRENCES).toHaveLength(9);
+    // Fase 1 resolveu G5: `routes/core.ts` passou a usar `assistantKeySchema` compartilhado,
+    // então a ocorrência saiu do inventário (9 -> 8). O número é explícito justamente para que
+    // saídas e entradas exijam revisão consciente.
+    expect(ALLOWED_OCCURRENCES).toHaveLength(8);
   });
 
   it("toda ocorrência de catálogo declara o container que a identifica", () => {

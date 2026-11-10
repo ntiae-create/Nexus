@@ -5,8 +5,9 @@ import {
 } from "@nexus/assistant-profiles";
 import {
   COORDINATION_ENVELOPE_KIND,
-  initialAssistantKeySchema,
+  assistantKeySchema,
   uuidSchema,
+  type AssistantKey,
   type AssistantReference,
   type InitialAssistantKey,
 } from "@nexus/shared";
@@ -20,9 +21,20 @@ export type InstructionPromptMode =
 
 export interface BuildSystemInstructionsOptions {
   readonly mode: InstructionPromptMode;
-  readonly canDelegateTo?: readonly InitialAssistantKey[];
+  readonly canDelegateTo?: readonly AssistantKey[];
 }
 
+/**
+ * Resolves an assistant profile from its identifier.
+ *
+ * Validation is against the **registry**, not against the frozen enum: the key is first checked
+ * for *format* (`assistantKeySchema`) and then looked up in the canonical profile catalog. A
+ * well-formed key of an assistant that does not exist is `ASSISTANT_NOT_FOUND`, exactly like a
+ * malformed one — the observable behaviour is unchanged, but the reason is now "not registered"
+ * instead of "not one of three literals".
+ *
+ * The id↔key coherence check remains: both identifiers must resolve to the same profile.
+ */
 export function resolveCanonicalAssistantProfile(input: {
   readonly assistantId?: string;
   readonly assistantKey?: string;
@@ -30,7 +42,7 @@ export function resolveCanonicalAssistantProfile(input: {
   if (input.assistantId && input.assistantKey) {
     const parsedUuid = uuidSchema.safeParse(input.assistantId);
     const byId = parsedUuid.success ? getAssistantProfileById(parsedUuid.data) : undefined;
-    const parsedKey = initialAssistantKeySchema.safeParse(input.assistantKey.toLowerCase());
+    const parsedKey = assistantKeySchema.safeParse(input.assistantKey.toLowerCase());
     const byKey = parsedKey.success ? getAssistantProfileByKey(parsedKey.data) : undefined;
     if (!byId || !byKey || byId.id !== byKey.id) {
       throw new CoreExecutionError(
@@ -54,7 +66,7 @@ export function resolveCanonicalAssistantProfile(input: {
   }
 
   if (input.assistantKey) {
-    const parsedKey = initialAssistantKeySchema.safeParse(input.assistantKey.toLowerCase());
+    const parsedKey = assistantKeySchema.safeParse(input.assistantKey.toLowerCase());
     const profile = parsedKey.success ? getAssistantProfileByKey(parsedKey.data) : undefined;
     if (!profile) {
       throw new CoreExecutionError(
@@ -72,15 +84,30 @@ export function resolveCanonicalAssistantProfile(input: {
 }
 
 /**
- * Narrows a frozen profile key to the canonical assistant key union.
- * Throws when a profile outside the initial catalog is supplied.
+ * Returns the assistant key of a profile after validating it against the registry.
+ *
+ * Etapa 3C.3, Fase 1 (G1/G3): this used to narrow the key to the frozen three-literal enum, so
+ * any profile registered later threw `ASSISTANT_NOT_FOUND` here — the most direct blocker for a
+ * fourth assistant. The key is now validated for **format** and for **registration**: it must be
+ * well-formed and must resolve, by key, to the very profile that carries it.
+ *
+ * The rejection path is preserved for the case that actually matters — a profile object that
+ * claims a key no registered assistant owns — and it is still `ASSISTANT_NOT_FOUND`, so callers
+ * and error codes are unchanged.
  */
-export function assistantKeyOf(profile: AssistantProfile): InitialAssistantKey {
-  const parsed = initialAssistantKeySchema.safeParse(profile.key);
+export function assistantKeyOf(profile: AssistantProfile): AssistantKey {
+  const parsed = assistantKeySchema.safeParse(profile.key);
   if (!parsed.success) {
     throw new CoreExecutionError(
       "ASSISTANT_NOT_FOUND",
-      `Assistant key '${profile.key}' is not part of the initial catalog`,
+      `Assistant key '${profile.key}' is not a valid assistant identifier`,
+    );
+  }
+  const registered = getAssistantProfileByKey(parsed.data);
+  if (!registered || registered.id !== profile.id) {
+    throw new CoreExecutionError(
+      "ASSISTANT_NOT_FOUND",
+      `Assistant key '${profile.key}' does not resolve to a registered assistant profile`,
     );
   }
   return parsed.data;
