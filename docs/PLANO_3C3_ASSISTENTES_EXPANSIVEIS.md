@@ -281,7 +281,7 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
 | 3 | `apps/server/src/core/delegation.ts:17` | `Record<InitialAssistantKey, …>` literal | mapa fechado |
 | 4 | `apps/server/src/core/engine.ts:911` | `["alice","schwi"]` literal | duplica a regra 3 |
 | 5 | `apps/server/src/routes/core.ts:38` | `z.enum([...])` local | **redefine** o domínio na rota |
-| 6 | `apps/server/src/routes/assistants.ts:4` | array literal de 3 | **quarta cópia**, já divergente |
+| 6 | `apps/server/src/routes/assistants.ts:4` | array literal de 3 | **quarta cópia**, divergente; `registerAssistantRoutes` **não é chamada** por `buildApp` (L9) |
 | 7 | `apps/mobile/src/lib/config.ts:177` | array literal de 3 | rótulos/cores |
 | 8 | `apps/mobile/src/lib/assistants.ts:25` | array literal de 3 | espelho validado por texto |
 | 9 | `apps/mobile/src/services/core-service.ts:92` | união literal | tipo duplicado |
@@ -319,9 +319,32 @@ reaproveitável para jobs (§5.8), mas hoje aplicado apenas a `core_runs`.
 
 **Operacionais e de consistência**
 
-- **L9 (defeito conhecido, não comportamento a preservar).** `GET /v1/assistants` responde de um
-  array literal em `apps/server/src/routes/assistants.ts`, **independente** de
-  `packages/assistant-profiles`, e **já divergiu**:
+- **L9 (defeito conhecido, não comportamento a preservar).** A implementação de
+  `GET /v1/assistants` em `apps/server/src/routes/assistants.ts` mantém um array literal
+  **independente** de `packages/assistant-profiles`. A Fase 0 separa explicitamente o que foi
+  verificado do que não foi.
+
+  **Comprovado por inspeção do código-fonte:**
+
+  1. `registerAssistantRoutes` é **exportada** por `apps/server/src/routes/assistants.ts`, mas
+     **não é chamada** por `buildApp` (`apps/server/src/app.ts`) no estado analisado. A rota,
+     portanto, não participa da aplicação montada por essa função.
+  2. A implementação da rota contém um array **independente e divergente** do catálogo canônico —
+     os valores estão na tabela abaixo, conferidos campo a campo na fonte.
+
+  **Não comprovado nesta fase:** o status HTTP efetivamente retornado pelo endpoint em execução.
+  A Fase 0 não executou requisição HTTP contra a aplicação; não há teste de integração nem
+  observação de `404`. A inferência de que a ausência de registro resulta em `404` é plausível,
+  mas **não é evidência desta fase** e não deve ser citada como fato consumado.
+
+  **Planejado para a Fase 2:** conectar a rota e derivar seu payload do registro canônico, com
+  testes de integração e de paridade que comprovem o comportamento — inclusive o status — antes e
+  depois da correção.
+
+  Ambos os achados são **defeitos a corrigir na Fase 2**, não comportamentos a preservar. A Fase 0
+  apenas os registra aqui: **não existe teste automatizado sobre L9** — nem de caracterização,
+  nem de contrato. Um teste que exigisse "a rota continua fora do `buildApp`" ou "o payload
+  continua divergente" passaria a bloquear exatamente a correção.
 
   Valores conferidos no código:
 
@@ -432,8 +455,10 @@ packages/assistant-profiles/
 - `nexus.assistants` + `assistant_config_versions` passam a ser **espelho** sincronizado
   (`source: 'static_code'` hoje; `'managed_future'` se a edição em runtime for aprovada).
 - Teste de paridade obrigatório: perfis ⇄ seed SQL ⇄ `GET /v1/assistants` ⇄ catálogo móvel.
-- **`GET /v1/assistants` é correção de defeito**, não apenas refatoração: hoje responde de um
-  array divergente (L9).
+- **`GET /v1/assistants` é correção de defeito**, não apenas refatoração: a rota não é chamada
+  por `buildApp` no estado analisado e sua implementação atual diverge do catálogo canônico (L9).
+  O comportamento em execução — inclusive o status HTTP — não foi observado na Fase 0; a Fase 2
+  o comprova com testes de integração.
 
 ### 5.3 Especialidades e capacidades declarativas
 
@@ -1289,11 +1314,36 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
 - Testes de caracterização **somente** para comportamento desejado: projeção de perfil em
   `buildAssistantSystemInstructions`, ordem/limites de delegação, códigos de erro
   (`ASSISTANT_NOT_FOUND`, `DELEGATION_*`), política `free_only`.
-- **O defeito L9 não é congelado.** Nenhum teste desta fase pode afirmar o payload divergente de
-  `GET /v1/assistants`. O defeito é **documentado** (§2 L9, com a tabela de divergências) e
-  vira especificação de comportamento correto na Fase 2.
-- **Testes:** suíte atual verde (507 testes; 28 integrações PostgreSQL no workflow dedicado);
+- **O defeito L9 não é congelado — e não tem teste.** A Fase 0 **não** cria teste de
+  caracterização para L9: nenhum teste pode afirmar que a rota segue fora do `buildApp` ou que o
+  payload segue divergente, porque isso viraria bloqueio da própria correção. O defeito é
+  **documentado** (§2 L9, com a tabela de divergências) e vira especificação de comportamento
+  correto na Fase 2.
+- **Testes:** suíte atual verde (583 testes; 28 integrações PostgreSQL no workflow dedicado);
   guards de acoplamento; caracterização do comportamento intencional. Nenhum teste asserta bug.
+- **Como o guard identifica acoplamento.** Análise **estrutural com o parser do TypeScript**
+  (`typescript@5.9.3`, já devDependency de `apps/server`), não heurística de texto. Heurísticas
+  de tokenização foram descartadas após dois falsos negativos demonstrados: um `"]"` dentro de
+  string fechava o array antes da hora e a ocorrência **desaparecia** do inventário; e a âncora
+  era atribuída à última `const/let/var` do arquivo, mesmo quando a coleção pertencia a uma
+  propriedade de objeto ou a um `return`.
+  - **Listas** (`findCouplingGroups`): array literal, união de tipos e enum, com 2+ chaves
+    distintas.
+  - **Catálogos** (`findCatalogDeclarations`): coleções de objetos com propriedade
+    `key`/`assistantKey`, 2+ chaves distintas.
+  - **Identidade por ocorrência**: `padrão:arquivo::chaves@container`, onde o container é a
+    cadeia estrutural que possui a coleção (`CATALOGO`, `X.assistentes`, `listar()`,
+    `GRUPOS[0]`, `montar@CATALOGO`). Não usa número de linha: reformatar mantém a identidade,
+    renomear o container a invalida — mudança estrutural que merece revisão.
+  - **Âncora conservadora**: quando não há container nomeado (coleção como argumento de chamada,
+    expressão de nível superior), a âncora é explícita (`<argumento>`, `<expr>`), nunca uma
+    declaração vizinha.
+  - **Limitações residuais conhecidas:** (1) um arquivo com erro de sintaxe produz AST parcial —
+    nesse caso o scanner é conservador e pode deixar de ver uma ocorrência; `tsc --noEmit` cobre
+    o caso no CI. (2) padrões de catálogo montados em tempo de execução (`map`, spread de
+    variável, `Object.fromEntries`) não são literais e não entram no inventário por construção.
+    (3) o guard detecta **duplicação estrutural**, não paridade de valores — divergência de
+    conteúdo entre cópias é matéria da Fase 2.
 
 ### Fase 1 — Separar identificador de catálogo (G1, G3)
 
