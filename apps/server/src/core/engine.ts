@@ -910,6 +910,11 @@ export class NexusCoreEngine {
       // da política que `validateDelegationPlan` consultava em outro arquivo. As duas podiam
       // divergir sem que nada falhasse — e a quarta assistente só apareceria na validação, nunca
       // no prompt (ou o contrário).
+      //
+      // Ambos os lados usam a política de servidor padrão (`SERVER_DELEGATION_POLICY`) e o
+      // registro canônico selado, porque é produção. Se um dia o engine passar uma política
+      // própria, `validateDelegationPlan` precisa receber a **mesma** — o contrato de
+      // `ValidateDelegationPlanInput.policy` existe para isso.
       const canDelegateTo = delegationTargetsFor(profileKey);
       const coordinator = canDelegateTo.length > 0;
       const instructions = buildAssistantSystemInstructions(profile, {

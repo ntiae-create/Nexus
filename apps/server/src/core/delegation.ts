@@ -11,6 +11,7 @@ import {
   type DelegationTaskSpec,
 } from "@nexus/shared";
 import { CoreExecutionError } from "./errors.js";
+import { SERVER_DELEGATION_POLICY, type DelegationPolicy } from "./delegation-policy.js";
 
 /**
  * Delegation policy, derived from the profile registry.
@@ -31,10 +32,14 @@ import { CoreExecutionError } from "./errors.js";
  */
 function snapshotDelegationTargets(
   registry: AssistantProfileRegistry,
+  policy: DelegationPolicy,
 ): Readonly<Record<string, readonly string[]>> {
   const entries = registry
     .list()
-    .map((profile) => [profile.key, Object.freeze([...effectiveDelegationTargets(profile, registry)])] as const);
+    .map((profile) => [
+      profile.key,
+      Object.freeze([...effectiveDelegationTargets(profile, registry, policy)]),
+    ] as const);
   return Object.freeze(Object.fromEntries(entries));
 }
 
@@ -45,7 +50,7 @@ function snapshotDelegationTargets(
  * it declares coordination, without widening a closed enum in a contract.
  */
 export const DELEGATION_TARGETS: Readonly<Record<string, readonly AssistantKey[]>> =
-  snapshotDelegationTargets(CANONICAL_PROFILE_REGISTRY);
+  snapshotDelegationTargets(CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY);
 
 /**
  * Kept for compatibility. No longer the *authority*: it is derived from the profile that declares
@@ -70,17 +75,19 @@ export const COORDINATOR_ASSISTANT_KEY: AssistantKey | undefined =
 export function delegationTargetsFor(
   key: AssistantKey,
   registry: AssistantProfileRegistry = CANONICAL_PROFILE_REGISTRY,
+  policy: DelegationPolicy = SERVER_DELEGATION_POLICY,
 ): readonly AssistantKey[] {
   const profile = registry.getByKey(key);
   if (!profile) return [];
-  return effectiveDelegationTargets(profile, registry) as readonly AssistantKey[];
+  return effectiveDelegationTargets(profile, registry, policy) as readonly AssistantKey[];
 }
 
 export function canDelegate(
   key: AssistantKey,
   registry: AssistantProfileRegistry = CANONICAL_PROFILE_REGISTRY,
+  policy: DelegationPolicy = SERVER_DELEGATION_POLICY,
 ): boolean {
-  return delegationTargetsFor(key, registry).length > 0;
+  return delegationTargetsFor(key, registry, policy).length > 0;
 }
 
 export interface DelegationPlanNode {
@@ -109,6 +116,13 @@ export interface ValidateDelegationPlanInput {
    * produção precise conhecer essa chave.
    */
   readonly registry?: AssistantProfileRegistry;
+  /**
+   * Política do servidor aplicada à relação coordenador → alvo (§5.5).
+   *
+   * Omitida -> a política de produção. É aqui que a terceira condição da interseção age: um alvo
+   * declarado no perfil e existente no catálogo ainda é recusado se a política não o admitir.
+   */
+  readonly policy?: DelegationPolicy;
 }
 
 /** Flattens the structured plan (including nested sub-delegations) deterministically. */
@@ -139,6 +153,7 @@ export function flattenDelegationPlan(
 export function validateDelegationPlan(input: ValidateDelegationPlanInput): void {
   const { specs, chainKeys, baseDepth, limits } = input;
   const registry = input.registry ?? CANONICAL_PROFILE_REGISTRY;
+  const policy = input.policy ?? SERVER_DELEGATION_POLICY;
   const owner = chainKeys[chainKeys.length - 1];
 
   if (!owner) {
@@ -187,7 +202,7 @@ export function validateDelegationPlan(input: ValidateDelegationPlanInput): void
     // 3. Authorization: only catalog-authorized coordinator targets are accepted.
     // O alvo pode ser qualquer identificador válido (Fase 1); quem decide se ele é autorizado
     // é o **perfil do coordenador** (Fase 3), projetado pelo registro — não uma lista aqui.
-    const allowedTargets = delegationTargetsFor(owner, registry);
+    const allowedTargets = delegationTargetsFor(owner, registry, policy);
     if (!allowedTargets.some((allowed) => allowed === target)) {
       throw new CoreExecutionError(
         "DELEGATION_NOT_ALLOWED",

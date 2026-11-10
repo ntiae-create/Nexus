@@ -25,32 +25,69 @@ export interface AssistantProfileRegistry {
 }
 
 /**
+ * Política de admissão da relação coordenador → alvo.
+ *
+ * Declarada **aqui como interface** e implementada pelo servidor. O pacote de perfis não pode
+ * importar de `apps/server`, então a dependência aponta para o lado que sabe menos: o dado
+ * declara a forma, quem opera fornece a regra.
+ */
+export interface DelegationTargetPolicy {
+  readonly id: string;
+  readonly allowsTarget: (input: {
+    readonly coordinator: AssistantProfile;
+    readonly target: AssistantProfile;
+  }) => boolean;
+  readonly maxTargetsPerCoordinator: number;
+}
+
+/**
  * Alvos efetivos de coordenação de um perfil.
  *
- * A lista efetiva é a interseção de três condições, conforme o plano (§5.5):
+ * A lista efetiva é a interseção de **três** condições independentes, conforme o plano (§5.5):
  *
- * 1. o perfil **declara** os alvos (`coordination.delegateTo`);
- * 2. o coordenador pode coordenar (`coordination.canCoordinate`);
- * 3. o coordenador e cada alvo estão **ativos** no catálogo (`status: "active"`).
+ * 1. **declarado** — o perfil do coordenador lista o alvo em `coordination.delegateTo`;
+ * 2. **permitido** — a política do servidor admite a relação `(coordenador, alvo)`;
+ * 3. **ativo** — o coordenador pode coordenar, e o alvo existe no catálogo com
+ *    `status: "active"`.
  *
- * A terceira condição é o "∩ perfis ativos" do plano. Sem ela, desabilitar uma assistente a
- * deixaria disponível como alvo e como coordenadora — visível na API como `disabled`, mas
- * operante na delegação, que é a pior combinação possível.
+ * A condição 2 é a que dá sentido à interseção. Na primeira versão desta fase ela não existia:
+ * o "permitido" era lido do próprio `delegateTo`, o que tornava a fórmula uma tautologia e
+ * deixava o servidor sem nenhuma decisão própria sobre coordenação.
  *
- * O resultado preserva a **ordem de declaração** do perfil. Ordem importa: o prompt do
- * coordenador apresenta os alvos nessa sequência, e um teste de caracterização a fixa.
+ * A condição 3 cobre dois casos que o plano trata como um só ("perfis ativos"): sem ela,
+ * desabilitar uma assistente a deixaria disponível como alvo **e** como coordenadora — visível
+ * na API como `disabled`, mas operante na delegação, que é a pior combinação possível.
+ *
+ * O resultado preserva a **ordem de declaração** do perfil, truncada pelo teto da política.
+ * Ordem importa: o prompt do coordenador apresenta os alvos nessa sequência.
+ *
+ * @param policy Omitida -> nenhuma restrição de servidor além do que o perfil declara. Isso é
+ *   intencional: quem chama sem política (testes de schema, ferramentas de inspeção) enxerga a
+ *   projeção pura do dado; o servidor sempre passa a própria política explicitamente.
  */
 export function effectiveDelegationTargets(
   profile: AssistantProfile,
   registry: AssistantProfileRegistry,
+  policy?: DelegationTargetPolicy,
 ): readonly string[] {
   if (profile.status !== "active") return [];
   if (!profile.coordination.canCoordinate) return [];
 
-  return (profile.coordination.delegateTo ?? []).filter((target) => {
-    const candidate = registry.getByKey(target);
-    return candidate !== undefined && candidate.status === "active";
-  });
+  const cap = policy?.maxTargetsPerCoordinator ?? Number.POSITIVE_INFINITY;
+
+  const allowed: string[] = [];
+  for (const key of profile.coordination.delegateTo ?? []) {
+    if (allowed.length >= cap) break;
+
+    const target = registry.getByKey(key);
+    if (!target) continue;
+    if (target.status !== "active") continue;
+    if (policy && !policy.allowsTarget({ coordinator: profile, target })) continue;
+
+    allowed.push(key);
+  }
+
+  return allowed;
 }
 
 /**
