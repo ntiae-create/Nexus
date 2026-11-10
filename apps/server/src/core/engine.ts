@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AssistantProfile } from "@nexus/assistant-profiles";
 import type {
+  AssistantKey,
   Conversation,
   CoreContextReport,
   CoreExecutionInspection,
@@ -138,7 +139,7 @@ interface DelegationExecutionFailure {
   readonly errorCode: string;
   readonly errorMessage: string;
   readonly childRunId: string;
-  readonly assistantKey: InitialAssistantKey;
+  readonly assistantKey: AssistantKey;
 }
 
 interface DelegationExecutionSuccess {
@@ -1335,7 +1336,7 @@ export class NexusCoreEngine {
       maxCharsPerOutcome: this.limits.maxSynthesisOutcomeChars,
       outcomes: [
         ...successes.map((success) => ({
-          assistantName: this.profileForDelegation(success.outcome.assistant.assistantKey as InitialAssistantKey).name,
+          assistantName: this.profileForDelegation(success.outcome.assistant.assistantKey).name,
           assistantKey: success.outcome.assistant.assistantKey,
           objective: success.outcome.objective,
           status: "succeeded" as const,
@@ -1407,7 +1408,7 @@ export class NexusCoreEngine {
     });
   }
 
-  private profileForDelegation(key: InitialAssistantKey): AssistantProfile {
+  private profileForDelegation(key: AssistantKey): AssistantProfile {
     return resolveCanonicalAssistantProfile({ assistantKey: key });
   }
 

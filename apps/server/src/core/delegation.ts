@@ -2,6 +2,7 @@ import type { AssistantProfile } from "@nexus/assistant-profiles";
 import {
   COORDINATION_ENVELOPE_KIND,
   coordinatorDecisionEnvelopeSchema,
+  type AssistantKey,
   type DelegationTaskSpec,
   type InitialAssistantKey,
 } from "@nexus/shared";
@@ -24,12 +25,17 @@ export const DELEGATION_TARGETS: Readonly<
 
 export const COORDINATOR_ASSISTANT_KEY: InitialAssistantKey = "yui";
 
-export function delegationTargetsFor(key: InitialAssistantKey): readonly InitialAssistantKey[] {
-  return DELEGATION_TARGETS[key];
+/**
+ * Fase 1: the *policy* is still the frozen three-key map (deriving it from the profile registry
+ * is Fase 3 / G2), but the functions accept any valid identifier so that an assistant outside the
+ * initial catalog can ask the question and get a truthful "no targets" instead of a crash.
+ */
+export function delegationTargetsFor(key: AssistantKey): readonly InitialAssistantKey[] {
+  return DELEGATION_TARGETS[key as InitialAssistantKey] ?? [];
 }
 
-export function canDelegate(key: InitialAssistantKey): boolean {
-  return DELEGATION_TARGETS[key].length > 0;
+export function canDelegate(key: AssistantKey): boolean {
+  return delegationTargetsFor(key).length > 0;
 }
 
 export interface DelegationPlanNode {
@@ -46,7 +52,7 @@ export interface DelegationLimits {
 export interface ValidateDelegationPlanInput {
   readonly specs: readonly DelegationTaskSpec[];
   /** Assistant keys already present in the execution ancestry, oldest first. */
-  readonly chainKeys: readonly InitialAssistantKey[];
+  readonly chainKeys: readonly AssistantKey[];
   /** Delegation depth of the run that owns this plan. */
   readonly baseDepth: number;
   readonly limits: DelegationLimits;
@@ -125,8 +131,10 @@ export function validateDelegationPlan(input: ValidateDelegationPlanInput): void
     }
 
     // 3. Authorization: only catalog-authorized coordinator targets are accepted.
+    // O alvo pode ser qualquer identificador válido (Fase 1); quem decide se ele é autorizado
+    // continua sendo o mapa de política, por comparação de chave.
     const allowedTargets = delegationTargetsFor(owner);
-    if (!allowedTargets.includes(target)) {
+    if (!allowedTargets.some((allowed) => allowed === target)) {
       throw new CoreExecutionError(
         "DELEGATION_NOT_ALLOWED",
         allowedTargets.length === 0

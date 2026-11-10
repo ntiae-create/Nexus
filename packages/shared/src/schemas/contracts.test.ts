@@ -485,7 +485,16 @@ describe("NEXUS CORE execution and delegation contracts", () => {
     };
     expect(coreExecutionRequestSchema.safeParse(base).success).toBe(true);
     expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "yui" }).success).toBe(true);
-    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "unknown" }).success).toBe(false);
+    // Fase 1 (G1): o contrato valida FORMA, não existência. "unknown" é uma chave bem formada;
+    // quem decide que ela não existe é o registro no servidor, que responde ASSISTANT_NOT_FOUND
+    // (coberto em apps/server/src/routes/core.test.ts). Manter a rejeição aqui exigiria que o
+    // pacote compartilhado conhecesse o catálogo — exatamente o acoplamento que a fase remove.
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "unknown" }).success).toBe(true);
+    // Forma inválida continua rejeitada pelo contrato.
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "YUI" }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "-bad" }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "" }).success).toBe(false);
+    expect(coreExecutionRequestSchema.safeParse({ ...base, assistantKey: "a" }).success).toBe(false);
     expect(coreExecutionRequestSchema.safeParse({ ...base, idempotencyKey: "x".repeat(141) }).success).toBe(false);
     expect(coreExecutionRequestSchema.safeParse({ ...base, content: [] }).success).toBe(false);
     expect(coreExecutionRequestSchema.safeParse({ ...base, timeoutMs: 99 }).success).toBe(false);
