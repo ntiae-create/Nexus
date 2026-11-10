@@ -173,31 +173,14 @@ export function resetApiBaseUrl(): void {
   configuredBaseUrl = undefined;
 }
 
-export const ASSISTANTS = [
-  {
-    id: "00000000-0000-4000-8000-000000000001",
-    key: "yui",
-    name: "YUI",
-    role: "Assistente pessoal",
-    description: "Conversas, organização e planejamento do dia a dia.",
-    accent: "#a78bfa",
-  },
-  {
-    id: "00000000-0000-4000-8000-000000000002",
-    key: "alice",
-    name: "ALICE",
-    role: "Pesquisa e conhecimento",
-    description: "Análise, referências e explicações técnicas.",
-    accent: "#38bdf8",
-  },
-  {
-    id: "00000000-0000-4000-8000-000000000003",
-    key: "schwi",
-    name: "SCHWI",
-    role: "Lógica e estratégia",
-    description: "Planejamento, arquitetura e problemas complexos.",
-    accent: "#34d399",
-  },
-] as const;
-
-export type AssistantMeta = (typeof ASSISTANTS)[number];
+/**
+ * Fase 2 (G6): o catálogo de apresentação era duplicado aqui — um segundo array com os três ids,
+ * nomes, rótulos e cores, independente de `lib/assistants.ts` e dos perfis do servidor. A fonte
+ * única passou a ser `lib/assistants.ts`, alimentada por `GET /v1/assistants` com fallback
+ * derivado de `@nexus/assistant-profiles`.
+ *
+ * O que resta em `assistants.ts` sobre apresentação é intencional e genérico: a cor de destaque
+ * é decisão visual do cliente e não existe no perfil. Ela é aplicada por chave, com padrão
+ * neutro, para que um assistente novo apareça na interface sem edição de código.
+ */
+export { ASSISTANT_ACCENTS } from "./assistant-accents.js";

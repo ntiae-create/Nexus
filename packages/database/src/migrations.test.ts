@@ -136,4 +136,73 @@ describe("SINGLE-USER PostgreSQL migration", () => {
     expect(sql).toContain("core_runs_identity_immutable");
     expect(sql).not.toMatch(/DROP TABLE|ALTER TABLE nexus\.(messages|core_runs)\s+DROP/i);
   });
+
+  it("syncs the assistant seed additively and idempotently in migration 00005", async () => {
+    const sql = await readFile(
+      join(migrationsDirectory, "00005_assistant_seed_parity.sql"),
+      "utf8",
+    );
+
+    // Aditiva: nunca recria a tabela nem mexe em identidade já referenciada por outras tabelas.
+    expect(sql).not.toMatch(/DROP TABLE/i);
+    expect(sql).not.toMatch(/DELETE\s+FROM\s+nexus\.assistants/i);
+    expect(sql).not.toMatch(/TRUNCATE/i);
+    expect(sql).not.toMatch(/ALTER TABLE nexus\.assistants\s+(DROP|RENAME)/i);
+    expect(sql).not.toMatch(/UPDATE nexus\.assistants SET (id|assistant_key)\s*=/i);
+
+    // Idempotente: cada UPDATE é condicional ao valor divergente, e o INSERT não duplica.
+    expect(sql).toMatch(/WHERE assistant_key = 'yui'\s+AND description <> /);
+    expect(sql).toContain("ON CONFLICT (assistant_id, config_version) DO NOTHING");
+
+    // Escopo: só as três chaves do catálogo inicial. Nenhuma quarta assistente é criada.
+    const insertedKeys = [...sql.matchAll(/INSERT INTO nexus\.assistants[^;]*;/gi)].map((m) => m[0]);
+    expect(insertedKeys).toEqual([]);
+    for (const key of ["yui", "alice", "schwi"]) {
+      expect(sql).toContain(`'${key}'`);
+    }
+    expect(sql).not.toMatch(/'(delta|omega|assistente-4)'/);
+
+    // Não toca em segurança, ownership nem tabelas pessoais.
+    expect(sql).not.toMatch(/ROW LEVEL SECURITY|POLICY|GRANT|REVOKE/i);
+    expect(sql).not.toMatch(/owner_id|user_id/i);
+  });
+
+  it("keeps earlier migrations byte-identical after adding 00005", async () => {
+    // Regra do projeto: migration aplicada é imutável. Se 00001 for editada para "resolver" a
+    // paridade, o histórico de instalações existentes deixa de ser reproduzível.
+    const initial = await readFile(join(migrationsDirectory, "00001_initial_schema.sql"), "utf8");
+    expect(initial).toContain("'Assistente pessoal.'");
+    expect(initial).toContain("'Pesquisa e investigação.'");
+    expect(initial).toContain("'Lógica e planejamento.'");
+    // A correção vive exclusivamente na 00005.
+    const fix = await readFile(join(migrationsDirectory, "00005_assistant_seed_parity.sql"), "utf8");
+    expect(fix).toContain("Assistente pessoal para conversação cotidiana");
+  });
+
+  it("wires the migration 00005 idempotency check into the PostgreSQL CI job", async () => {
+    // A idempotência só é real se for exercitada contra PostgreSQL. Este teste garante que a
+    // verificação não fica órfã no repositório: o script de integração precisa executá-la, e o
+    // workflow precisa chamar o script.
+    const script = await readFile(
+      join(migrationsDirectory, "..", "scripts", "test-postgres-integration.sh"),
+      "utf8",
+    );
+    expect(script).toContain("verify-assistant-seed-parity.sql");
+    expect(script).toContain("00005_assistant_seed_parity.sql");
+    expect(script).toContain("docker cp");
+
+    const workflow = await readFile(
+      join(migrationsDirectory, "..", "..", "..", ".github", "workflows", "database-postgres.yml"),
+      "utf8",
+    );
+    expect(workflow).toContain("test:integration --workspace @nexus/database");
+
+    // E a verificação precisa de fato reaplicar a migration.
+    const verification = await readFile(
+      join(migrationsDirectory, "..", "tests", "postgres", "verify-assistant-seed-parity.sql"),
+      "utf8",
+    );
+    expect(verification).toContain("\\i /tmp/00005_assistant_seed_parity.sql");
+    expect(verification).toContain("is not idempotent");
+  });
 });

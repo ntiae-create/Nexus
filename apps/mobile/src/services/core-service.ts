@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   conversationSchema,
+  type AssistantKey,
   coreExecutionInspectionSchema,
   coreExecutionResponseSchema,
   coreRunSchema,
@@ -89,13 +90,22 @@ export interface SendMessageInput {
   readonly content: readonly { readonly type: "text"; readonly text: string }[];
   readonly requestId: string;
   readonly idempotencyKey: string;
-  readonly assistantKey?: "yui" | "alice" | "schwi";
+  // Fase 2 (G6): a união literal repetia o catálogo no cliente. O tipo generalizado da Fase 1
+  // é a forma correta: o contrato valida forma, e o servidor decide existência.
+  readonly assistantKey?: AssistantKey;
   readonly assistantId?: string;
 }
 
 export interface CoreService {
   /** `GET /v1/conversations` — owner conversations, newest first (server ordering). */
   listConversations(token: string, options?: { signal?: AbortSignal }): Promise<readonly Conversation[]>;
+  /**
+   * `GET /v1/assistants` — the assistant catalog served from `@nexus/assistant-profiles`.
+   *
+   * Returns the raw payload: hardening of the catalog shape is `assistant-service.ts`'s job, so
+   * a malformed response degrades to the build fallback instead of throwing inside the client.
+   */
+  listAssistants(token: string, options?: { signal?: AbortSignal }): Promise<unknown>;
   /** `GET /v1/conversations/:id`. */
   getConversation(
     token: string,
@@ -166,6 +176,13 @@ export function createCoreService(client: ApiClient): CoreService {
         "a lista de conversas",
       );
       return parsed.conversations;
+    },
+
+    async listAssistants(token, options = {}) {
+      return client.get<unknown>("/v1/assistants", {
+        token,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
     },
 
     async getConversation(token, conversationId, options = {}) {

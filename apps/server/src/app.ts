@@ -6,6 +6,7 @@ import {
   type ProviderRoutesOptions,
 } from "./routes/providers.js";
 import { registerCoreRoutes, type CoreRoutesOptions } from "./routes/core.js";
+import { registerAssistantRoutes, type AssistantRoutesOptions } from "./routes/assistants.js";
 
 export type DatabaseReadinessProbe = () => Promise<void>;
 
@@ -19,6 +20,7 @@ export interface BuildAppOptions {
   auth?: AuthPluginOptions;
   providers?: ProviderRoutesOptions;
   core?: CoreRoutesOptions;
+  assistants?: AssistantRoutesOptions;
   logger?: boolean;
 }
 
@@ -44,6 +46,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void app.register(authPlugin, options.auth ?? {});
   void registerProviderRoutes(app, options.providers ?? {});
   void registerCoreRoutes(app, options.core ?? {});
+  // Fase 2 (G4): a rota existia mas nunca era chamada — `GET /v1/assistants` respondia 404.
+  void registerAssistantRoutes(app, options.assistants ?? {});
 
   app.get("/v1/health", async () =>
     healthResponseSchema.parse({ status: "ok" }),

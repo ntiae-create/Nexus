@@ -1,72 +1,159 @@
-import { initialAssistantKeySchema, type InitialAssistantKey } from "@nexus/shared";
+import {
+  listAssistantProfiles,
+  type AssistantProfile,
+} from "@nexus/assistant-profiles";
+import { assistantKeySchema } from "@nexus/shared";
 
 /**
- * Read-only mirror of the frozen assistant catalog, for display and selection.
+ * Assistant catalog for display and selection.
  *
- * Sources of truth (never duplicated logic, only identity):
- * - `packages/assistant-profiles/src/catalog.ts` — frozen profiles (`id`, `key`, `name`);
- * - `packages/database/migrations/00001_initial_schema.sql` — seeded `nexus.assistants` rows.
+ * Fase 2 (G6): antes desta fase o mobile mantinha **duas** listas literais independentes — esta
+ * e um `ASSISTANTS` em `config.ts` — com ids, nomes e descrições escritos à mão. Adicionar um
+ * assistente exigia editar o app.
  *
- * `apps/mobile/src/lib/assistants.test.ts` asserts that this mirror stays byte-for-byte
- * identical to the frozen catalog, so a profile change breaks the build instead of
- * silently mislabelling a message.
+ * A fonte de verdade é o servidor (`GET /v1/assistants`, derivado de
+ * `@nexus/assistant-profiles`). O app carrega o catálogo no início e usa o **fallback de build**
+ * abaixo quando a API ainda não respondeu ou está indisponível.
  *
- * This module is presentation data only. The app never decides who answers: delegation
- * (YUI → ALICE/SCHWI) belongs exclusively to the NEXUS CORE backend, and the mobile client
- * only sends `assistantKey` values the API contract already accepts.
+ * O fallback **não é** uma nova lista manual: ele é derivado dos perfis congelados do pacote
+ * compartilhado, no mesmo import que o bundler já resolve. Assim, quando o catálogo canônico
+ * mudar, o fallback acompanha no próximo build — sem edição manual e sem divergência silenciosa.
+ *
+ * Escopo preservado: este módulo é apresentação. Quem decide quem responde é o servidor; o
+ * cliente apenas envia `assistantKey` que o contrato já aceita, e só oferece assistentes da
+ * conversa atual.
  */
+
+/** Registro mínimo que a API devolve para cada assistente (`GET /v1/assistants`). */
+export interface AssistantApiRecord {
+  readonly id: string;
+  readonly key: string;
+  readonly name: string;
+  readonly description: string;
+  readonly primaryRole: string;
+  readonly capabilities: readonly string[];
+  readonly status: string;
+}
+
+/** O que uma tela precisa saber sobre um assistente para exibi-lo. */
 export interface AssistantOption {
-  readonly key: InitialAssistantKey;
+  readonly key: string;
   /** Canonical UUID used when creating a conversation (`assistantIds`). */
   readonly id: string;
   readonly name: string;
+  readonly description: string;
+  readonly primaryRole: string;
+  readonly capabilities: readonly string[];
+  readonly status: string;
 }
 
-const RAW_CATALOG: readonly { key: string; id: string; name: string }[] = [
-  { key: "yui", id: "00000000-0000-4000-8000-000000000001", name: "YUI" },
-  { key: "alice", id: "00000000-0000-4000-8000-000000000002", name: "ALICE" },
-  { key: "schwi", id: "00000000-0000-4000-8000-000000000003", name: "SCHWI" },
-];
+function toOption(profile: AssistantProfile): AssistantOption {
+  return Object.freeze({
+    key: profile.key,
+    id: profile.id,
+    name: profile.name,
+    description: profile.description ?? "",
+    primaryRole: profile.primaryRole,
+    capabilities: Object.freeze([...profile.capabilities]),
+    status: profile.status,
+  });
+}
 
 /**
- * Parsed once, at module load: a key outside `initialAssistantKeySchema` would make
- * every request fail with `400 INVALID_REQUEST`, so it is rejected at build/test time.
+ * Fallback de build: derivado dos perfis congelados, na ordem do catálogo canônico.
+ * Congelado em profundidade para que nenhuma tela o mute em runtime.
  */
-export const ASSISTANT_CATALOG: readonly AssistantOption[] = Object.freeze(
-  RAW_CATALOG.map((assistant) => {
-    const parsed = initialAssistantKeySchema.parse(assistant.key);
-    return Object.freeze({
-      key: parsed,
-      id: assistant.id,
-      name: assistant.name,
-    });
-  }),
+export const FALLBACK_CATALOG: readonly AssistantOption[] = Object.freeze(
+  listAssistantProfiles().map(toOption),
 );
 
-const byKey = new Map<string, AssistantOption>(
+/**
+ * Catálogo em uso.
+ *
+ * Começa no fallback e é **substituído** pela resposta da API quando ela chega. A identidade do
+ * array é estável (`ASSISTANT_CATALOG` continua sendo a mesma referência) para que consumidores
+ * possam importá-lo diretamente; o conteúdo é trocado in-place por `applyCatalogFromApi`.
+ */
+export const ASSISTANT_CATALOG: AssistantOption[] = [...FALLBACK_CATALOG];
+
+let indexByKey = new Map<string, AssistantOption>(
   ASSISTANT_CATALOG.map((assistant) => [assistant.key, assistant]),
 );
-const byId = new Map<string, AssistantOption>(
+let indexById = new Map<string, AssistantOption>(
   ASSISTANT_CATALOG.map((assistant) => [assistant.id, assistant]),
 );
+
+function rebuildIndexes(): void {
+  indexByKey = new Map(ASSISTANT_CATALOG.map((assistant) => [assistant.key, assistant]));
+  indexById = new Map(ASSISTANT_CATALOG.map((assistant) => [assistant.id, assistant]));
+}
+
+/**
+ * Substitui o catálogo pelo que veio da API.
+ *
+ * Ignora resposta inutilizável em vez de esvaziar a tela: um servidor desatualizado, uma resposta
+ * parcial ou um payload corrompido não podem deixar o app sem catálogo. Chaves com forma
+ * inválida e ids repetidos também são recusados — o servidor é confiável, o canal não.
+ *
+ * @returns `true` quando o catálogo foi substituído.
+ */
+export function applyCatalogFromApi(records: readonly AssistantApiRecord[]): boolean {
+  if (!Array.isArray(records) || records.length === 0) return false;
+
+  const uniqueKeys = new Set<string>();
+  const uniqueIds = new Set<string>();
+  const next: AssistantOption[] = [];
+
+  for (const record of records) {
+    if (!record || typeof record !== "object") return false;
+    if (!assistantKeySchema.safeParse(record.key).success) return false;
+    if (uniqueKeys.has(record.key) || uniqueIds.has(record.id)) return false;
+    uniqueKeys.add(record.key);
+    uniqueIds.add(record.id);
+    next.push(
+      Object.freeze({
+        key: record.key,
+        id: record.id,
+        name: record.name,
+        description: record.description ?? "",
+        primaryRole: record.primaryRole,
+        capabilities: Object.freeze([...(record.capabilities ?? [])]),
+        status: record.status,
+      }),
+    );
+  }
+
+  ASSISTANT_CATALOG.length = 0;
+  ASSISTANT_CATALOG.push(...next);
+  rebuildIndexes();
+  return true;
+}
+
+/** Volta ao fallback de build. Usado entre testes e ao trocar de sessão. */
+export function resetAssistantCatalog(): void {
+  ASSISTANT_CATALOG.length = 0;
+  ASSISTANT_CATALOG.push(...FALLBACK_CATALOG);
+  rebuildIndexes();
+}
 
 /** Resolves an assistant by its canonical key; `undefined` when not in the catalog. */
 export function getAssistantByKey(key: string | null | undefined): AssistantOption | undefined {
   if (!key) return undefined;
-  return byKey.get(key.toLowerCase());
+  return indexByKey.get(key.toLowerCase());
 }
 
 /** Resolves an assistant by its canonical UUID; `undefined` for unknown ids. */
 export function getAssistantById(id: string | null | undefined): AssistantOption | undefined {
   if (!id) return undefined;
-  return byId.get(id);
+  return indexById.get(id);
 }
 
 /**
  * Assistants that participate in a conversation, in the order the server returned them.
  *
  * Only these may be addressed in that conversation: the CORE rejects any other target with
- * `ASSISTANT_NOT_IN_CONVERSATION`, so the UI must not offer it.
+ * `ASSISTANT_NOT_IN_CONVERSATION`, so the UI must not offer it. Conhecer um assistente pelo
+ * catálogo não é o mesmo que poder usá-lo nesta conversa.
  */
 export function getConversationAssistants(
   assistantIds: readonly string[],

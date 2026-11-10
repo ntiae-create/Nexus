@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { abandonAssistantCatalog } from "./services/assistant-service.js";
 import type { Conversation } from "@nexus/shared";
 import { AuthProvider, useAuth } from "./state/auth-context.js";
 import { LoginScreen } from "./screens/LoginScreen.js";
@@ -54,6 +55,19 @@ function AuthenticatedApp({ container }: { container: AppContainer }) {
     () => (sessionToken ? container.createConversationService(sessionToken) : null),
     [container, sessionToken],
   );
+
+  // Fase 2 (G6): o catálogo de apresentação vem do servidor. A chamada nunca lança — se o
+  // backend estiver indisponível, o app segue com o fallback de build derivado dos perfis.
+  //
+  // O `abandonAssistantCatalog` no início de cada sessão (e no logout, logo abaixo) é o que
+  // impede o catálogo de vazar de uma conta para outra: o estado do catálogo é de módulo, então
+  // ele sobrevive a uma troca de sessão se ninguém o invalidar. Invalida também as respostas
+  // ainda em voo, que não podem reaplicar o catálogo da sessão anterior.
+  useEffect(() => {
+    abandonAssistantCatalog();
+    if (!sessionToken) return;
+    void container.loadAssistantCatalog(sessionToken);
+  }, [container, sessionToken]);
 
   const configurationError =
     container.apiBaseUrl === null && !showConfig
