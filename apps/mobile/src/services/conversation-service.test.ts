@@ -40,6 +40,7 @@ function stubService(overrides: Partial<CoreService> = {}): CoreService {
     Promise.reject(new Error(`unstubbed core service method: ${name}`));
   return {
     listConversations: notStubbed("listConversations") as CoreService["listConversations"],
+    listAssistants: notStubbed("listAssistants") as CoreService["listAssistants"],
     getConversation: notStubbed("getConversation") as CoreService["getConversation"],
     createConversation: notStubbed("createConversation") as CoreService["createConversation"],
     listMessages: notStubbed("listMessages") as CoreService["listMessages"],

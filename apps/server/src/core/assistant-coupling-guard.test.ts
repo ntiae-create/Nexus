@@ -464,37 +464,6 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     removedIn: "Fase 3",
   },
   {
-    file: "apps/mobile/src/services/core-service.ts",
-    keys: ["yui", "alice", "schwi"],
-    pattern: "list",
-    reason: "união literal duplicando InitialAssistantKey — substituída pelo tipo canônico (G1)",
-    removedIn: "Fase 1",
-  },
-  {
-    file: "apps/mobile/src/lib/assistants.ts",
-    keys: ["yui", "alice", "schwi"],
-    pattern: "catalog",
-    anchor: "RAW_CATALOG",
-    reason: "espelho do catálogo congelado — proteção válida, não cópia de lógica",
-    removedIn: "Fase 1",
-  },
-  {
-    file: "apps/mobile/src/lib/config.ts",
-    keys: ["yui", "alice", "schwi"],
-    pattern: "catalog",
-    anchor: "ASSISTANTS",
-    reason: "catálogo de apresentação do mobile (rótulos/cores) — Fase 1 unifica (G4)",
-    removedIn: "Fase 1",
-  },
-  {
-    file: "apps/server/src/routes/assistants.ts",
-    keys: ["yui", "alice", "schwi"],
-    pattern: "catalog",
-    anchor: "ASSISTANTS",
-    reason: "array literal da rota L9 — corrigido por derivação do registro na Fase 2",
-    removedIn: "Fase 2",
-  },
-  {
     file: "packages/assistant-profiles/src/catalog.ts",
     keys: ["yui", "alice", "schwi"],
     pattern: "catalog",
@@ -896,32 +865,39 @@ describe("Fase 0 — catálogos de objetos: uma ocorrência, uma identidade", ()
   });
 });
 
-describe("Fase 0 — duplicata dentro de um arquivo real do inventário", () => {
+describe("Fase 2 — duplicata dentro de um arquivo real do inventário", () => {
   // Usa o conteúdo real de um arquivo inventariado e acrescenta, em memória, um segundo catálogo
   // idêntico. Nenhum arquivo em disco é alterado: a validação lê o texto injetado.
-  it("bloqueia um segundo catálogo com as mesmas chaves em routes/assistants.ts", () => {
-    const real = readFileSync(resolve(REPO_ROOT, "apps/server/src/routes/assistants.ts"), "utf8");
-    const duplicated = `${real}\nconst ASSISTANTS_MIRROR = [\n  { id: "1", key: "yui" },\n  { id: "2", key: "alice" },\n  { id: "3", key: "schwi" },\n] as const;\n`;
-    const occurrences = findCatalogDeclarations(duplicated);
-    expect(occurrences.map((occurrence) => occurrence.anchor)).toEqual([
-      "ASSISTANTS",
-      "ASSISTANTS_MIRROR",
-    ]);
+  //
+  // Fase 2: o arquivo de referência passou a ser o catálogo canônico de perfis. A rota
+  // `routes/assistants.ts` deixou de servir de um array literal (G4), então não é mais um
+  // exemplo de ocorrência legítima — o catálogo de perfis é, e continuará sendo.
+  it("bloqueia um segundo catálogo com as mesmas chaves ao lado do catálogo canônico", () => {
+    const file = "packages/assistant-profiles/src/catalog.ts";
+    const real = readFileSync(resolve(REPO_ROOT, file), "utf8");
+    const duplicated =
+      `${real}\nconst CATALOGO_MIRROR = [\n` +
+      '  { id: "1", key: "yui" },\n' +
+      '  { id: "2", key: "alice" },\n' +
+      '  { id: "3", key: "schwi" },\n' +
+      "] as const;\n";
 
     const root = mkdtempSync(join(tmpdir(), "nexus-real-"));
-    const path = join(root, "assistants.ts");
+    // O caminho escrito é relativo à raiz varrida (`catalog.ts`), como faz a varredura real;
+    // por isso a assinatura é montada com o nome relativo, e não com o caminho do repositório.
+    const path = join(root, "catalog.ts");
+    const canonical = ALLOWED_OCCURRENCES.find((entry) => entry.file === file);
+    expect(canonical, `ocorrência canônica de ${file}`).toBeDefined();
+    const allowed = new Set([
+      signatureOf("catalog.ts", canonical!.keys, canonical!.pattern, canonical!.anchor),
+    ]);
     try {
       writeFileSync(path, real, "utf8");
-      const allowed = new Set(
-        ALLOWED_OCCURRENCES.map((entry) =>
-          signatureOf("assistants.ts", entry.keys, entry.pattern, entry.anchor),
-        ),
-      );
       expect(findUndeclaredCoupling([path], root, allowed), "arquivo real").toEqual([]);
 
       writeFileSync(path, duplicated, "utf8");
       const blocked = findUndeclaredCoupling([path], root, allowed);
-      expect(blocked.map((entry) => entry.anchor)).toEqual(["ASSISTANTS_MIRROR"]);
+      expect(blocked.map((entry) => entry.anchor)).toEqual(["CATALOGO_MIRROR"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1210,6 +1186,55 @@ describe("Fase 0 — reconhecimento estrutural (parser) e âncora de container",
   });
 });
 
+describe("Fase 2 — guard anti-duplicação: catálogo de identidade ≠ permissão", () => {
+  // O guard não pode tratar toda lista de chaves como cópia de catálogo. Uma permissão de
+  // ferramenta (`authorizedAssistantKeys: ["alice"]`) e uma lista de alvos de delegação são
+  // políticas sobre assistentes que existem — não uma segunda fonte de identidade. Catálogo de
+  // identidade é o que declara `id`+`key`+`name` de um assistente.
+  const validate = (source: string, file: string, allowed: ReadonlySet<string>) => {
+    const root = mkdtempSync(join(tmpdir(), "nexus-guard-p2-"));
+    const path = join(root, file);
+    writeFileSync(path, source, "utf8");
+    try {
+      return findUndeclaredCoupling([path], root, allowed);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  it("lista de permissão de ferramenta com uma chave não é acusada", () => {
+    expect(validate('authorizedAssistantKeys: ["alice"]', "tool.ts", new Set())).toEqual([]);
+  });
+
+  it("lista de permissão de ferramenta com duas chaves é acusada como lista, não como catálogo", () => {
+    // É acusada — é uma lista literal de chaves — mas com o padrão `list`. Chamar isso de
+    // `catalog` seria classificar errado o acoplamento e induzir a correção errada.
+    const found = validate('authorizedAssistantKeys: ["alice", "schwi"]', "tool.ts", new Set());
+    expect(found).toHaveLength(1);
+    expect(found[0]!.pattern).toBe("list");
+  });
+
+  it("uma fixture de teste não é varrida pelo guard", () => {
+    // Fixtures legítimas citam uma chave por campo e vivem em `*.test-support`/`*.test.ts`.
+    // O guard exclui arquivos de teste da varredura.
+    const files = SCANNED_DIRECTORIES.flatMap((directory) => collectSourceFiles(directory));
+    expect(files.some((file) => /\.(test|spec)\.tsx?$/.test(file))).toBe(false);
+  });
+
+  it("catálogo de identidade é o padrão que declara id+key+name juntos", () => {
+    const source = [
+      "export const CATALOGO = [",
+      '  { id: "00000000-0000-4000-8000-000000000001", key: "yui", name: "YUI" },',
+      '  { id: "00000000-0000-4000-8000-000000000002", key: "alice", name: "ALICE" },',
+      "];",
+    ].join("\n");
+    const found = validate(source, "catalogo.ts", new Set());
+    expect(found).toHaveLength(1);
+    expect(found[0]!.pattern).toBe("catalog");
+    expect(found[0]!.anchor).toBe("CATALOGO");
+  });
+});
+
 describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
   it("cada ocorrência declara motivo e fase responsável pela remoção", () => {
     for (const entry of ALLOWED_OCCURRENCES) {
@@ -1226,10 +1251,14 @@ describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
   });
 
   it("o inventário não cresce silenciosamente: tamanho é explícito", () => {
-    // Fase 1 resolveu G5: `routes/core.ts` passou a usar `assistantKeySchema` compartilhado,
-    // então a ocorrência saiu do inventário (9 -> 8). O número é explícito justamente para que
-    // saídas e entradas exijam revisão consciente.
-    expect(ALLOWED_OCCURRENCES).toHaveLength(8);
+    // Histórico do inventário, fase a fase:
+    //   Fase 0: 9 ocorrências
+    //   Fase 1: 8 — G5 removeu o enum local de `routes/core.ts`
+    //   Fase 2: 4 — G4 serviu `routes/assistants.ts` do registro; G6 unificou o mobile
+    //               (`lib/assistants.ts` derivado dos perfis, `config.ts` e a união de
+    //               `core-service.ts` eliminados)
+    // O número é explícito para que toda saída e entrada exija revisão consciente.
+    expect(ALLOWED_OCCURRENCES).toHaveLength(4);
   });
 
   it("toda ocorrência de catálogo declara o container que a identifica", () => {

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { initialAssistantKeySchema } from "@nexus/shared";
 import {
   ASSISTANT_CATALOG,
+  FALLBACK_CATALOG,
   getAssistantById,
   getAssistantByKey,
   getConversationAssistants,
@@ -98,7 +99,12 @@ describe("assistant catalog mirror", () => {
   });
 
   it("is frozen so no screen can mutate the catalog at runtime", () => {
-    expect(Object.isFrozen(ASSISTANT_CATALOG)).toBe(true);
+    // Fase 2 (G6): `ASSISTANT_CATALOG` passou a ser o catálogo **em uso**, substituído pela
+    // resposta de `GET /v1/assistants` — ele é mutável por desenho, e só por `applyCatalogFromApi`
+    // / `resetAssistantCatalog`. A garantia de imutabilidade migrou para o fallback de build, que
+    // é o que um telas não pode alterar, e para cada entrada, que continua congelada.
+    expect(Object.isFrozen(FALLBACK_CATALOG)).toBe(true);
+    expect(Object.isFrozen(FALLBACK_CATALOG[0])).toBe(true);
     expect(Object.isFrozen(ASSISTANT_CATALOG[0])).toBe(true);
   });
 

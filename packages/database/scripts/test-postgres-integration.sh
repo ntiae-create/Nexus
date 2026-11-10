@@ -9,8 +9,8 @@ fi
 database_package_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 migration_dir="$database_package_dir/migrations"
 migration_count=$(find "$migration_dir" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d ' ')
-if [ "$migration_count" -ne 4 ]; then
-  echo "Expected migrations 00001 through 00004 in the fresh test database; found $migration_count." >&2
+if [ "$migration_count" -ne 5 ]; then
+  echo "Expected migrations 00001 through 00005 in the fresh test database; found $migration_count." >&2
   exit 2
 fi
 
@@ -32,5 +32,11 @@ for migration_file in "$migration_dir"/*.sql; do
     docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-2b-migration.sql"
   fi
 done
+# Fase 2 (G7): a verificação da 00005 reaplica a migration para provar idempotência com
+# PostgreSQL real. O arquivo é copiado para o container porque o `\i` do psql precisa de um
+# caminho que exista dentro dele.
+docker cp "$migration_dir/00005_assistant_seed_parity.sql" "$postgres_container_id":/tmp/00005_assistant_seed_parity.sql
+echo "Verifying assistant seed parity and migration 00005 idempotency."
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-assistant-seed-parity.sql"
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/bootstrap.sql"
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U nexus_app -d nexus_test -f - < "$database_package_dir/tests/postgres/integration.sql"

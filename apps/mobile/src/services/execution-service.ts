@@ -2,7 +2,7 @@ import type {
   CoreExecutionInspection,
   CoreExecutionResponse,
   CoreRun,
-  InitialAssistantKey,
+  AssistantKey,
   Message,
   RunStatus,
 } from "@nexus/shared";
@@ -283,7 +283,7 @@ export async function sendChatMessage(input: {
   readonly token: string;
   readonly conversationId: string;
   readonly text: string;
-  readonly assistantKey: InitialAssistantKey;
+  readonly assistantKey: AssistantKey;
   readonly requestId: string;
   readonly idempotencyKey: string;
   readonly signal?: AbortSignal;

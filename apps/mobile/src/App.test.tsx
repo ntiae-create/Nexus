@@ -109,6 +109,9 @@ function makeContainer(routes: Record<string, Route>, storage: SecureStorage | n
       apiClient: client,
       createConversationService: (token: string) =>
         createConversationService({ service: coreService, token }),
+      // Fase 2: o app busca o catálogo do servidor ao entrar. Nestes testes a chamada não é o
+      // objeto de interesse e devolve `unavailable`, mantendo o fallback de build.
+      loadAssistantCatalog: async () => ({ status: "unavailable" as const }),
     },
   };
 }

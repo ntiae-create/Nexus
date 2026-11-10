@@ -12,6 +12,7 @@ import { createApiClient, type ApiClient } from "../../services/api-client.js";
 import { createAuthService } from "../../services/auth-service.js";
 import { createCoreService } from "../../services/core-service.js";
 import { createConversationService } from "../../services/conversation-service.js";
+import { loadAssistantCatalog } from "../../services/assistant-service.js";
 import { createSecureStorage, type SecureStorage } from "./secure-storage.js";
 import { createSessionManager, type SessionManager } from "./session-manager.js";
 
@@ -30,6 +31,13 @@ export interface AppContainer {
    * manager currently considers valid, and a screen unmount cannot leave a token behind.
    */
   readonly createConversationService: (token: string) => ReturnType<typeof createConversationService>;
+  /**
+   * Loads `GET /v1/assistants` and replaces the in-memory catalog.
+   *
+   * Never throws: on failure the app keeps the build fallback derived from
+   * `@nexus/assistant-profiles` (Fase 2, G6).
+   */
+  readonly loadAssistantCatalog: (token: string) => ReturnType<typeof loadAssistantCatalog>;
 }
 
 /**
@@ -120,6 +128,9 @@ export async function bootstrapApp(): Promise<AppContainer> {
     },
     createConversationService(token: string) {
       return createConversationService({ service: coreService, token });
+    },
+    loadAssistantCatalog(token: string) {
+      return loadAssistantCatalog({ service: coreService, token });
     },
     async configureApiBaseUrl(value: string) {
       const normalized = normalizeApiBaseUrl(value);
