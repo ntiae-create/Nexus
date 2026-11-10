@@ -1319,8 +1319,31 @@ Cada fase é entregável, testável e reversível. Nenhuma remove funcionalidade
   payload segue divergente, porque isso viraria bloqueio da própria correção. O defeito é
   **documentado** (§2 L9, com a tabela de divergências) e vira especificação de comportamento
   correto na Fase 2.
-- **Testes:** suíte atual verde (507 testes; 28 integrações PostgreSQL no workflow dedicado);
+- **Testes:** suíte atual verde (583 testes; 28 integrações PostgreSQL no workflow dedicado);
   guards de acoplamento; caracterização do comportamento intencional. Nenhum teste asserta bug.
+- **Como o guard identifica acoplamento.** Análise **estrutural com o parser do TypeScript**
+  (`typescript@5.9.3`, já devDependency de `apps/server`), não heurística de texto. Heurísticas
+  de tokenização foram descartadas após dois falsos negativos demonstrados: um `"]"` dentro de
+  string fechava o array antes da hora e a ocorrência **desaparecia** do inventário; e a âncora
+  era atribuída à última `const/let/var` do arquivo, mesmo quando a coleção pertencia a uma
+  propriedade de objeto ou a um `return`.
+  - **Listas** (`findCouplingGroups`): array literal, união de tipos e enum, com 2+ chaves
+    distintas.
+  - **Catálogos** (`findCatalogDeclarations`): coleções de objetos com propriedade
+    `key`/`assistantKey`, 2+ chaves distintas.
+  - **Identidade por ocorrência**: `padrão:arquivo::chaves@container`, onde o container é a
+    cadeia estrutural que possui a coleção (`CATALOGO`, `X.assistentes`, `listar()`,
+    `GRUPOS[0]`, `montar@CATALOGO`). Não usa número de linha: reformatar mantém a identidade,
+    renomear o container a invalida — mudança estrutural que merece revisão.
+  - **Âncora conservadora**: quando não há container nomeado (coleção como argumento de chamada,
+    expressão de nível superior), a âncora é explícita (`<argumento>`, `<expr>`), nunca uma
+    declaração vizinha.
+  - **Limitações residuais conhecidas:** (1) um arquivo com erro de sintaxe produz AST parcial —
+    nesse caso o scanner é conservador e pode deixar de ver uma ocorrência; `tsc --noEmit` cobre
+    o caso no CI. (2) padrões de catálogo montados em tempo de execução (`map`, spread de
+    variável, `Object.fromEntries`) não são literais e não entram no inventário por construção.
+    (3) o guard detecta **duplicação estrutural**, não paridade de valores — divergência de
+    conteúdo entre cópias é matéria da Fase 2.
 
 ### Fase 1 — Separar identificador de catálogo (G1, G3)
 

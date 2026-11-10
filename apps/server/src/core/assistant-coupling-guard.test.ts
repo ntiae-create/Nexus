@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { listAssistantProfiles } from "@nexus/assistant-profiles";
+import ts from "typescript";
 
 /**
  * Fase 0 — guard estrutural de acoplamento (Etapa 3C.3).
@@ -52,103 +53,40 @@ const REPO_ROOT = ((): string => {
 const INITIAL_KEYS = ["yui", "alice", "schwi"] as const;
 const SCANNED_DIRECTORIES = ["apps/server/src", "apps/mobile/src", "packages"] as const;
 
+const KEY_SET: ReadonlySet<string> = new Set(INITIAL_KEYS);
+
 /**
- * Remove comentários de bloco e de linha, preservando o número de linhas para que o relatório
- * aponte a posição correta. Strings ficam intactas aqui — são tratadas na fase de análise.
+ * Cria a AST. `setParentNodes = true` — a âncora sobe pela cadeia de pais.
+ *
+ * `ScriptKind` é derivado do nome do arquivo: `.tsx` precisa de `TSX`, senão o parser trata
+ * `<div>` como operador de comparação, falha, e devolve uma AST parcial em que o catálogo pode
+ * desaparecer. O guard varre `apps/mobile/src`, que tem `.tsx` — sem isso o falso negativo é
+ * silencioso justamente nos arquivos de UI.
  */
-export function stripComments(source: string): string {
-  let result = "";
-  let index = 0;
-  let inBlockComment = false;
-  let inLineComment = false;
-  let stringQuote: string | null = null;
-
-  while (index < source.length) {
-    const char = source[index]!;
-    const next = source[index + 1];
-
-    if (inLineComment) {
-      if (char === "\n") {
-        inLineComment = false;
-        result += char;
-      } else {
-        result += " ";
-      }
-      index += 1;
-      continue;
-    }
-
-    if (inBlockComment) {
-      if (char === "*" && next === "/") {
-        inBlockComment = false;
-        result += "  ";
-        index += 2;
-        continue;
-      }
-      result += char === "\n" ? "\n" : " ";
-      index += 1;
-      continue;
-    }
-
-    if (stringQuote) {
-      result += char;
-      if (char === "\\") {
-        result += next ?? "";
-        index += 2;
-        continue;
-      }
-      if (char === stringQuote) stringQuote = null;
-      index += 1;
-      continue;
-    }
-
-    if (char === "/" && next === "/") {
-      inLineComment = true;
-      result += "  ";
-      index += 2;
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      inBlockComment = true;
-      result += "  ";
-      index += 2;
-      continue;
-    }
-    if (char === '"' || char === "'" || char === "`") {
-      stringQuote = char;
-      result += char;
-      index += 1;
-      continue;
-    }
-
-    result += char;
-    index += 1;
-  }
-
-  return result;
+function parseSource(text: string, fileName = "analisado.ts"): ts.SourceFile {
+  const kind = /\.tsx$/i.test(fileName) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  return ts.createSourceFile(fileName, text, ts.ScriptTarget.ES2022, true, kind);
 }
 
-const KEY_TOKEN = new RegExp(`^["'\`](${INITIAL_KEYS.join("|")})["'\`]$`);
-
-/**
- * Encontra **grupos** de chaves de assistente que formam uma lista literal.
- *
- * A varredura percorre os tokens relevantes (chaves em string e separadores de lista) na ordem
- * em que aparecem no arquivo, **atravessando linhas**. Um grupo é acumulado enquanto o que
- * separa duas chaves é apenas pontuação de lista: `,`, `|`, `[`, `]`, `(`, `)`, espaço, seta de
- * tipo (`as const`), ou conteúdo de array. Qualquer outro token (por exemplo `:` seguido de
- * valor, ou uma propriedade de objeto entre as chaves) encerra o grupo.
- */
-/**
- * Linha (1-based) de um offset. Calculada sob demanda — o tokenizador de listas antes fazia isso
- * de forma incremental, mas separar em uma função única evita duas noções divergentes de linha.
- */
-function lineOf(source: string, offset: number): number {
-  let line = 1;
-  for (let index = 0; index < offset && index < source.length; index += 1) {
-    if (source[index] === "\n") line += 1;
+function assistantKeyOfLiteral(node: ts.Node): string | null {
+  if (ts.isStringLiteral(node) && KEY_SET.has(node.text)) return node.text;
+  // Em posição de tipo, `"yui"` não é StringLiteral: é LiteralTypeNode envolvendo um.
+  if (ts.isLiteralTypeNode(node)) return assistantKeyOfLiteral(node.literal);
+  // `"yui" as const` / `"yui" as InitialAssistantKey` / `"yui" satisfies X`
+  if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) {
+    return assistantKeyOfLiteral(node.expression);
   }
-  return line;
+  return null;
+}
+
+function keyOfProperty(node: ts.Node): string | null {
+  if (!ts.isPropertyAssignment(node)) return null;
+  const name = node.name;
+  const isKeyProperty =
+    (ts.isIdentifier(name) && (name.text === "key" || name.text === "assistantKey")) ||
+    (ts.isStringLiteral(name) && (name.text === "key" || name.text === "assistantKey"));
+  if (!isKeyProperty) return null;
+  return assistantKeyOfLiteral(node.initializer);
 }
 
 export interface CouplingGroup {
@@ -156,202 +94,277 @@ export interface CouplingGroup {
   readonly line: number;
 }
 
-export function findCouplingGroups(rawSource: string): CouplingGroup[] {
-  const source = stripComments(rawSource);
-
-  // Tokeniza tudo o que pode ocorrer entre duas chaves: chaves em string, "pontes" de lista
-  // (vírgula, colchete, parêntese, barra de união, `as const`) e **qualquer outro token**, que
-  // funciona como quebra de contexto. Sem o terceiro grupo, `;` e identificadores seriam
-  // ignorados e duas listas distintas no mesmo arquivo seriam fundidas em uma só — um falso
-  // negativo grave. O processamento é em streaming (sem array intermediário) e a linha é
-  // contada de forma incremental: com um token por caractere, `slice(0, index).split()` por
-  // token seria quadrático e o guard estouraria o tempo de teste.
-  const tokenRegex =
-    /(["'`])((?:[^"'`\\]|\\.)*)\1|([,[\]()|]|\bas\s+const\b)|([^\s])/g;
-
-  const groups: CouplingGroup[] = [];
-  let current: string[] = [];
-  let startLine = 0;
-  let line = 1;
-  let cursor = 0;
-
-  const advanceTo = (index: number): void => {
-    for (; cursor < index; cursor += 1) {
-      if (source[cursor] === "\n") line += 1;
-    }
-  };
-
-  const flush = (): void => {
-    // Só forma acoplamento com 2+ chaves DISTINTAS. Chave repetida (ex.: `"yui"` duas vezes
-    // em contextos distintos) não caracteriza lista de alvos.
-    if (new Set(current).size >= 2) {
-      groups.push({ keys: [...new Set(current)], line: startLine });
-    }
-    current = [];
-  };
-
-  for (const match of source.matchAll(tokenRegex)) {
-    advanceTo(match.index ?? 0);
-
-    if (match[1]) {
-      const literal = `${match[1]}${match[2]}${match[1]}`;
-      if (KEY_TOKEN.test(literal)) {
-        if (current.length === 0) startLine = line;
-        current.push(match[2] ?? "");
-      } else {
-        flush();
-      }
-      continue;
-    }
-    if (match[3]) continue; // ponte: mantém o grupo aberto
-    flush(); // qualquer outro token encerra o grupo
-  }
-  flush();
-
-  return groups;
-}
-
-/**
- * Segundo padrão de acoplamento: **catálogo de objetos**.
- *
- * `apps/mobile/src/lib/config.ts`, `apps/mobile/src/lib/assistants.ts`, `routes/assistants.ts` e
- * `packages/assistant-profiles/src/catalog.ts` não têm lista literal de chaves — têm uma
- * sequência de objetos `{ key: "yui", … }, { key: "alice", … }`. Um detector de lista de strings
- * não os vê, e é justamente isso que os torna cópias silenciosas da fonte de verdade.
- *
- * **Cada declaração é uma ocorrência independente.** A implementação anterior juntava todas as
- * propriedades `key:` do arquivo num único grupo, e a assinatura `catalog:arquivo::chaves` ficava
- * idêntica para duas listas distintas com o mesmo conjunto de chaves — ou seja, declarar uma
- * liberava a outra. Aqui cada objeto/array é delimitado estruturalmente e recebe **âncora de
- * contexto**: o encadeamento de identificadores que o contém (`ASSISTANTS`, `profiles`, …).
- *
- * A âncora é estável por construção: não usa número de linha, então reformatar o arquivo não
- * muda a identidade — renomear o container, sim, e nesse caso a revisão da allowlist é
- * desejável.
- */
 export interface CatalogOccurrence {
   readonly keys: readonly string[];
   readonly line: number;
   readonly offset: number;
-  /** Encadeamento de containers que delimita a ocorrência: `PROFILES`, `a.b`, `<expr>`. */
+  /** Identidade estrutural do container. Ver `anchorOf`. */
   readonly anchor: string;
 }
 
-const CATALOG_KEY_PROPERTY = /\b(?:key|assistantKey)\s*:\s*(["'`])(yui|alice|schwi)\1/g;
+/**
+ * Analisador do guard — Fase 0.
+ *
+ * Histórico relevante: as duas versões anteriores eram heurísticas de texto. A primeira errava
+ * em listas multilinha; a segunda (delimitadores contados manualmente) tinha dois defeitos
+ * demonstrados por sonda antes desta reescrita:
+ *
+ * - um `"]"` dentro de uma **string** anterior à chave fechava o array antes da hora e a
+ *   ocorrência inteira desaparecia do inventário — falso negativo silencioso, o pior tipo de
+ *   falha para um guard;
+ * - `anchorBefore` atribuía a ocorrência à última `const/let/var` do arquivo, então
+ *   `const X = { assistentes: [...] }` virava âncora `X` em vez de `assistentes`.
+ *
+ * Em vez de remendar a tokenização, a análise passa a usar o parser do TypeScript — já
+ * devDependency de `apps/server` (`typescript@5.9.3`), nenhuma dependência nova. O parser
+ * resolve de graça strings, template literals, escapes, comentários, aninhamento e
+ * correspondência de delimitadores, e dá a estrutura necessária para a âncora.
+ *
+ * Limite conhecido e deliberado: o texto analisado é o do arquivo real; um arquivo com erro de
+ * sintaxe produz uma AST parcial. Nesse caso o scanner é conservador — ele não inventa
+ * ocorrências — e o `tsc --noEmit` da validação cobre o resto.
+ */
 
-/** Índices dos delimitadores de abertura/fechamento, respeitando strings e template literals. */
-function matchingDelimiter(source: string, openIndex: number): number {
-  const open = source[openIndex]!;
-  const close = open === "[" ? "]" : open === "{" ? "}" : null;
-  if (close === null) return -1;
+/**
+ * Encontra **grupos** de chaves de assistente que formam uma coleção literal.
+ *
+ * Cobre array literal (`["yui", "alice"]`), união de tipos (`"yui" | "alice"`), enum
+ * (`enum E { A = "yui" }`), e a forma `as const`. Um grupo exige **2+ chaves distintas** —
+ * chave isolada é dado pontual, não acoplamento.
+ */
+export function findCouplingGroups(rawSource: string, fileName?: string): CouplingGroup[] {
+  const sourceFile = parseSource(rawSource, fileName);
+  const groups: CouplingGroup[] = [];
 
-  let depth = 0;
-  for (let index = openIndex; index < source.length; index += 1) {
-    const char = source[index]!;
-    if (char === '"' || char === "'" || char === "`") {
-      index += 1;
-      while (index < source.length && source[index] !== char) {
-        if (source[index] === "\\") index += 1;
-        index += 1;
-      }
-      continue;
+  const push = (keys: readonly string[], node: ts.Node): void => {
+    const distinct = [...new Set(keys)];
+    if (distinct.length < 2) return;
+    groups.push({
+      keys: distinct,
+      line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+    });
+  };
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isArrayLiteralExpression(node)) {
+      const keys = node.elements
+        .map((element) => assistantKeyOfLiteral(element))
+        .filter((key): key is string => key !== null);
+      push(keys, node);
+    } else if (ts.isUnionTypeNode(node)) {
+      const keys = node.types
+        .map((member) => assistantKeyOfLiteral(member))
+        .filter((key): key is string => key !== null);
+      push(keys, node);
+    } else if (ts.isEnumDeclaration(node)) {
+      const keys = node.members
+        .map((member) =>
+          member.initializer === undefined ? null : assistantKeyOfLiteral(member.initializer),
+        )
+        .filter((key): key is string => key !== null);
+      push(keys, node);
     }
-    if (char === open) depth += 1;
-    else if (char === close) {
-      depth -= 1;
-      if (depth === 0) return index;
-    }
-  }
-  return -1;
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sourceFile);
+  return groups.sort((a, b) => a.line - b.line);
 }
 
-/** Delimitador que contém `index`, do mais interno para o mais externo. */
-function enclosingDelimiter(source: string, index: number): { open: number; close: number } | null {
-  let depth = 0;
-  for (let cursor = index; cursor >= 0; cursor -= 1) {
-    const char = source[cursor]!;
-    if (char === "]") depth += 1;
-    else if (char === "[") {
-      if (depth === 0) {
-        const close = matchingDelimiter(source, cursor);
-        if (close > index) return { open: cursor, close };
-      } else depth -= 1;
-    }
+/** Elemento de array que é entrada de catálogo: `{ key: "yui", … }` (ou literal direto de chave). */
+function keyOfCatalogEntry(element: ts.Node): string | null {
+  // Só objeto com propriedade de chave é entrada de catálogo. Uma lista de strings literais é o
+  // padrão `list` — classificá-la também como catálogo duplicaria a mesma ocorrência sob duas
+  // identidades e faria o guard exigir duas entradas de allowlist para um único ponto.
+  if (!ts.isObjectLiteralExpression(element)) return null;
+  for (const property of element.properties) {
+    const key = keyOfProperty(property);
+    if (key !== null) return key;
   }
   return null;
 }
 
 /**
- * Nome do container que abre `source` antes de `openIndex`.
+ * Identidade estrutural do container que **possui** o delimitador da ocorrência.
  *
- * Usa a última declaração (`const|let|var`) anterior ao delimitador, e não o texto imediatamente
- * à esquerda: `const RAW_CATALOG: readonly {…}[] = [` tem uma anotação de tipo entre o nome e o
- * `[`, e uma leitura do vizinho imediato devolveria `<expr>`. É esse nome que distingue
- * `ASSISTANTS` de `ASSISTANTS_MIRROR` — e o que faz a identidade sobreviver a reformatação,
- * porque não depende de linha nem de offset.
+ * A cadeia sobe pela AST e para no primeiro nó que de fato delimita a coleção. Isso corrige a
+ * heurística anterior, que só olhava para trás no texto:
+ *
+ * | situação                                   | âncora resultante        |
+ * | ---                                        | ---                      |
+ * | `const CATALOGO = [...]`                   | `CATALOGO`               |
+ * | `const X = { assistentes: [...] }`         | `X.assistentes`          |
+ * | `function listar() { return [...] }`        | `listar()`               |
+ * | `const N = [[...], [...]]`                 | `N[0]`, `N[1]`           |
+ * | `const A = {…}; const B = [...]`           | `B` — `A` nunca é usada  |
+ * | escopos diferentes, mesmo nome             | `<bloco>@` + nome        |
+ *
+ * **Regra de segurança:** a cadeia só para em um container quando existe um nó estrutural que o
+ * comprove (`VariableDeclaration`, `PropertyAssignment`, `ReturnStatement`, índice de array). Se
+ * a coleção está solta — argumento de chamada, expressão de nível superior, `export default` sem
+ * nome — a âncora é explícita e conservadora (`<argumento>`, `<expressão>`, `<bloco>`), nunca
+ * uma declaração qualquer que por acaso venha antes no arquivo.
  */
-function anchorBefore(source: string, openIndex: number): string {
-  const prefix = source.slice(0, openIndex);
-  if (/\bexport\s+default\s*$/.test(prefix)) return "export default";
+function joinParts(parts: readonly string[]): string {
+  return parts.reduce((acc, part) => {
+    if (part.startsWith("[")) return `${acc}${part}`;
+    return acc === "" ? part : `${acc}.${part}`;
+  }, "");
+}
 
-  let name: string | null = null;
-  for (const match of prefix.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) {
-    name = match[1]!;
+function anchorOf(collection: ts.Node, sourceFile: ts.SourceFile): string {
+  const parts: string[] = [];
+  let current: ts.Node | undefined = collection;
+
+  while (current !== undefined) {
+    const parent: ts.Node | undefined = current.parent;
+    if (parent === undefined) break;
+
+    if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
+      parts.unshift(parent.name.text);
+      return qualifyByScope(joinParts(parts), parent, sourceFile);
+    }
+    if (ts.isPropertyAssignment(parent)) {
+      parts.unshift(propertyName(parent.name, sourceFile));
+      current = parent;
+      continue;
+    }
+    if (ts.isReturnStatement(parent)) {
+      const label = functionLabel(parent, sourceFile);
+      parts.unshift(label);
+      const anchor = joinParts(parts);
+      // `listar()` já identifica a função: prefixar o escopo daria `listar@listar()`.
+      return anchor.startsWith("<") ? qualifyByScope(anchor, parent, sourceFile) : anchor;
+    }
+    if (ts.isArrayLiteralExpression(parent)) {
+      const index = parent.elements.findIndex((element) => element === current);
+      parts.unshift(`[${index}]`);
+      current = parent;
+      continue;
+    }
+    if (ts.isCallExpression(parent) || ts.isNewExpression(parent)) {
+      // `z.array(...).parse([...])` / `Object.freeze([...])`: a coleção é argumento de uma
+      // chamada. Se a chamada **é o valor** de uma declaração ou propriedade, ela ainda é o
+      // caminho até o dono real; só paramos com `<argumento>` quando não há dono estrutural.
+      current = parent;
+      continue;
+    }
+    if (ts.isExportAssignment(parent)) {
+      parts.unshift("<export default>");
+      return qualifyByScope(joinParts(parts), parent, sourceFile);
+    }
+    if (ts.isSourceFile(parent)) {
+      parts.unshift(parts.length === 0 ? "<argumento>" : "<expr>");
+      return joinParts(parts);
+    }
+    current = parent;
   }
-  if (name !== null) return name;
+  return "<expr>";
+}
 
-  // Sem declaração: ainda pode ser uma propriedade (`assistants: [`, `return [`).
-  const chain = /([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*:\s*$/.exec(prefix);
-  return chain ? chain[1]!.replace(/\s+/g, "") : "<expr>";
+function propertyName(name: ts.PropertyName, sourceFile: ts.SourceFile): string {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+    return ts.isStringLiteral(name) ? name.text : name.getText(sourceFile);
+  }
+  return `<${ts.SyntaxKind[name.kind]}>`;
+}
+
+function functionLabel(statements: ts.Node, sourceFile: ts.SourceFile): string {
+  let current: ts.Node | undefined = statements.parent;
+  while (current !== undefined) {
+    if (ts.isFunctionDeclaration(current) || ts.isFunctionExpression(current)) {
+      return current.name === undefined ? "<anônima>()" : `${current.name.text}()`;
+    }
+    if (ts.isMethodDeclaration(current)) {
+      return `${propertyName(current.name, sourceFile)}()`;
+    }
+    if (ts.isArrowFunction(current)) {
+      const parent: ts.Node = current.parent;
+      if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
+        return `${parent.name.text}()`;
+      }
+      return "<arrow>()";
+    }
+    if (ts.isSourceFile(current)) break;
+    current = current.parent;
+  }
+  return "<topo>()";
 }
 
 /**
- * Extrai as ocorrências de catálogo de um arquivo.
+ * Desambigua declarações homônimas em escopos diferentes.
  *
- * Uma ocorrência é o **menor delimitador** (array ou objeto) que contém uma propriedade de chave
- * — exceto uma chave solta dentro de um objeto que não é entrada de catálogo, como
- * `{ assistantKey: "yui" }` numa chamada: um único objeto sem irmãos não é catálogo. Agrupar por
- * delimitador é o que separa duas listas no mesmo arquivo mesmo quando uma é filha da outra.
+ * `const CATALOG` no nível do módulo e `const CATALOG` dentro de uma função têm o mesmo nome mas
+ * não são a mesma ocorrência. Quando o container não está no escopo do módulo, o nome recebe o
+ * escopo que o contém (`<bloco>@CATALOG`, `listar@CATALOG`).
  */
-export function findCatalogDeclarations(rawSource: string): CatalogOccurrence[] {
-  const source = stripComments(rawSource);
-
-  const occurrences = new Map<number, { offset: number; keys: string[] }>();
-  for (const match of source.matchAll(CATALOG_KEY_PROPERTY)) {
-    const offset = match.index ?? 0;
-    const delimiter = enclosingDelimiter(source, offset);
-    if (delimiter === null) continue;
-    const existing = occurrences.get(delimiter.open);
-    if (existing) {
-      existing.keys.push(match[2]!);
-    } else {
-      occurrences.set(delimiter.open, { offset, keys: [match[2]!] });
+function qualifyByScope(anchor: string, node: ts.Node, _sourceFile: ts.SourceFile): string {
+  let current: ts.Node | undefined = node.parent;
+  while (current !== undefined) {
+    if (ts.isSourceFile(current)) return anchor;
+    if (ts.isFunctionDeclaration(current) || ts.isFunctionExpression(current)) {
+      const label = current.name === undefined ? "<anônima>" : current.name.text;
+      return `${label}@${anchor}`;
     }
+    if (ts.isArrowFunction(current)) {
+      const parent: ts.Node = current.parent;
+      const label =
+        ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)
+          ? parent.name.text
+          : "<arrow>";
+      return `${label}@${anchor}`;
+    }
+    if (ts.isMethodDeclaration(current)) return `${propertyName(current.name, current.getSourceFile())}@${anchor}`;
+    current = current.parent;
   }
+  return anchor;
+}
 
-  const result: CatalogOccurrence[] = [];
-  for (const [openIndex, occurrence] of occurrences) {
-    const distinct = [...new Set(occurrence.keys)];
-    // Um único objeto `{ key: "yui" }` é dado pontual, não catálogo: exige 2+ chaves distintas.
-    if (distinct.length < 2) continue;
-    result.push({
-      keys: distinct,
-      line: lineOf(source, occurrence.offset),
-      offset: occurrence.offset,
-      anchor: anchorBefore(source, openIndex),
-    });
-  }
-  result.sort((a, b) => a.offset - b.offset);
+/**
+ * Extrai as ocorrências de catálogo de um arquivo: coleções com 2+ chaves **distintas** em
+ * propriedades `key:` / `assistantKey:` de objetos de entrada.
+ *
+ * Duas listas no mesmo arquivo são ocorrências separadas mesmo com as mesmas chaves — é o que
+ * permite a identidade por ocorrência que a allowlist exige.
+ */
+export function findCatalogDeclarations(rawSource: string, fileName?: string): CatalogOccurrence[] {
+  const sourceFile = parseSource(rawSource, fileName);
+  const occurrences: CatalogOccurrence[] = [];
 
-  // Dois catálogos com o MESMO nome no mesmo arquivo (`const CATALOG` duplicado) ainda precisam
-  // ser distinguíveis. O ordinal dentro do arquivo resolve isso e continua estável sob
-  // reformatação; só é aplicado quando há colisão, então o caso normal fica com o nome puro.
+  const visit = (node: ts.Node): void => {
+    if (ts.isArrayLiteralExpression(node)) {
+      const keys: string[] = [];
+      let firstEntry: ts.Node | null = null;
+      for (const element of node.elements) {
+        const key = keyOfCatalogEntry(element);
+        if (key === null) continue;
+        if (firstEntry === null) firstEntry = element;
+        keys.push(key);
+      }
+      const distinct = [...new Set(keys)];
+      if (distinct.length >= 2 && firstEntry !== null) {
+        occurrences.push({
+          keys: distinct,
+          line: sourceFile.getLineAndCharacterOfPosition(firstEntry.getStart(sourceFile)).line + 1,
+          offset: firstEntry.getStart(sourceFile),
+          anchor: anchorOf(node, sourceFile),
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sourceFile);
+
+  // Ordinal apenas quando há colisão de âncora (dois `const CATALOG` irmãos, por exemplo).
+  // Ordena antes por posição para que o ordinal seja estável.
+  occurrences.sort((a, b) => a.offset - b.offset);
   const total = new Map<string, number>();
-  for (const occurrence of result) {
+  for (const occurrence of occurrences) {
     total.set(occurrence.anchor, (total.get(occurrence.anchor) ?? 0) + 1);
   }
   const seen = new Map<string, number>();
-  return result.map((occurrence) => {
+  return occurrences.map((occurrence) => {
     if ((total.get(occurrence.anchor) ?? 0) < 2) return occurrence;
     const ordinal = (seen.get(occurrence.anchor) ?? 0) + 1;
     seen.set(occurrence.anchor, ordinal);
@@ -521,8 +534,8 @@ describe("Fase 0 — analisador de listas de assistentes", () => {
     );
     expect(groups).toHaveLength(1);
     expect(new Set(groups[0]!.keys)).toEqual(new Set(["yui", "alice"]));
-    // `line` aponta a primeira chave encontrada (linha 2), não o colchete.
-    expect(groups[0]!.line).toBe(2);
+    // Com o parser, a linha é a do início do nó — o `[` da linha 1, não a primeira chave.
+    expect(groups[0]!.line).toBe(1);
   });
 
   it("detecta união de tipos multilinha e enum", () => {
@@ -630,10 +643,10 @@ describe("Fase 0 — testes negativos obrigatórios (entradas sintéticas)", () 
       const expected = signatureOf(entry.file, entry.keys, entry.pattern, entry.anchor);
       const found =
         entry.pattern === "list"
-          ? findCouplingGroups(source).some(
+          ? findCouplingGroups(source, entry.file).some(
               (group) => signatureOf(entry.file, group.keys, "list") === expected,
             )
-          : findCatalogDeclarations(source).some(
+          : findCatalogDeclarations(source, entry.file).some(
               (occurrence) =>
                 signatureOf(entry.file, occurrence.keys, "catalog", occurrence.anchor) === expected,
             );
@@ -967,6 +980,243 @@ describe("Fase 0 — prova de regressão: legítima, duplicata, remoção", () =
   });
 });
 
+describe("Fase 0 — reconhecimento estrutural (parser) e âncora de container", () => {
+  // Todos os casos passam por `findUndeclaredCoupling`, o caminho de validação que a varredura
+  // usa. Nenhum compara strings de assinatura nem inspeciona resultado intermediário.
+  const validate = (source: string, file: string, allowed: ReadonlySet<string>) => {
+    const root = mkdtempSync(join(tmpdir(), "nexus-estrutural-"));
+    const path = join(root, file);
+    writeFileSync(path, source, "utf8");
+    try {
+      return findUndeclaredCoupling([path], root, allowed);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  const THREE = ["yui", "alice", "schwi"] as const;
+  const LEGIT = signatureOf("catalogo.ts", THREE, "catalog", "CATALOGO");
+  const legit = (): string =>
+    [
+      "export const CATALOGO = [",
+      '  { key: "yui", name: "YUI" },',
+      '  { key: "alice", name: "ALICE" },',
+      '  { key: "schwi", name: "SCHWI" },',
+      "] as const;",
+    ].join("\n");
+
+  it("1. string contendo \"]\" dentro de um catálogo válido não quebra o reconhecimento", () => {
+    // Antes do parser, o `]` da string fechava o array antes da hora e a ocorrência inteira
+    // desaparecia do inventário — um falso negativo silencioso.
+    const source = [
+      "export const CATALOGO = [",
+      '  { key: "yui", note: "fecha ] aqui" },',
+      '  { key: "alice", note: "] e ] e ]" },',
+      '  { key: "schwi" },',
+      "] as const;",
+    ].join("\n");
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+    // E a ocorrência existe de fato: sem a entrada, o guard acusa.
+    expect(validate(source, "catalogo.ts", new Set())).toHaveLength(1);
+  });
+
+  it("2. string contendo \"[\" dentro de um catálogo válido não cria ocorrência falsa", () => {
+    const source = [
+      "export const CATALOGO = [",
+      '  { key: "yui", note: "abre [ aqui" },',
+      '  { key: "alice", note: "[ [" },',
+      '  { key: "schwi" },',
+      "] as const;",
+    ].join("\n");
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+    expect(validate(source, "catalogo.ts", new Set())).toHaveLength(1);
+  });
+
+  it("3. comentários com delimitadores não afetam o reconhecimento", () => {
+    const source = [
+      "/* [{ key: \"yui\" }, { key: \"alice\" }] */",
+      "// ] [ } {",
+      legit(),
+      "/** depois: [ { key: \"schwi\" } ] */",
+    ].join("\n");
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+    expect(validate(source, "catalogo.ts", new Set())).toHaveLength(1);
+  });
+
+  it("4. array aninhado dentro de um objeto de catálogo não vira ocorrência própria", () => {
+    // `personality: ["a", "b"]` é array aninhado, não catálogo: não tem propriedade de chave.
+    const source = [
+      "export const CATALOGO = [",
+      '  { key: "yui", personality: ["natural", "objetiva"] },',
+      '  { key: "alice", personality: ["técnica", "direta"] },',
+      '  { key: "schwi" },',
+      "] as const;",
+    ].join("\n");
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+    expect(validate(source, "catalogo.ts", new Set())).toHaveLength(1);
+
+    // Arrays aninhados de OBJETOS com chaves são ocorrências separadas, com âncoras distintas.
+    const nested = [
+      "export const GRUPOS = [",
+      '  [{ key: "yui" }, { key: "alice" }],',
+      '  [{ key: "schwi" }, { key: "alice" }],',
+      "];",
+    ].join("\n");
+    const found = validate(nested, "grupos.ts", new Set());
+    expect(found.map((entry) => entry.anchor)).toEqual(["GRUPOS[0]", "GRUPOS[1]"]);
+  });
+
+  it("5. variável declarada antes do catálogo não é assumida como proprietária", () => {
+    const source = [
+      "const OUTRA_COISA = 1;",
+      "const TAMBEM_ANTES = { qualquer: 2 };",
+      legit(),
+    ].join("\n");
+    // A âncora é `CATALOGO`; declarar `OUTRA_COISA` não libera nada.
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+    expect(
+      validate(
+        source,
+        "catalogo.ts",
+        new Set([signatureOf("catalogo.ts", THREE, "catalog", "OUTRA_COISA")]),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("6. array retornado diretamente por função recebe a função como âncora", () => {
+    const source = [
+      "export function listarAssistentes() {",
+      '  return [{ key: "yui" }, { key: "alice" }, { key: "schwi" }];',
+      "}",
+    ].join("\n");
+    const anchor = signatureOf("catalogo.ts", THREE, "catalog", "listarAssistentes()");
+    expect(validate(source, "catalogo.ts", new Set([anchor]))).toEqual([]);
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toHaveLength(1);
+  });
+
+  it("7. array atribuído a propriedade de objeto é ancorado na propriedade, não no objeto", () => {
+    const source = [
+      "export const REGISTRO = {",
+      '  assistentes: [{ key: "yui" }, { key: "alice" }, { key: "schwi" }],',
+      "};",
+    ].join("\n");
+    const correct = signatureOf("catalogo.ts", THREE, "catalog", "REGISTRO.assistentes");
+    expect(validate(source, "catalogo.ts", new Set([correct]))).toEqual([]);
+    // A heurística antiga usaria `REGISTRO`; ela não pode liberar a ocorrência.
+    expect(
+      validate(source, "catalogo.ts", new Set([signatureOf("catalogo.ts", THREE, "catalog", "REGISTRO")])),
+    ).toHaveLength(1);
+  });
+
+  it("8. duas ocorrências independentes com as mesmas três chaves continuam separadas", () => {
+    const source = [legit(), "", "export const COPIA = [", '  { key: "yui" },', '  { key: "alice" },', '  { key: "schwi" },', "] as const;"].join("\n");
+    const found = validate(source, "catalogo.ts", new Set([LEGIT]));
+    expect(found).toHaveLength(1);
+    expect(found[0]!.anchor).toBe("COPIA");
+  });
+
+  it("9. catálogo legítimo continua aceito após reformatação", () => {
+    const reformatted = [
+      "",
+      "",
+      "export   const   CATALOGO   =",
+      "  [",
+      "",
+      "    {",
+      '      name: "YUI",',
+      '      key: "yui",',
+      "    },",
+      "",
+      "    {",
+      '      key: "alice",',
+      "    },",
+      "",
+      "    {",
+      '      key: "schwi",',
+      "    },",
+      "",
+      "  ] as const;",
+      "",
+    ].join("\n");
+    expect(validate(reformatted, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+  });
+
+  it("10. quando o container não pode ser determinado, a âncora é explícita e conservadora", () => {
+    // Catálogo passado como argumento: não há container nomeado. A âncora é `<argumento>` —
+    // explícita — e nunca uma declaração vizinha que não o possui.
+    const source = [
+      "const IRRELEVANTE = 1;",
+      'registrar([{ key: "yui" }, { key: "alice" }]);',
+    ].join("\n");
+    const found = validate(source, "catalogo.ts", new Set());
+    expect(found).toHaveLength(1);
+    expect(found[0]!.anchor).toBe("<argumento>");
+    expect(found[0]!.anchor).not.toBe("IRRELEVANTE");
+
+    // E a âncora conservadora é utilizável: pode ser declarada se o ponto for legítimo.
+    const allowed = new Set([
+      signatureOf("catalogo.ts", ["yui", "alice"], "catalog", "<argumento>"),
+    ]);
+    expect(validate(source, "catalogo.ts", allowed)).toEqual([]);
+  });
+
+  it("catálogo em arquivo .tsx é reconhecido (JSX exige ScriptKind.TSX)", () => {
+    // Regressão real desta rodada. Sem `ScriptKind.TSX`, o parser trata `<div>` como operador,
+    // falha, e devolve AST parcial: um catálogo escrito DENTRO do JSX perde o container e a
+    // âncora degrada para `<função>()` — o ponto continua visível, mas deixa de ser
+    // identificável por ocorrência. Arquivos de UI de `apps/mobile/src` são `.tsx`.
+    const source = [
+      "export function Lista() {",
+      "  return (",
+      "    <div>",
+      '      {[{ key: "yui" }, { key: "alice" }, { key: "schwi" }].map((item) => (',
+      "        <span key={item.key}>{item.key}</span>",
+      "      ))}",
+      "    </div>",
+      "  );",
+      "}",
+    ].join("\n");
+
+    const found = validate(source, "componente.tsx", new Set());
+    expect(found).toHaveLength(1);
+    // O container estrutural é o `return` da função: a coleção é parte do JSX retornado.
+    expect(found[0]!.anchor).toBe("Lista()");
+
+    // E a ocorrência é endereçável: declarada a âncora real, ela é aceita.
+    expect(
+      validate(
+        source,
+        "componente.tsx",
+        new Set([signatureOf("componente.tsx", THREE, "catalog", "Lista()")]),
+      ),
+    ).toEqual([]);
+  });
+
+  it("declarações homônimas em escopos diferentes são ocorrências distintas", () => {
+    const source = [
+      "export const CATALOGO = [{ key: \"yui\" }, { key: \"alice\" }];",
+      "export function montar() {",
+      "  const CATALOGO = [{ key: \"schwi\" }, { key: \"alice\" }];",
+      "  return CATALOGO;",
+      "}",
+    ].join("\n");
+    const found = validate(source, "catalogo.ts", new Set());
+    expect(found.map((entry) => entry.anchor)).toEqual(["CATALOGO", "montar@CATALOGO"]);
+  });
+
+  it("template literal e escapes dentro de string não confundem o parser", () => {
+    const source = [
+      "export const CATALOGO = [",
+      '  { key: "yui", note: `fecha ] e abre [ ${"x"}` },',
+      '  { key: "alice", note: "aspas \\" com ] dentro" },',
+      '  { key: "schwi" },',
+      "] as const;",
+    ].join("\n");
+    expect(validate(source, "catalogo.ts", new Set([LEGIT]))).toEqual([]);
+    expect(validate(source, "catalogo.ts", new Set())).toHaveLength(1);
+  });
+});
+
 describe("Fase 0 — allowlist é por ocorrência, não por arquivo", () => {
   it("cada ocorrência declara motivo e fase responsável pela remoção", () => {
     for (const entry of ALLOWED_OCCURRENCES) {
@@ -1032,12 +1282,12 @@ export function findUndeclaredCoupling(
     const relativePath = relative(repoRoot, file);
     const source = readFileSync(file, "utf8");
     const found: UndeclaredCoupling[] = [];
-    for (const group of findCouplingGroups(source)) {
+    for (const group of findCouplingGroups(source, relativePath)) {
       if (!allowed.has(signatureOf(relativePath, group.keys, "list"))) {
         found.push({ file: relativePath, line: group.line, keys: group.keys, pattern: "list" });
       }
     }
-    for (const occurrence of findCatalogDeclarations(source)) {
+    for (const occurrence of findCatalogDeclarations(source, relativePath)) {
       if (!allowed.has(signatureOf(relativePath, occurrence.keys, "catalog", occurrence.anchor))) {
         found.push({
           file: relativePath,
@@ -1087,10 +1337,10 @@ describe("Fase 0 — varredura do repositório", () => {
       const signature = signatureOf(entry.file, entry.keys, entry.pattern, entry.anchor);
       const found =
         entry.pattern === "list"
-          ? findCouplingGroups(source).some(
+          ? findCouplingGroups(source, entry.file).some(
               (group) => signatureOf(entry.file, group.keys, "list") === signature,
             )
-          : findCatalogDeclarations(source).some(
+          : findCatalogDeclarations(source, entry.file).some(
               (occurrence) =>
                 signatureOf(entry.file, occurrence.keys, "catalog", occurrence.anchor) === signature,
             );
