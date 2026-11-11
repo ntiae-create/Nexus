@@ -152,3 +152,89 @@ describe("Fase 4 — VIVY no catálogo canônico", () => {
     // Isso é anterior à Fase 4 e vale para as quatro assistentes; alterá-lo ampliaria o escopo.
   });
 });
+
+describe("Fase 4 — contrato de entrada de `modelPreference` (não apenas o objeto transformado)", () => {
+  /**
+   * Motivo destes testes: os dois campos são obrigatórios **na entrada**, não só no resultado.
+   *
+   * Com `requiredCapabilities: z.array(...).default([])`, `{}` era aceito e o Zod preenchia `[]`.
+   * O objeto parseado saía correto, então um teste que só olhasse o perfil final não distinguiria
+   * "declarou lista vazia" de "não declarou nada" — que é exatamente a diferença que a Fase 3
+   * estabeleceu para `coordination`: ausência de declaração não pode virar padrão implícito.
+   *
+   * Estes testes olham o **resultado do parse da entrada**, não o catálogo.
+   */
+  const base = (): Record<string, unknown> => {
+    const { modelPreference: _ignored, ...rest } = CANONICAL_PROFILE_REGISTRY.getByKey("vivy")!;
+    return rest as Record<string, unknown>;
+  };
+
+  it("`modelPreference` ausente é rejeitado", () => {
+    const parsed = assistantProfileSchema.safeParse(base());
+    expect(parsed.success).toBe(false);
+    expect(JSON.stringify(parsed.error?.issues)).toContain("modelPreference");
+  });
+
+  it("`requiredCapabilities` ausente dentro de `modelPreference` é rejeitado", () => {
+    // O caso que o `.default([])` escondia: `{}` passava e virava `{ requiredCapabilities: [] }`.
+    const parsed = assistantProfileSchema.safeParse({ ...base(), modelPreference: {} });
+    expect(parsed.success).toBe(false);
+    expect(JSON.stringify(parsed.error?.issues)).toContain("requiredCapabilities");
+  });
+
+  it("array vazio é aceito — é a declaração legítima de 'nenhuma exigência extra'", () => {
+    const parsed = assistantProfileSchema.safeParse({
+      ...base(),
+      modelPreference: { requiredCapabilities: [] },
+    });
+    expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
+    expect(parsed.data?.modelPreference.requiredCapabilities).toEqual([]);
+  });
+
+  it("capability de modelo inválida é rejeitada", () => {
+    for (const invalid of ["telepathy", "ui_design", ""]) {
+      const parsed = assistantProfileSchema.safeParse({
+        ...base(),
+        modelPreference: { requiredCapabilities: [invalid] },
+      });
+      expect(parsed.success, `aceitou capability inválida: ${JSON.stringify(invalid)}`).toBe(false);
+    }
+  });
+
+  it("capability do perfil não serve como capability de modelo", () => {
+    // A confusão que o campo existe para impedir: `software_engineering` é capability da
+    // assistente (texto do catálogo), não do modelo. O enum de modelo é fechado.
+    const vivy = CANONICAL_PROFILE_REGISTRY.getByKey("vivy")!;
+    expect(vivy.capabilities).toContain("software_engineering");
+    const parsed = assistantProfileSchema.safeParse({
+      ...base(),
+      modelPreference: { requiredCapabilities: ["software_engineering"] },
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("VIVY continua exigindo `code`", () => {
+    // Reafirmado aqui, e não só no teste de catálogo: remover o `.default([])` não pode ter mudado
+    // a exigência efetiva da VIVY.
+    const parsed = assistantProfileSchema.safeParse({
+      ...base(),
+      modelPreference: { requiredCapabilities: ["code"] },
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.data?.modelPreference.requiredCapabilities).toEqual(["code"]);
+    expect(CANONICAL_PROFILE_REGISTRY.getByKey("vivy")!.modelPreference.requiredCapabilities).toEqual([
+      "code",
+    ]);
+  });
+
+  it("os quatro perfis do catálogo declaram o campo explicitamente", () => {
+    // Sem default, um perfil que dependesse do preenchimento automático quebraria no parse do
+    // catálogo — este teste é a guarda contra "funcionou porque o Zod completou".
+    for (const profile of listAssistantProfiles()) {
+      expect(
+        Object.prototype.hasOwnProperty.call(profile.modelPreference, "requiredCapabilities"),
+        profile.key,
+      ).toBe(true);
+    }
+  });
+});

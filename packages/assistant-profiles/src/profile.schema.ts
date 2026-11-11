@@ -125,16 +125,23 @@ export const assistantProfileSchema = stableAssistantFieldsSchema.extend({
    * provedor (`chat`, `code`, `vision`…). Misturar os dois faria "ui_design" virar exigência de
    * modelo, o que não existe.
    *
-   * Obrigatório e sempre presente, mesmo que vazio: um perfil que não declarasse nada ficaria
-   * `undefined` e cada ponto de uso teria de inventar um padrão — o mesmo defeito que a Fase 3
-   * removeu da coordenação.
+   * Obrigatório em **dois** níveis, e a distinção não é acadêmica:
+   *
+   *   1. o objeto `modelPreference` precisa existir — um perfil sem ele ficaria `undefined` e
+   *      cada ponto de uso teria de inventar um padrão, o mesmo defeito que a Fase 3 removeu da
+   *      coordenação;
+   *   2. `requiredCapabilities` precisa ser **declarado**. Sem `.default([])`, omitir o campo é
+   *      erro de contrato em vez de virar lista vazia. A diferença importa: `[]` é uma afirmação
+   *      — "não exijo nada além de chat" —, e "não declarei" é ausência de decisão. Preencher a
+   *      segunda com o significado da primeira esconde a omissão atrás de um objeto que sempre
+   *      parece completo, e o parse de saída não distingue os dois casos.
    *
    * `.strict()` recusa nome de modelo fixo (`model: "openai/gpt"`): o plano proíbe acoplar a
    * seleção a um fornecedor; a exigência é por **capacidade**, não por produto.
    */
   modelPreference: z
     .object({
-      requiredCapabilities: z.array(modelCapabilitySchema).default([]),
+      requiredCapabilities: z.array(modelCapabilitySchema),
     })
     .strict(),
 
