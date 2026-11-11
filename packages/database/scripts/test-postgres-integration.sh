@@ -9,8 +9,8 @@ fi
 database_package_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 migration_dir="$database_package_dir/migrations"
 migration_count=$(find "$migration_dir" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d ' ')
-if [ "$migration_count" -ne 6 ]; then
-  echo "Expected migrations 00001 through 00006 in the fresh test database; found $migration_count." >&2
+if [ "$migration_count" -ne 7 ]; then
+  echo "Expected migrations 00001 through 00007 in the fresh test database; found $migration_count." >&2
   exit 2
 fi
 
@@ -43,3 +43,23 @@ echo "Verifying assistant seed parity and migrations 00005/00006 idempotency."
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-assistant-seed-parity.sql"
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/bootstrap.sql"
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U nexus_app -d nexus_test -f - < "$database_package_dir/tests/postgres/integration.sql"
+# Fase 5 (G13): isolamento entre owners, append-only da auditoria e dominio de grants/preferencias.
+# ORDEM IMPORTA: a exclusao do owner so e observavel como `postgres` (`nexus_app` tem apenas SELECT
+# nessa tabela), vive em arquivo separado, roda em transacao com ROLLBACK e exige as tabelas da
+# Fase 5 VAZIAS — por isso e executada ANTES de verify-stage-5-rls.sql, que deixa linhas.
+# A declaracao da FK (`confdeltype`) ja e verificada no bloco M de verify-stage-5-rls.sql.
+#
+# O nome do arquivo diz o que ele comprova: `verify-stage-5-owner-deletion.sql` NAO demonstra que
+# excluir o owner funciona com dados presentes — isso falha hoje (SQLSTATE 23503 em
+# `tombstones_owner_id_fkey`, por causa dos triggers de tombstone de 00001). O arquivo registra a
+# falha e prova a cascata das tabelas da Fase 5 num cenario em que a limitacao foi contornada.
+echo "Verifying Phase 5 grant lifecycle, audit and enum ACL."
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-grants-lifecycle.sql"
+echo "Verifying Phase 5 assistant preferences display_label."
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-preferences.sql"
+echo "Verifying Phase 5 owner-deletion behavior and cascade."
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-owner-deletion.sql"
+echo "Verifying Phase 5 cascade with the DELETE policy removed."
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-cascade-without-delete-policy.sql"
+echo "Verifying Phase 5 tool grants and assistant preferences under RLS."
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U nexus_app -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-rls.sql"
