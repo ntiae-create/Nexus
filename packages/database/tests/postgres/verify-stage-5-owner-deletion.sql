@@ -56,9 +56,10 @@
 -- owner nao ha dispositivo a reconciliar nem destino valido para a FK, e o tombstone nao e
 -- gravado. Nenhum privilegio e ampliado, nenhuma policy e alterada.
 --
--- Consequencia: excluir o owner SO funciona quando nao sobra nenhuma linha nas tres tabelas.
--- §4 esvazia as tres de proposito. Isso e um CONTORNO da limitacao, nao uma demonstracao de
--- que a exclusao do owner funciona com dados reais — §3 e que documenta a falha.
+-- Consequencia (ANTES da 00008): excluir o owner so funcionava quando nao sobrava nenhuma linha
+-- nas tres tabelas. §4 esvazia as tres de proposito — nao como contorno necessario, mas para isolar
+-- a cascata das tabelas da Fase 5 sem que nenhum trigger de tombstone entre em jogo. A exclusao com
+-- dados presentes e demonstrada em §3.
 --
 -- Tudo acontece em transacoes com ROLLBACK e em subtransacoes com EXCEPTION: o banco nao e
 -- alterado ao final.
@@ -292,7 +293,7 @@ $$;
 -- =============================================================================================
 -- HISTORICO DESTE BLOCO. Ele foi escrito quando a exclusao do owner falhava com dados presentes:
 -- o trigger `record_deleted_entity()` (00001) tentava gravar em `tombstones` um `owner_id` que a
--- cascata acabara de apagar, e a policy de FORMA RLS de `tombstones` recusava com SQLSTATE 42501
+-- cascata acabara de apagar, e a policy de FORCE ROW LEVEL SECURITY de `tombstones` recusava com SQLSTATE 42501
 -- (a FK `tombstones_owner_id_fkey` nunca chegava a ser avaliada, de modo que o 23503 registrado
 -- nas rodadas anteriores so aparecia com um runner SUPERUSER, que contorna RLS).
 --

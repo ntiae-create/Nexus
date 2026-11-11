@@ -604,8 +604,9 @@ A trilha é **imutável, não indestrutível**. Três afirmações distintas, ca
 | Excluir **definitivamente o owner**, com dados presentes | trilha **apagada** junto (`owner_id ON DELETE CASCADE`); ver a nota de retenção em §4.5.1 | `verify-owner-deletion.sql` §5 e §7 |
 
 A remoção do owner não é alcançável pela aplicação: `nexus_app` tem apenas `SELECT` em
-`owner_identity`. Por isso o teste do efeito roda como `postgres`, em transação com `ROLLBACK`, num
-arquivo separado — a declaração da FK (`confdeltype = 'c'`) é verificada no bloco M do teste de RLS.
+`owner_identity`. Por isso o teste do efeito roda em arquivo separado, como `nexus_migrator` — o
+dono do schema, com `rolsuper = f` e `rolbypassrls = f`, que é o papel real de operação. A
+declaração da FK (`confdeltype = 'c'`) é verificada no bloco M do teste de RLS.
 
 > ### 4.5.1 O defeito que existia aqui — corrigido pela migration 00008
 >
