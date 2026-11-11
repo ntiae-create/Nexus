@@ -58,10 +58,13 @@ describe("Fase 2 — fallback de build derivado dos perfis", () => {
 
   it("o app inicia com o fallback disponível, sem depender de rede", () => {
     // Estado inicial do módulo: nenhuma chamada de API aconteceu.
+    // Fase 4: o fallback acompanha o catálogo, que passou a ter quatro perfis. Continua sem
+    // qualquer chamada de rede — só o build.
     expect(ASSISTANT_CATALOG.map((assistant) => assistant.key)).toEqual([
       "yui",
       "alice",
       "schwi",
+      "vivy",
     ]);
     expect(getAssistantByKey("yui")?.name).toBe("YUI");
   });
@@ -103,14 +106,17 @@ describe("Fase 2 — catálogo alimentado pela API", () => {
 
   it("resposta vazia ou inválida não substitui o fallback", () => {
     // Um servidor desatualizado não pode deixar o app sem catálogo.
+    const fallbackSize = FALLBACK_CATALOG.length;
+    expect(fallbackSize).toBe(4);
+
     applyCatalogFromApi([]);
-    expect(ASSISTANT_CATALOG).toHaveLength(3);
+    expect(ASSISTANT_CATALOG).toHaveLength(fallbackSize);
 
     applyCatalogFromApi([{ ...API_RECORD, key: "INVÁLIDA" }]);
-    expect(ASSISTANT_CATALOG).toHaveLength(3);
+    expect(ASSISTANT_CATALOG).toHaveLength(fallbackSize);
 
     applyCatalogFromApi([API_RECORD, { ...API_RECORD }]);
-    expect(ASSISTANT_CATALOG).toHaveLength(3);
+    expect(ASSISTANT_CATALOG).toHaveLength(fallbackSize);
   });
 
   it("reset volta ao fallback", () => {
@@ -120,6 +126,7 @@ describe("Fase 2 — catálogo alimentado pela API", () => {
       "yui",
       "alice",
       "schwi",
+      "vivy",
     ]);
   });
 });

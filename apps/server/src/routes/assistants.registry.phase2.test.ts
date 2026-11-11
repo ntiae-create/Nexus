@@ -290,11 +290,15 @@ describe("Fase 2 — uma entrada nova no registro aparece na API sem tocar a rot
       });
       expect(response.statusCode).toBe(200);
       const body = response.json() as { assistants: AssistantPayload[] };
-      expect(body.assistants).toHaveLength(4);
+      // Fase 4: o catálogo de produção passou a ter quatro perfis, então o sintético é o quinto.
+      // O que este teste prova continua idêntico: a rota não conhece o perfil novo — ela serve o
+      // registro injetado, e o perfil sintético aparece sem que a rota tenha sido alterada.
+      expect(body.assistants).toHaveLength(5);
       expect(body.assistants.map((assistant) => assistant.key)).toEqual([
         "yui",
         "alice",
         "schwi",
+        "vivy",
         "delta",
       ]);
       expect(body.assistants.at(-1)).toEqual({
@@ -329,12 +333,12 @@ describe("Fase 2 — uma entrada nova no registro aparece na API sem tocar a rot
     }
   });
 
-  it("o catálogo de produção continua com exatamente três perfis", () => {
-    // Contrapeso explícito: nada do teste acima vaza para produção.
-    expect(listAssistantProfiles().map((profile) => profile.key)).toEqual([
-      "yui",
-      "alice",
-      "schwi",
-    ]);
+  it("o catálogo de produção continua sendo exatamente o declarado, sem o perfil sintético", () => {
+    // Contrapeso explícito: nada do teste acima vaza para produção. A lista é literal e ordenada
+    // de propósito — se um perfil sintético vazasse, ele apareceria aqui com nome.
+    const keys = listAssistantProfiles().map((profile) => profile.key);
+    expect(keys).toEqual(["yui", "alice", "schwi", "vivy"]);
+    expect(keys).not.toContain("delta");
+    expect(keys).toHaveLength(4);
   });
 });

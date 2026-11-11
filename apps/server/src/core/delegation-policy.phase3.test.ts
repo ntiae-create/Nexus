@@ -140,7 +140,9 @@ describe("Fase 3 — a política do servidor é uma camada independente", () => 
   });
 
   it("produz o resultado aprovado no catálogo canônico", () => {
-    // A camada nova não pode mudar o comportamento aprovado: YUI continua com os seus dois alvos.
+    // A camada nova não pode mudar o comportamento aprovado: YUI continua com os alvos que
+    // declara. A Fase 4 acrescentou VIVY a essa lista — o teste acompanha o catálogo, sem deixar
+    // de afirmar a ordem, que é o que revelaria um alvo inserido por acidente.
     //
     // Antes este teste comparava "com política" × "sem política" — e a comparação só fazia
     // sentido porque omitir a política significava "sem restrição". Depois do endurecimento a
@@ -148,7 +150,7 @@ describe("Fase 3 — a política do servidor é uma camada independente", () => 
     const yui = CANONICAL_PROFILE_REGISTRY.getByKey("yui")!;
     expect(
       effectiveDelegationTargets(yui, CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY),
-    ).toEqual(["alice", "schwi"]);
+    ).toEqual(["alice", "schwi", "vivy"]);
   });
 });
 
@@ -160,7 +162,7 @@ describe("Fase 3 — interseção das três condições (§5.5)", () => {
       CANONICAL_PROFILE_REGISTRY,
       SERVER_DELEGATION_POLICY,
     );
-    expect(targets).toEqual(["alice", "schwi"]);
+    expect(targets).toEqual(["alice", "schwi", "vivy"]);
   });
 
   it("declarado, mas bloqueado pela política do servidor, NÃO aparece", () => {
@@ -172,7 +174,7 @@ describe("Fase 3 — interseção das três condições (§5.5)", () => {
       CANONICAL_PROFILE_REGISTRY,
       policyBlocking("alice"),
     );
-    expect(targets).toEqual(["schwi"]);
+    expect(targets).toEqual(["schwi", "vivy"]);
   });
 
   it("permitido pela política, mas não declarado pelo perfil, NÃO aparece", () => {
@@ -185,7 +187,7 @@ describe("Fase 3 — interseção das três condições (§5.5)", () => {
       registry,
       policyCapped(10),
     );
-    expect(targets).toEqual(["alice", "schwi"]);
+    expect(targets).toEqual(["alice", "schwi", "vivy"]);
     expect(targets).not.toContain("delta");
     void yui;
   });
@@ -201,6 +203,9 @@ describe("Fase 3 — interseção das três condições (§5.5)", () => {
       CANONICAL_PROFILE_REGISTRY.getByKey("yui")!,
       disabledAlice,
       CANONICAL_PROFILE_REGISTRY.getByKey("schwi")!,
+      // Fase 4: incluída para que o cenário continue isolado em ALICE — a YUI a declara como
+      // alvo, e o registro exige que todo alvo declarado exista no conjunto.
+      CANONICAL_PROFILE_REGISTRY.getByKey("vivy")!,
     ]);
 
     const targets = effectiveDelegationTargets(
@@ -208,7 +213,7 @@ describe("Fase 3 — interseção das três condições (§5.5)", () => {
       registry,
       SERVER_DELEGATION_POLICY,
     );
-    expect(targets).toEqual(["schwi"]);
+    expect(targets).toEqual(["schwi", "vivy"]);
   });
 
   it("um coordenador desativado não recebe alvos efetivos", () => {
@@ -286,7 +291,7 @@ describe("Fase 3 — a validação usa a mesma interseção", () => {
     // `delegationTargetsFor` e `validateDelegationPlan` precisam concordar quando recebem a
     // mesma política — senão o coordenador promete o que a validação recusa.
     const targets = delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, policyBlocking("alice"));
-    expect(targets).toEqual(["schwi"]);
+    expect(targets).toEqual(["schwi", "vivy"]);
 
     expect(captureError(() =>
       validateDelegationPlan({
@@ -311,8 +316,8 @@ describe("Fase 3 — a validação usa a mesma interseção", () => {
 });
 
 describe("Fase 3 — compatibilidade preservada após a correção", () => {
-  it("YUI continua coordenando ALICE e SCHWI", () => {
-    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual(["alice", "schwi"]);
+  it("YUI continua coordenando ALICE e SCHWI (e, desde a Fase 4, VIVY)", () => {
+    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual(["alice", "schwi", "vivy"]);
     expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
   });
 

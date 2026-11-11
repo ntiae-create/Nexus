@@ -45,10 +45,13 @@ const catalogSource = readFileSync(
   resolve(repoRoot, "packages/assistant-profiles/src/catalog.ts"),
   "utf8",
 );
-const migrationSource = readFileSync(
-  resolve(repoRoot, "packages/database/migrations/00001_initial_schema.sql"),
-  "utf8",
-);
+// O seed é lido das duas migrations que o compõem: a 00001 (as três iniciais) e a 00006 (a VIVY
+// da Fase 4). A 00001 é imutável — migrations aplicadas não são reescritas —, então o estado final
+// do seed é a união das duas, e é isso que o espelho do app precisa refletir.
+const migrationSources = [
+  "packages/database/migrations/00001_initial_schema.sql",
+  "packages/database/migrations/00006_assistant_seed_vivy.sql",
+].map((file) => readFileSync(resolve(repoRoot, file), "utf8"));
 
 /** `{ id, key, name }` triples extracted from the frozen catalog source. */
 function frozenProfiles(): { id: string; key: string; name: string }[] {
@@ -60,24 +63,33 @@ function frozenProfiles(): { id: string; key: string; name: string }[] {
   }));
 }
 
-/** `('uuid', 'key', 'NAME', ...)` rows of the seeded `nexus.assistants` insert. */
+/** `('uuid', 'key', 'NAME', ...)` rows of every seeded `nexus.assistants` insert, in file order. */
 function seededAssistants(): { id: string; key: string; name: string }[] {
-  const insertStart = migrationSource.indexOf("INSERT INTO nexus.assistants");
-  expect(insertStart).toBeGreaterThan(-1);
-  const insertEnd = migrationSource.indexOf(";", insertStart);
-  const block = migrationSource.slice(insertStart, insertEnd);
-  const pattern = /\('([0-9a-f-]+)',\s*'([a-z]+)',\s*'([A-Z]+)'/g;
-  return [...block.matchAll(pattern)].map((match) => ({
-    id: match[1]!,
-    key: match[2]!,
-    name: match[3]!,
-  }));
+  // `\(\s*` porque a 00001 escreve as linhas na mesma linha do `VALUES (` e a 00006 abre o
+  // parêntese numa linha e o uuid na seguinte. O que é extraído continua estrito: uuid, chave em
+  // minúsculas e nome em maiúsculas, na ordem das colunas.
+  const pattern = /\(\s*'([0-9a-f-]+)',\s*'([a-z]+)',\s*'([A-Z]+)'/g;
+  const rows: { id: string; key: string; name: string }[] = [];
+  for (const source of migrationSources) {
+    const insertStart = source.indexOf("INSERT INTO nexus.assistants");
+    // Cada migration que compõe o seed precisa ter o INSERT, senão o silêncio de uma delas faria
+    // a comparação passar com menos linhas do que o banco realmente terá.
+    expect(insertStart, "migration sem INSERT em nexus.assistants").toBeGreaterThan(-1);
+    const insertEnd = source.indexOf(";", insertStart);
+    const block = source.slice(insertStart, insertEnd);
+    for (const match of block.matchAll(pattern)) {
+      rows.push({ id: match[1]!, key: match[2]!, name: match[3]! });
+    }
+  }
+  return rows;
 }
 
 describe("assistant catalog mirror", () => {
   it("found the frozen catalog and the seeded rows (guard against a silent empty match)", () => {
-    expect(frozenProfiles()).toHaveLength(3);
-    expect(seededAssistants()).toHaveLength(3);
+    // Fase 4: quatro perfis e quatro linhas de seed. A guarda contra casamento vazio continua
+    // sendo o ponto — os números literais só acompanham o catálogo.
+    expect(frozenProfiles()).toHaveLength(4);
+    expect(seededAssistants()).toHaveLength(4);
   });
 
   it("matches the frozen profiles id/key/name exactly, in order", () => {
@@ -108,11 +120,12 @@ describe("assistant catalog mirror", () => {
     expect(Object.isFrozen(ASSISTANT_CATALOG[0])).toBe(true);
   });
 
-  it("exposes exactly YUI, ALICE and SCHWI for selection", () => {
+  it("exposes exactly YUI, ALICE, SCHWI and VIVY for selection", () => {
     expect(ASSISTANT_CATALOG.map((assistant) => assistant.name)).toEqual([
       "YUI",
       "ALICE",
       "SCHWI",
+      "VIVY",
     ]);
   });
 });

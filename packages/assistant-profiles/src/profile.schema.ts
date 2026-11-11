@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { assistantKeySchema, assistantSchema, type AssistantKey } from "@nexus/shared";
+import {
+  assistantKeySchema,
+  assistantSchema,
+  modelCapabilitySchema,
+  type AssistantKey,
+} from "@nexus/shared";
 
 const stableAssistantFieldsSchema = assistantSchema.pick({
   id: true,
@@ -111,6 +116,28 @@ export const assistantProfileSchema = stableAssistantFieldsSchema.extend({
     instructions: z.array(z.string().trim().min(1)).min(1),
     profileSchemaVersion: z.literal(1),
   }).strict(),
+  /**
+   * Fase 4 (plano §5.6): o que o **modelo** precisa oferecer para atender este perfil.
+   *
+   * Distinção que importa: `capabilities` (campo acima) descrevem o que a *assistente* sabe
+   * fazer e são texto do catálogo. `modelPreference.requiredCapabilities` descreve o que o
+   * *modelo* precisa suportar e usa `modelCapabilitySchema` — o enum fechado de capabilities de
+   * provedor (`chat`, `code`, `vision`…). Misturar os dois faria "ui_design" virar exigência de
+   * modelo, o que não existe.
+   *
+   * Obrigatório e sempre presente, mesmo que vazio: um perfil que não declarasse nada ficaria
+   * `undefined` e cada ponto de uso teria de inventar um padrão — o mesmo defeito que a Fase 3
+   * removeu da coordenação.
+   *
+   * `.strict()` recusa nome de modelo fixo (`model: "openai/gpt"`): o plano proíbe acoplar a
+   * seleção a um fornecedor; a exigência é por **capacidade**, não por produto.
+   */
+  modelPreference: z
+    .object({
+      requiredCapabilities: z.array(modelCapabilitySchema).default([]),
+    })
+    .strict(),
+
   /**
    * Fase 3 (G2). Obrigatório de propósito: um campo opcional deixaria perfis sem política e
    * reintroduziria o "não declarado, logo padrão implícito" que esta fase elimina.

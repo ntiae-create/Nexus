@@ -23,7 +23,7 @@ export const assistantKeySchema = z.string().regex(/^[a-z][a-z0-9-]{1,31}$/);
  * and referenced by the frozen profiles. Widening it is a data decision (a new profile plus
  * seed), not something a contract change should do implicitly.
  */
-export const initialAssistantKeySchema = z.enum(["yui", "alice", "schwi"]);
+export const initialAssistantKeySchema = z.enum(["yui", "alice", "schwi", "vivy"]);
 
 export const assistantSchema = z.object({
   id: uuidSchema,
