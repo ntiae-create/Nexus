@@ -50,16 +50,19 @@ docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgre
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -c "GRANT nexus_anonymous TO nexus_migrator WITH SET TRUE;"
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U nexus_app -d nexus_test -f - < "$database_package_dir/tests/postgres/integration.sql"
 # Fase 5 (G13): isolamento entre owners, append-only da auditoria e dominio de grants/preferencias.
-# ORDEM IMPORTA: a exclusao do owner so e observavel como `postgres` (`nexus_app` tem apenas SELECT
-# nessa tabela), vive em arquivo separado, roda em transacao com ROLLBACK e exige as tabelas da
+# ORDEM IMPORTA: a exclusao do owner NAO e alcancavel por `nexus_app` (que tem apenas SELECT em
+# `owner_identity`), vive em arquivo separado, roda em transacao com ROLLBACK e exige as tabelas da
 # Fase 5 VAZIAS — por isso e executada ANTES de verify-stage-5-rls.sql, que deixa linhas.
 # A declaracao da FK (`confdeltype`) ja e verificada no bloco M de verify-stage-5-rls.sql.
 #
-# O nome do arquivo diz o que ele comprova: `verify-stage-5-owner-deletion.sql` registra o
-# COMPORTAMENTO HISTORICO da limitacao (SQLSTATE 42501 na policy de INSERT de `tombstones`) e
-# prova a cascata das tabelas da Fase 5 num cenario em que ela e contornada. Ele NAO demonstra que
-# excluir o owner funciona com dados presentes — quem demonstra isso e
-# `verify-owner-deletion.sql`, depois da correcao da 00008.
+# O que este arquivo comprova, depois da 00008: §3 exige que a exclusao do owner CONCLUA com
+# dados presentes e confere o estado pos-exclusao (owner, mensagens, conversas, memorias e
+# tombstones a zero; catalogo global intacto), tudo em transacao revertida. §4 isola a cascata das
+# tabelas da Fase 5 com as tres tabelas de tombstone vazias.
+#
+# O que ele NAO comprova: que a exclusao PERSISTE. §3 termina em ROLLBACK e §4 tambem. A prova do
+# estado final commitado vive em `verify-owner-deletion.sql`, que roda por ultimo e e o unico que
+# comita a exclusao.
 echo "Verifying Phase 5 grant lifecycle, audit and enum ACL."
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-grants-lifecycle.sql"
 echo "Verifying Phase 5 assistant preferences display_label."
