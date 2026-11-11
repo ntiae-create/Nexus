@@ -330,25 +330,25 @@ describe("SINGLE-USER PostgreSQL migration", () => {
       join(migrationsDirectory, "..", "tests", "postgres", "verify-stage-5-owner-deletion.sql"),
       "utf8",
     );
-    // B2: a falha com dados presentes e assercao, nao comentario.
+    // B2: o desfecho com dados presentes e ASSERCAO, nao comentario.
     //
-    // R42 — o SQLSTATE esperado e 42501, nao 23503. Medido em cluster descartavel com o banco
-    // completamente instalado, em tres runners (postgres, nexus_migrator, nexus_app): sempre 42501.
-    // O motivo: o INSERT em `tombstones` nao e feito pelo runner, e sim DENTRO do trigger
-    // `record_deleted_entity`, que e SECURITY DEFINER e portanto executa com os privilegios do seu
-    // dono — `nexus_migrator` (rolsuper=f, rolbypassrls=f). A policy de FORCE ROW LEVEL SECURITY da
-    // tabela `tombstones` barra a operacao ANTES de a FK `tombstones_owner_id_fkey` ser avaliada, de
-    // modo que o 23503 e inalcancavel por construcao.
+    // HISTORICO. Ate a migration 00008, este bloco exigia que a exclusao FALHASSE e aceitava um
+    // conjunto fechado de dois SQLSTATEs (23503 com um runner SUPERUSER, que contorna RLS e chega
+    // a FK `tombstones_owner_id_fkey`; 42501 com um runner nao-superuser, que e o caso de
+    // producao, onde a policy de INSERT de `tombstones` barra antes da FK). O R42 reconciliou a
+    // assercao para 42501.
     //
-    // A assercao NAO foi afrouxada para aceitar "qualquer erro": ela exige o conjunto FECHADO de
-    // exatamente dois SQLSTATEs e, mais abaixo, a validacao da ORIGEM de cada um (constraint
-    // `tombstones_owner_id_fkey` para 23503; mensagem referenciando `tombstones` para 42501).
-    expect(ownerDeletion).toContain("IF err_state NOT IN ('23503', '42501') THEN");
-    expect(ownerDeletion).toContain(
-      "IF err_state = '42501' AND err_message NOT LIKE '%tombstones%'",
-    );
-    expect(ownerDeletion).toContain("err_constraint IS DISTINCT FROM 'tombstones_owner_id_fkey'");
+    // A 00008 CORRIGE o defeito, entao a assercao mudou de sentido: agora e preciso que a exclusao
+    // CONCLUA. Ela continua sendo verificacao estrita — exige UM ROW_COUNT, ausencia de SQLSTATE,
+    // e o estado pos-exclusao conferido (owner, mensagens, conversas, memorias, tombstones a zero;
+    // catalogo global intacto). Se a regressao voltar, o bloco falha dizendo que a 00008 sumiu.
+    expect(ownerDeletion).toContain("Owner deletion FAILED with data present");
+    expect(ownerDeletion).toContain("Migration 00008 is missing or was reverted");
     expect(ownerDeletion).toContain("GET STACKED DIAGNOSTICS");
+    expect(ownerDeletion).toContain("IF removidas <> 1 THEN");
+    // A prova de que o teste nao e vacuidade: a restauracao pos-ROLLBACK e verificada em conteudo.
+    expect(ownerDeletion).toContain("ROLLBACK did not restore tombstones content");
+    expect(ownerDeletion).toContain("§3 OK: deletion works with data present");
     // B1: a limpeza se declara contorno, e nao cenario real.
     expect(ownerDeletion).toContain("bypassed the tombstone limitation");
     // D: a contagem de tombstones e verificada nos tres pontos.
@@ -415,5 +415,152 @@ describe("SINGLE-USER PostgreSQL migration", () => {
       expect(script).toContain(file);
     }
     expect(script).toContain("verify-stage-5-grants-lifecycle.sql");
+  });
+});
+
+// =============================================================================================
+// Correcao do DEFEITO DO OWNER (migration 00008)
+// =============================================================================================
+// O defeito: `DELETE FROM nexus.owner_identity` falhava com SQLSTATE 42501 por causa da policy
+// de INSERT de `tombstones`, tornando a instalacao permanentemente nao-excluivel. Estes testes
+// travam a correcao e, tao importante quanto, travam o que a correcao NAO pode ter feito:
+// ampliar privilegio, afrouxar policy ou desligar RLS.
+describe("owner deletion fix (migration 00008)", () => {
+  const readFix = async (): Promise<string> =>
+    readFile(join(migrationsDirectory, "00008_owner_deletion_tombstone_guard.sql"), "utf8");
+
+  it("is a sequential migration that only replaces the tombstone trigger function", async () => {
+    const names = (await readdir(migrationsDirectory)).filter((name) => name.endsWith(".sql")).sort();
+    expect(names).toContain("00008_owner_deletion_tombstone_guard.sql");
+    // Sequencial e sem lacuna: a lista de teste da versao ja garante isso para toda a pasta.
+    const versions = names.map((name) => Number(/^([0-9]+)[_-].+\.sql$/i.exec(name)?.[1]));
+    expect(versions).toEqual(versions.map((_, index) => index + 1));
+
+    const sql = await readFix();
+    // Uma unica instrucao efetiva. A correcao nao pode "trazer junto" estrutura nova.
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION nexus.record_deleted_entity()");
+
+    const commands = sql
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    // Nada de DDL estrutural: nenhuma tabela, coluna, policy, papel ou ACL.
+    expect(commands).not.toMatch(/CREATE\s+TABLE/i);
+    expect(commands).not.toMatch(/CREATE\s+POLICY/i);
+    expect(commands).not.toMatch(/DROP\s+POLICY/i);
+    expect(commands).not.toMatch(/CREATE\s+ROLE/i);
+    expect(commands).not.toMatch(/ALTER\s+ROLE/i);
+    expect(commands).not.toMatch(/\bGRANT\b/i);
+    expect(commands).not.toMatch(/\bREVOKE\b/i);
+    expect(commands).not.toMatch(/DISABLE\s+TRIGGER/i);
+    expect(commands).not.toMatch(/DISABLE\s+ROW\s+LEVEL\s+SECURITY/i);
+    expect(commands).not.toMatch(/ALTER\s+TABLE/i);
+    // E nenhum privilegio amplo em COMANDO efetivo. A verificacao e sobre `commands`, nao sobre
+    // `sql`: os comentarios citam BYPASSRLS/SUPERUSER justamente para explicar por que NAO sao
+    // usados, e uma assercao sobre o texto integral proibiria explicar a decisao.
+    expect(commands).not.toMatch(/\bBYPASSRLS\b(?!\s*=\s*false)/i);
+    expect(commands).not.toMatch(/\bSUPERUSER\b(?!\s*=\s*false)/i);
+  });
+
+  it("keeps the function SECURITY DEFINER and adds only an owner-existence guard", async () => {
+    const sql = await readFix();
+    // Preserva as propriedades da funcao original: se perdesse SECURITY DEFINER, o INSERT em
+    // `tombstones` passaria a rodar como o chamador e a policy de INSERT (que exige o papel
+    // escritor) recusaria tombstones legitimos.
+    expect(sql).toMatch(/SECURITY\s+DEFINER/i);
+    expect(sql).toContain("SET search_path = pg_catalog");
+    // O guard e a unica condicao acrescentada.
+    expect(sql).toContain("IF NOT EXISTS (SELECT 1 FROM nexus.owner_identity WHERE id = OLD.owner_id) THEN");
+    // O INSERT original continua intacto, inclusive o ON CONFLICT.
+    expect(sql).toContain("INSERT INTO nexus.tombstones (id, owner_id, entity_type, entity_id)");
+    expect(sql).toContain("ON CONFLICT (entity_type, entity_id) DO NOTHING");
+    // A funcao continua devolvendo OLD no caminho do guard: um trigger AFTER DELETE nao pode
+    // devolver NULL.
+    expect(sql).toMatch(/THEN\s+RETURN\s+OLD;\s+END\s+IF;/i);
+  });
+
+  it("documents the measured cause (42501) instead of the previously documented 23503", async () => {
+    const sql = await readFix();
+    // A documentacao anterior dizia 23503 (violacao da FK `tombstones_owner_id_fkey`). A causa
+    // medida e a policy de INSERT; a FK nunca chega a ser avaliada.
+    expect(sql).toContain("42501");
+    expect(sql).toContain("configured_owner_id()");
+    // E precisa dizer POR QUE o 23503 e inalcancavel, nao apenas trocar o numero.
+    expect(sql).toMatch(/23503[\s\S]{0,200}INALCANCAVEL/i);
+  });
+
+  it("ships a verifier that is wired into the integration runner as the last step", async () => {
+    const script = await readFile(
+      join(migrationsDirectory, "..", "scripts", "test-postgres-integration.sh"),
+      "utf8",
+    );
+    expect(script).toContain("00001 through 00008");
+    expect(script).toContain("verify-owner-deletion.sql");
+
+    // O verificador COMINTA a exclusao do owner: depois dele nao existe mais owner. Se qualquer
+    // verificador rodasse depois, falharia por ausencia de dados e nao por defeito real.
+    const execLine = 'psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-owner-deletion.sql"';
+    const execIndex = script.indexOf(execLine);
+    expect(execIndex).toBeGreaterThan(-1);
+    // E a ultima LINHA DE EXECUCAO do arquivo (comentarios depois nao contam como execucao).
+    const after = script.slice(execIndex + execLine.length);
+    const remainingExecs = after
+      .split("\n")
+      .filter((line) => line.trimStart().startsWith("docker exec"));
+    expect(remainingExecs).toEqual([]);
+
+    // Roda como o DONO do schema (nao-superuser), nunca como `postgres`: e o papel real de
+    // operacao, e um runner superusuario contornaria RLS e mascararia regressao.
+    expect(execLine).toContain("-U nexus_migrator");
+    expect(execLine).not.toContain("-U postgres");
+  });
+
+  it("proves the deletion outcome, not merely that the DELETE statement succeeded", async () => {
+    const verifier = await readFile(
+      join(migrationsDirectory, "..", "tests", "postgres", "verify-owner-deletion.sql"),
+      "utf8",
+    );
+
+    // 1. Pre-condicao: recusa rodar como superusuario ou com BYPASSRLS.
+    expect(verifier).toContain("is SUPERUSER");
+    expect(verifier).toContain("has it");
+    // 2. Recusa rodar se a 00008 nao estiver aplicada — senao testaria a versao defeituosa.
+    expect(verifier).toContain("does not carry the owner-existence guard");
+
+    // 3. Popula TODAS as tabelas de owner antes de excluir. Uma exclusao que funciona com o
+    //    banco vazio nao prova nada.
+    for (const table of [
+      "conversations", "conversation_assistants", "messages", "core_runs", "run_steps",
+      "run_results", "tool_events", "assistant_memories", "memory_permissions",
+      "memory_permission_audit", "conversation_provider_preferences",
+      "assistant_provider_preferences", "global_provider_preferences",
+      "provider_authorizations", "sync_cursors", "tombstones", "tool_grants",
+      "tool_grant_audit", "user_assistant_preferences",
+    ]) {
+      expect(verifier).toContain(`('${table}')`);
+    }
+
+    // 4. Os cenarios obrigatorios existem e sao assertados, um a um.
+    expect(verifier).toContain("§2 OK: invalid context removes nothing and preserves the owner");
+    expect(verifier).toContain("§3 OK: nexus_app denied with SQLSTATE 42501");
+    expect(verifier).toContain("§4 OK: owner without data deleted cleanly");
+    expect(verifier).toContain("§5 OK: owner deleted with all 19 owner tables populated");
+    expect(verifier).toContain("§6 OK: induced failures rolled back completely");
+    expect(verifier).toContain("§7 OK: personal data erased, global catalog preserved");
+    expect(verifier).toContain("§8 OK: no role holds SUPERUSER/BYPASSRLS");
+
+    // 5. Atomicidade e verificada por CONTEUDO (jsonb), nao por contagem: contagem igual com
+    //    conteudo diferente esconderia corrupcao silenciosa.
+    expect(verifier).toContain("jsonb_agg");
+    expect(verifier).toContain("IS DISTINCT FROM b.convs");
+
+    // 6. A retencao de `tool_grant_audit` esta declarada como decisao pendente, e o verificador
+    //    falha se ela mudar sem que o arquivo mude.
+    expect(verifier).toContain("tool_grant_audit retention changed");
+    expect(verifier).toMatch(/RETENCAO PENDENTE DE DECISAO DE PRODUTO/i);
+
+    // 7. O catalogo GLOBAL e assertado como preservado, e o provider de prova como sobrevivente.
+    expect(verifier).toContain("Owner deletion changed the GLOBAL assistant catalog");
+    expect(verifier).toContain("does not belong to the owner");
   });
 });

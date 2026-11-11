@@ -21,18 +21,20 @@
 --   §1 excluir UM GRANT preserva os eventos de auditoria dele (append-only na vida da instalacao);
 --   §2 o trigger BEFORE DELETE de `messages` anula `assistant_memories.source_message_id` antes
 --      de a linha sumir, e o ROLLBACK devolve a referencia;
---   §3 com DADOS PRESENTES, excluir o owner HOJE FALHA: SQLSTATE 23503 na constraint
---      `tombstones_owner_id_fkey`. O defeito fica registrado, isolado e testado (ver abaixo);
+--   §3 com DADOS PRESENTES, excluir o owner FUNCIONA (migration 00008): a cascata leva os dados
+--      pessoais a zero, os tombstones tambem, o catalogo global fica, e o ROLLBACK restaura tudo;
 --   §4 depois de esvaziar as tres tabelas com trigger de tombstone, a cascata de `owner_id`
 --      leva `tool_grants`, `tool_grant_audit` e `user_assistant_preferences` a zero;
 --   §5 o ROLLBACK restaura integralmente owner, grants, auditoria, preferencias, tombstones,
 --      mensagens, conversas e memorias — comparando CONTEUDO, nao apenas contagem.
 --
--- NAO PROVA, E NAO PODE PROVAR ENQUANTO O DEFEITO EXISTIR:
---   que excluir o owner funciona com dados reais presentes. Nao funciona (e o que §3 demonstra).
+-- NAO PROVA:
+--   que a exclusao persiste fora da transacao — §3 roda em subtransacao com EXCEPTION e desfaz.
+--   Essa prova (COMMIT de verdade, estado final medido depois) vive em `verify-owner-deletion.sql`,
+--   que e o unico verificador que comita a exclusao e por isso roda por ultimo no runner.
 --
 -- =============================================================================================
--- A LIMITACAO PRE-EXISTENTE (de 00001, fora do escopo desta fase)
+-- O DEFEITO PRE-EXISTENTE (de 00001) E SUA CORRECAO (00008)
 -- =============================================================================================
 -- `nexus.record_deleted_entity()` e SECURITY DEFINER e faz:
 --     INSERT INTO nexus.tombstones (id, owner_id, entity_type, entity_id)
@@ -41,9 +43,18 @@
 --
 -- Quando o owner e excluido, as FKs `*_owner_id_fkey` dessas tabelas cascateiam e cada linha
 -- apagada dispara o trigger. O trigger insere um tombstone com `OLD.owner_id` — um owner que,
--- naquele instante, ja nao existe mais. `tombstones_owner_id_fkey` rejeita:
---     ERROR: insert or update on table "tombstones" violates foreign key constraint
---            "tombstones_owner_id_fkey"   (SQLSTATE 23503)
+-- naquele instante, ja nao existe mais.
+--
+-- A recusa NAO vem da FK. `SECURITY DEFINER` nao contorna `FORCE ROW LEVEL SECURITY`; como o dono
+-- da funcao e `nexus_migrator` (rolbypassrls = f), a policy de INSERT de `tombstones` e aplicada.
+-- Ela exige `owner_id = nexus.configured_owner_id()`, e essa funcao consulta `owner_identity` — ja
+-- vazia. A policy avalia NULL e recusa ANTES de a FK ser verificada:
+--     ERROR: new row violates row-level security policy for table "tombstones"   (SQLSTATE 42501)
+-- O 23503 so aparece com um runner SUPERUSER, que contorna a policy e chega a FK.
+--
+-- A migration 00008 fecha o buraco com um guard de existencia do owner dentro da funcao: sem
+-- owner nao ha dispositivo a reconciliar nem destino valido para a FK, e o tombstone nao e
+-- gravado. Nenhum privilegio e ampliado, nenhuma policy e alterada.
 --
 -- Consequencia: excluir o owner SO funciona quando nao sobra nenhuma linha nas tres tabelas.
 -- §4 esvazia as tres de proposito. Isso e um CONTORNO da limitacao, nao uma demonstracao de
@@ -277,100 +288,145 @@ END
 $$;
 
 -- =============================================================================================
--- §3. COM DADOS PRESENTES, excluir o owner FALHA (SQLSTATE 23503 / tombstones_owner_id_fkey)
+-- §3. COM DADOS PRESENTES, excluir o owner FUNCIONA (corrigido pela migration 00008)
 -- =============================================================================================
--- Este bloco registra o DEFEITO ATUAL. Se ele passar a falhar dizendo "owner deletion SUCCEEDED",
--- a limitacao dos triggers de tombstone foi corrigida (ou contornada) e §4 precisa ser reescrita,
--- junto com a documentacao da Fase 5.
+-- HISTORICO DESTE BLOCO. Ele foi escrito quando a exclusao do owner falhava com dados presentes:
+-- o trigger `record_deleted_entity()` (00001) tentava gravar em `tombstones` um `owner_id` que a
+-- cascata acabara de apagar, e a policy de FORMA RLS de `tombstones` recusava com SQLSTATE 42501
+-- (a FK `tombstones_owner_id_fkey` nunca chegava a ser avaliada, de modo que o 23503 registrado
+-- nas rodadas anteriores so aparecia com um runner SUPERUSER, que contorna RLS).
 --
--- O erro e capturado em subtransacao propria (bloco com EXCEPTION): ao capturar, o PostgreSQL
--- desfaz tudo o que aquele bloco fez. Nada residual permanece — as assercoes finais confirmam.
+-- A migration 00008 corrige isso com um guard de existencia do owner antes do INSERT. Este bloco
+-- passa a verificar o comportamento CORRIGIDO, e continua sendo uma assercao — nao um comentario.
+--
+-- O que ele NAO faz: excluir de verdade. Tudo roda em subtransacao com EXCEPTION, portanto o
+-- PostgreSQL desfaz o DELETE ao final do bloco. A exclusao real e verificada, fora deste arquivo,
+-- em `verify-owner-deletion.sql` (§5 e §7), que e o unico verificador que comita a exclusao.
+--
+-- Cada assercao abaixo falha se a regressao voltar:
+--   (a) o DELETE precisa concluir e remover exatamente 1 linha;
+--   (b) os dados pessoais precisam sumir junto (cascata), e o catalogo global precisa ficar;
+--   (c) os tombstones do owner precisam sumir (nao ha a quem reconciliar apos a destruicao);
+--   (d) a transacao precisa desfazer TUDO: contagem e conteudo.
+--
+-- Por que BEGIN/ROLLBACK alem do bloco com EXCEPTION: o handler do PL/pgSQL cria um savepoint
+-- implicitamente, mas esse savepoint SO desfaz o que foi feito dentro do bloco `BEGIN ... EXCEPTION
+-- ... END` que o contem — e o DELETE exitoso nao passa por ele. Sem a transacao externa, a exclusao
+-- COMITARIA e o banco ficaria sem owner, quebrando §4.
+BEGIN;
 DO $$
 DECLARE
-  deleted boolean := false;
+  removidas bigint := 0;
   err_state text;
-  err_constraint text;
   err_message text;
   doc_now jsonb;
   doc_base jsonb;
+  restantes bigint;
 BEGIN
   BEGIN
     DELETE FROM nexus.owner_identity WHERE id = '00000000-0000-4000-8000-000000000004';
-    deleted := true;
+    GET DIAGNOSTICS removidas = ROW_COUNT;
   EXCEPTION WHEN OTHERS THEN
-    GET STACKED DIAGNOSTICS
-      err_state = RETURNED_SQLSTATE,
-      err_constraint = CONSTRAINT_NAME,
-      err_message = MESSAGE_TEXT;
+    GET STACKED DIAGNOSTICS err_state = RETURNED_SQLSTATE, err_message = MESSAGE_TEXT;
   END;
 
-  IF deleted THEN
+  -- (a) O DELETE precisa ter sido executado, e nao meramente nao ter dado erro.
+  IF err_state IS NOT NULL THEN
     RAISE EXCEPTION
-      'Owner deletion SUCCEEDED with data present. The tombstone limitation is gone: update this file, verify-stage-5-rls.sql and docs/FASE_5_G13_CATALOGO_GLOBAL_CONFIGURACOES_PESSOAIS.md.';
-  END IF;
-
-  -- A exclusao do owner falha por UMA DE DUAS barreiras, e qual delas aparece depende do papel
-  -- do runner — o defeito e real nos dois casos, mas o SQLSTATE muda:
-  --
-  --   * runner SUPERUSER: ignora RLS; o INSERT em `tombstones` feito pelo trigger
-  --     `record_deleted_entity` chega a rodar e viola `tombstones_owner_id_fkey` -> 23503.
-  --   * runner NAO-superuser (o caso de PRODUCAO, ver R36): o trigger tambem e SECURITY DEFINER
-  --     com dono `postgres`, mas a tabela `tombstones` tem FORCE RLS e o INSERT nao tem contexto
-  --     coerente para o dono excluido -> 42501 (row-level security).
-  --
-  -- Exigir 23503 sempre foi exigir um runner superusuario, o que a instalacao real nao tem.
-  -- O que o teste DEVE garantir e: (a) a exclusao NAO acontece; (b) a causa e o mecanismo de
-  -- tombstone (FK ou RLS de `tombstones`), nunca algo generico.
-  IF err_state NOT IN ('23503', '42501') THEN
-    RAISE EXCEPTION 'Expected SQLSTATE 23503 (FK) or 42501 (RLS on tombstones), got %: %',
+      'Owner deletion FAILED with data present (SQLSTATE %: %). Migration 00008 is missing or was reverted: the owner-existence guard in nexus.record_deleted_entity() is what makes this work.',
       err_state, err_message;
   END IF;
-  IF err_state = '23503' AND err_constraint IS DISTINCT FROM 'tombstones_owner_id_fkey' THEN
-    RAISE EXCEPTION 'Expected constraint tombstones_owner_id_fkey, got %', coalesce(err_constraint, '<none>');
-  END IF;
-  IF err_state = '42501' AND err_message NOT LIKE '%tombstones%' THEN
-    RAISE EXCEPTION 'RLS rejection did not come from the tombstones table: %', err_message;
+  IF removidas <> 1 THEN
+    RAISE EXCEPTION 'Owner deletion affected % row(s) instead of exactly 1', removidas;
   END IF;
 
-  -- Isolamento: a subtransacao desfez a tentativa por completo. Contagem E conteudo.
-  IF (SELECT count(*) FROM nexus.owner_identity) <> 1 THEN
-    RAISE EXCEPTION 'Exception handling left the owner table inconsistent (% rows)', (SELECT count(*) FROM nexus.owner_identity);
+  -- (b) e (c) Estado imediatamente apos a exclusao, dentro da mesma subtransacao.
+  SELECT count(*) INTO restantes FROM nexus.owner_identity;
+  IF restantes <> 0 THEN
+    RAISE EXCEPTION 'Owner row survived the deletion (% rows)', restantes;
+  END IF;
+
+  SELECT count(*) INTO restantes FROM nexus.messages;
+  IF restantes <> 0 THEN
+    RAISE EXCEPTION 'Owner deletion left % message(s) behind', restantes;
+  END IF;
+  SELECT count(*) INTO restantes FROM nexus.conversations;
+  IF restantes <> 0 THEN
+    RAISE EXCEPTION 'Owner deletion left % conversation(s) behind', restantes;
+  END IF;
+  SELECT count(*) INTO restantes FROM nexus.assistant_memories;
+  IF restantes <> 0 THEN
+    RAISE EXCEPTION 'Owner deletion left % assistant memory(ies) behind', restantes;
+  END IF;
+  SELECT count(*) INTO restantes FROM nexus.tombstones;
+  IF restantes <> 0 THEN
+    RAISE EXCEPTION 'Owner deletion left % tombstone(s) behind', restantes;
+  END IF;
+
+  -- O catalogo GLOBAL nao pertence ao owner e nao pode ser tocado pela cascata. O baseline deste
+  -- arquivo nao guarda a contagem de assistentes, entao ela e conferida contra a seed das
+  -- migrations (00005/00006 inserem 4 assistentes e nao existe caminho que as remova).
+  SELECT count(*) INTO restantes FROM nexus.assistants;
+  IF restantes <> 4 THEN
+    RAISE EXCEPTION 'Owner deletion changed the GLOBAL assistant catalog (found % assistants, expected 4)', restantes;
+  END IF;
+
+  RAISE NOTICE 'Owner deletion succeeded inside the transaction: % row removed, no owner data left', removidas;
+END
+$$;
+ROLLBACK;
+
+-- --- (d) A transacao desfez a tentativa?  CONTAGEM e CONTEUDO -------------------------------
+-- Esta verificacao PRECISA ficar fora da transacao: dentro dela o estado reflete a exclusao, nao o
+-- estado restaurado. Verificar "o owner voltou" antes do ROLLBACK mediria a coisa errada.
+DO $pos3$
+DECLARE
+  doc_now jsonb;
+  doc_base jsonb;
+  restantes bigint;
+BEGIN
+  SELECT count(*) INTO restantes FROM nexus.owner_identity;
+  IF restantes <> 1 THEN
+    RAISE EXCEPTION 'ROLLBACK failed: expected 1 owner after the reverted deletion, found %', restantes;
   END IF;
 
   SELECT jsonb_agg(to_jsonb(t) - 'sequence' ORDER BY (to_jsonb(t) - 'sequence')::text) INTO doc_now FROM nexus.tombstones t;
   SELECT tombstones_doc INTO doc_base FROM pg_temp.verify_baseline;
   IF doc_now IS DISTINCT FROM doc_base THEN
-    RAISE EXCEPTION 'Exception handling changed tombstones content. Before: %  After: %', doc_base, doc_now;
+    RAISE EXCEPTION 'ROLLBACK did not restore tombstones content. Before: %  After: %', doc_base, doc_now;
   END IF;
 
   SELECT jsonb_agg(to_jsonb(m) ORDER BY to_jsonb(m)::text) INTO doc_now FROM nexus.messages m;
   SELECT messages_doc INTO doc_base FROM pg_temp.verify_baseline;
   IF doc_now IS DISTINCT FROM doc_base THEN
-    RAISE EXCEPTION 'Exception handling changed messages content';
+    RAISE EXCEPTION 'ROLLBACK did not restore messages content';
   END IF;
 
   SELECT jsonb_agg(to_jsonb(c) ORDER BY to_jsonb(c)::text) INTO doc_now FROM nexus.conversations c;
   SELECT conversations_doc INTO doc_base FROM pg_temp.verify_baseline;
   IF doc_now IS DISTINCT FROM doc_base THEN
-    RAISE EXCEPTION 'Exception handling changed conversations content';
+    RAISE EXCEPTION 'ROLLBACK did not restore conversations content';
   END IF;
 
   SELECT jsonb_agg(to_jsonb(mem) ORDER BY to_jsonb(mem)::text) INTO doc_now FROM nexus.assistant_memories mem;
   SELECT memories_doc INTO doc_base FROM pg_temp.verify_baseline;
   IF doc_now IS DISTINCT FROM doc_base THEN
-    RAISE EXCEPTION 'Exception handling changed assistant_memories content';
+    RAISE EXCEPTION 'ROLLBACK did not restore assistant_memories content';
   END IF;
 
-  RAISE NOTICE 'Owner deletion correctly fails today: % / % (% )', err_state, coalesce(err_constraint,'-'), err_message;
+  RAISE NOTICE '§3 OK: deletion works with data present (00008) and ROLLBACK restored everything';
 END
-$$;
+$pos3$;
+
 
 -- =============================================================================================
--- §4. CONTORNO EXPLICITO: esvaziar as tres tabelas e entao provar a cascata das tabelas da Fase 5
+-- §4. A CASCATA DAS TABELAS DA FASE 5, com as tres tabelas de tombstone VAZIAS
 -- =============================================================================================
--- A limpeza abaixo NAO e preparatoria "neutra": ela remove justamente os dados que disparam os
--- triggers de tombstone e impedem a exclusao do owner (§3). O que este bloco prova e a cascata
--- das tabelas da Fase 5 — nao que a exclusao do owner funcione na presenca de dados.
+-- A limpeza abaixo esvazia as tres tabelas com trigger de tombstone. Ela deixou de ser um
+-- "contorno" necessario: desde a 00008 a exclusao do owner funciona com dados presentes, e §3
+-- prova isso. O que §4 isola e o efeito da cascata sobre `tool_grants`, `tool_grant_audit` e
+-- `user_assistant_preferences` quando NENHUM trigger de tombstone entra em jogo — assim, se §4
+-- falhar, a causa e a cascata da Fase 5, e nao o mecanismo de tombstone.
 BEGIN;
 
 SELECT set_config('nexus.owner_id', '00000000-0000-4000-8000-000000000004', true);

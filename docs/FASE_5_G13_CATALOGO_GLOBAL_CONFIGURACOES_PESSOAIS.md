@@ -601,22 +601,63 @@ A trilha é **imutável, não indestrutível**. Três afirmações distintas, ca
 | Vida normal da instalação | **append-only**: `nexus_app` sem `INSERT`/`UPDATE`/`DELETE`; só `SELECT`; escrita exclusivamente pela função `SECURITY DEFINER` | `verify-stage-5-rls.sql` blocos A, G e M |
 | Excluir um **grant** | eventos **preservados** — `grant_id` é snapshot, sem FK para `tool_grants` | `verify-stage-5-rls.sql` bloco L; `verify-stage-5-owner-deletion.sql` §1 |
 | Excluir **definitivamente o owner**, sem dados nas tabelas com trigger de tombstone | trilha **apagada** junto (`owner_id ON DELETE CASCADE`) | `verify-stage-5-owner-deletion.sql` §4 |
-| Excluir **definitivamente o owner**, com dados presentes | ❌ **impossível hoje** — falha com `SQLSTATE 23503` em `tombstones_owner_id_fkey` | `verify-stage-5-owner-deletion.sql` §3 |
+| Excluir **definitivamente o owner**, com dados presentes | trilha **apagada** junto (`owner_id ON DELETE CASCADE`); ver a nota de retenção em §4.5.1 | `verify-owner-deletion.sql` §5 e §7 |
 
 A remoção do owner não é alcançável pela aplicação: `nexus_app` tem apenas `SELECT` em
 `owner_identity`. Por isso o teste do efeito roda como `postgres`, em transação com `ROLLBACK`, num
 arquivo separado — a declaração da FK (`confdeltype = 'c'`) é verificada no bloco M do teste de RLS.
 
-> **A cascata da Fase 5 está correta, mas a exclusão do owner não é executável com dados reais.**
+> ### 4.5.1 O defeito que existia aqui — corrigido pela migration 00008
+>
+> **Registro do que estava errado**, porque a descrição anterior deste documento estava
+> imprecisa em um ponto que importa:
+>
 > `record_deleted_entity()` (00001) é `SECURITY DEFINER` e insere em `nexus.tombstones` o
-> `OLD.owner_id` de cada linha apagada. Quando o owner é excluído, as FKs `*_owner_id_fkey` de
-> `messages`, `conversations` e `assistant_memories` cascateiam e os triggers tentam gravar um
-> tombstone apontando para um owner que já não existe; `tombstones_owner_id_fkey` rejeita a
-> operação inteira. Consequência: `DELETE FROM nexus.owner_identity` só conclui quando as três
-> tabelas estão vazias. Corrigir isso exige tocar em `record_deleted_entity()` ou na FK —
-> **fora do escopo da 5.1**, e registrado como limitação conhecida em
-> `verify-stage-5-owner-deletion.sql` §3. Quando for corrigido, aquele bloco falha de propósito e
-> obriga a atualizar este documento.
+> `OLD.owner_id` de cada linha apagada. Quando o owner era excluído, as FKs `*_owner_id_fkey` de
+> `messages`, `conversations` e `assistant_memories` cascateavam e os triggers tentavam gravar um
+> tombstone apontando para um owner que já não existia. Consequência: `DELETE FROM
+> nexus.owner_identity` só concluía quando as três tabelas estavam vazias.
+>
+> **A causa NÃO era a FK.** Este documento afirmava `SQLSTATE 23503` em
+> `tombstones_owner_id_fkey`. Medido em cluster PostgreSQL 17.11 descartável, com o banco
+> completamente instalado, como `nexus_migrator` (`rolsuper = f`, `rolbypassrls = f`), o SQLSTATE é
+> **sempre `42501`** — `new row violates row-level security policy for table "tombstones"`.
+>
+> O motivo: `SECURITY DEFINER` **não** contorna `FORCE ROW LEVEL SECURITY`. O dono da função é
+> `nexus_migrator`, que não tem `BYPASSRLS`, de modo que a policy de INSERT de `tombstones` é
+> aplicada. Essa policy exige
+> `owner_id = nexus.configured_owner_id()`; como `configured_owner_id()` faz
+> `SELECT owner.id FROM nexus.owner_identity WHERE singleton` e a linha do owner já havia sido
+> removida no início da cascata, a função retorna `NULL`, a policy avalia `NULL` e o INSERT é
+> recusado. **A constraint `tombstones_owner_id_fkey` nunca chega a ser verificada**: a RLS barra
+> antes, e por isso o `23503` é inalcançável por construção. Superusuário contorna a policy e
+> chega à FK — foi o que produziu o `23503` registrado nas rodadas anteriores.
+>
+> **A correção (00008) não amplia privilégio nem altera policy.** `record_deleted_entity()` ganha
+> uma condição de existência antes do INSERT:
+>
+> ```sql
+> IF NOT EXISTS (SELECT 1 FROM nexus.owner_identity WHERE id = OLD.owner_id) THEN
+>   RETURN OLD;
+> END IF;
+> ```
+>
+> Não existe owner, não existe dispositivo a reconciliar e não existe destino válido para a FK: o
+> tombstone não é gravado. Nenhum `GRANT`, nenhum papel novo, nenhuma policy criada ou removida,
+> nenhum RLS desligado. A policy de INSERT continua exigindo contexto coerente, actor `owner` e
+> `pg_trigger_depth() > 0` — e continua recusando INSERT direto e contexto inválido.
+>
+> **Retenção de `tool_grant_audit`: decisão de produto ainda pendente.** Hoje a trilha é apagada
+> junto com o owner (`ON DELETE CASCADE`). Mantê-la exigiria definir *por quanto tempo* e *para
+> quem* uma trilha de auditoria sobrevive à destruição da instalação — decisão que a 5.1 não toma.
+> `verify-owner-deletion.sql` §7 asserta o comportamento atual e **falha de propósito** se a ação
+> da FK mudar sem que o arquivo mude.
+>
+> Prova: `verify-owner-deletion.sql` §5 (exclusão com as 19 tabelas de owner populadas) e §7
+> (estado final). O verificador histórico `verify-stage-5-owner-deletion.sql` §3 continua
+> registrando o comportamento anterior, e passa a ser executado **antes** da 00008 fazer efeito
+> nos cenários que ele próprio constrói com `ROLLBACK`; ele não é mais a única evidência do
+> assunto.
 
 ### 4.6 Preferências por conversa — **não criar `conversation_settings`**
 
