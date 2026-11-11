@@ -1,0 +1,57 @@
+--- a/packages/database/tests/postgres/verify-stage-5-owner-deletion.sql
++++ b/packages/database/tests/postgres/verify-stage-5-owner-deletion.sql
+@@ -55,6 +55,13 @@
+ -- =============================================================================================
+ -- PRE-CONDICAO: banco recem-criado (uma execucao por banco)
+ -- =============================================================================================
++-- O verificador precisa ENXERGAR as linhas semeadas. Sob FORCE RLS isso depende de contexto:
++-- um runner SUPERUSER ve tudo (ignora RLS), mas um provisionador NAO-superuser ve zero sem os
++-- GUCs de contexto — e antes esta pre-condicao acusava "faltam seeds" quando na verdade elas
++-- existiam. Definimos o contexto de owner/ator para o runner enxergar como o dono das linhas.
++SELECT set_config('nexus.owner_id', '00000000-0000-4000-8000-000000000004', false);
++SELECT set_config('nexus.actor_type', 'owner', false);
++
+ DO $$
+ BEGIN
+   IF current_database() <> 'nexus_test' THEN
+@@ -302,12 +309,28 @@
+       'Owner deletion SUCCEEDED with data present. The tombstone limitation is gone: update this file, verify-stage-5-rls.sql and docs/FASE_5_G13_CATALOGO_GLOBAL_CONFIGURACOES_PESSOAIS.md.';
+   END IF;
+ 
+-  IF err_state IS DISTINCT FROM '23503' THEN
+-    RAISE EXCEPTION 'Expected SQLSTATE 23503 (foreign_key_violation), got %: %', err_state, err_message;
++  -- A exclusao do owner falha por UMA DE DUAS barreiras, e qual delas aparece depende do papel
++  -- do runner — o defeito e real nos dois casos, mas o SQLSTATE muda:
++  --
++  --   * runner SUPERUSER: ignora RLS; o INSERT em `tombstones` feito pelo trigger
++  --     `record_deleted_entity` chega a rodar e viola `tombstones_owner_id_fkey` -> 23503.
++  --   * runner NAO-superuser (o caso de PRODUCAO, ver R36): o trigger tambem e SECURITY DEFINER
++  --     com dono `postgres`, mas a tabela `tombstones` tem FORCE RLS e o INSERT nao tem contexto
++  --     coerente para o dono excluido -> 42501 (row-level security).
++  --
++  -- Exigir 23503 sempre foi exigir um runner superusuario, o que a instalacao real nao tem.
++  -- O que o teste DEVE garantir e: (a) a exclusao NAO acontece; (b) a causa e o mecanismo de
++  -- tombstone (FK ou RLS de `tombstones`), nunca algo generico.
++  IF err_state NOT IN ('23503', '42501') THEN
++    RAISE EXCEPTION 'Expected SQLSTATE 23503 (FK) or 42501 (RLS on tombstones), got %: %',
++      err_state, err_message;
+   END IF;
+-  IF err_constraint IS DISTINCT FROM 'tombstones_owner_id_fkey' THEN
++  IF err_state = '23503' AND err_constraint IS DISTINCT FROM 'tombstones_owner_id_fkey' THEN
+     RAISE EXCEPTION 'Expected constraint tombstones_owner_id_fkey, got %', coalesce(err_constraint, '<none>');
+   END IF;
++  IF err_state = '42501' AND err_message NOT LIKE '%tombstones%' THEN
++    RAISE EXCEPTION 'RLS rejection did not come from the tombstones table: %', err_message;
++  END IF;
+ 
+   -- Isolamento: a subtransacao desfez a tentativa por completo. Contagem E conteudo.
+   IF (SELECT count(*) FROM nexus.owner_identity) <> 1 THEN
+@@ -338,7 +361,7 @@
+     RAISE EXCEPTION 'Exception handling changed assistant_memories content';
+   END IF;
+ 
+-  RAISE NOTICE 'Owner deletion correctly fails today: % / %', err_state, err_constraint;
++  RAISE NOTICE 'Owner deletion correctly fails today: % / % (% )', err_state, coalesce(err_constraint,'-'), err_message;
+ END
+ $$;
+ 

@@ -1,0 +1,66 @@
+
+===============================================================================
+# SABOTAGEM 1 — injecao SQL no argumento de papel
+===============================================================================
+estado: alvo_sabotado com 3 linhas
+--- argumento: 'x; DROP DATABASE alvo_sabotado; --' ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+      FALHA identificador invalido: 'x;' (esperado ^[A-Za-z_][A-Za-z0-9_]*$)
+      ABORTADO: papel invalido na linha de comando
+EXIT=1
+     alvo_sabotado: EXISTE, linhas=3 (esperado 3)
+     => PRESERVADO: 1/1
+
+===============================================================================
+# SABOTAGEM 2 — nome de banco de teste com metacaractere
+===============================================================================
+--- argumento de papel com aspas: nexus"; DROP DATABASE alvo_sabotado; -- ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+      FALHA identificador invalido: 'nexus";' (esperado ^[A-Za-z_][A-Za-z0-9_]*$)
+      ABORTADO: papel invalido na linha de comando
+EXIT=1
+     alvo_sabotado: EXISTE, linhas=3 (esperado 3)
+     => PRESERVADO: 1/1
+
+===============================================================================
+# SABOTAGEM 3 — banco com nome de PREFIXO de um banco autorizado
+===============================================================================
+estado: 'nexus_test_prod' (prefixo de nexus_test) com 3 linhas; papel alvo1 so em nexus_test
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      --- alvo1 (oid 16789) ---
+        [teste]   nexus_test: 1 dependencia(s) — dentro do escopo
+   == C. limpar objetos dos papeis nos bancos de TESTE (DROP OWNED) ==
+        alvo1 @ nexus_test: DROP OWNED ok
+        alvo1 @ nexus_prov_test: banco nao existe — nada a limpar
+        alvo1 @ nexus_preexist_test: banco nao existe — nada a limpar
+        alvo1 @ probe_db: banco nao existe — nada a limpar
+   == C.2 derrubar os bancos de TESTE (somente os da lista autorizada) ==
+      nexus_test: removido (ou inexistente)
+      nexus_prov_test: removido (ou inexistente)
+      nexus_preexist_test: removido (ou inexistente)
+      probe_db: removido (ou inexistente)
+   == D. dropar os papeis ==
+      --- alvo1 (oid 16789) ---
+        DROP ROLE: ok
+   == E. estado final ==
+      bancos: db_alheio, db_alheio2, nexus_test_prod, postgres, sentinela_vazio
+      papeis: (nenhum)
+   
+   == LIMPEZA CONCLUIDA: 1 papel(is) removido(s); nenhum objeto fora de TEST_DATABASES foi tocado ==
+EXIT=0
+--- o banco de prefixo foi preservado? ---
+     nexus_test_prod existe: 1
+     nexus_test_prod.s_prod.dado linhas: 3

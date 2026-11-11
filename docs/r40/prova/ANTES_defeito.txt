@@ -1,0 +1,37 @@
+=== R40 — EVIDENCIA 'ANTES': pg_cleanup.sh ORIGINAL destroi banco fora da lista ===
+data: 2026-11-11T05:11:21Z   cluster: 127.0.0.1:55433 (descartavel)
+md5 do script executado: 5b60843dfb772f8061481f056a5ab882
+
+--- cenario montado ---
+  papel alvo_teste
+  banco autorizado nexus_test (esta em TEST_DATABASES)
+  banco sentinela_prod (FORA de TEST_DATABASES), schema s_prod, tabela com 3 linhas
+
+--- estado ANTES ---
+  s_prod.dado: 3 linha(s)
+
+--- as linhas 42-47 do script ORIGINAL (DROP OWNED sem filtro) ---
+      for db in $($PSQL -X $HOST -d postgres -tAc "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1;"); do
+        n=$($PSQL -X $HOST -d "$db" -tAc "SELECT count(*) FROM pg_shdepend WHERE refobjid='$oid'::oid;" 2>/dev/null)
+        [ "${n:-0}" != "0" ] && { echo "     [$db] $n dependencia(s)"; local_found="$local_found $db"; }
+        # limpa o que der para limpar
+        $PSQL -X $HOST -d "$db" -q -c "DROP OWNED BY $r CASCADE;" >/dev/null 2>&1
+      done
+
+--- execucao do script ORIGINAL ---
+== 1. bancos de teste (derrubar primeiro: leva pg_shdepend junto) ==
+   nexus_test: DROP DATABASE
+== 2. papel por papel: identificar bancos com dependencias, limpar, dropar ==
+   --- alvo_teste (oid 16405) ---
+     [postgres] 1 dependencia(s)
+     [sentinela_prod] 1 dependencia(s)
+     DROP ROLE: DROP ROLE
+== 3. estado final ==
+   papeis de teste remanescentes: (nenhum)
+   bancos: postgres, sentinela_prod
+exit=0
+
+--- estado DEPOIS ---
+  schema s_prod existe: 0
+  tabela s_prod.dado existe: 0
+  (0 = DESTRUIDO; havia 3 linhas)

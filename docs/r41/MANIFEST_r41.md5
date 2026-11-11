@@ -1,0 +1,13 @@
+6752999521fdb1265b2b66be1164e39b  docs/r38/scripts/install_clean.sh
+aa050fb7454bd3560676d678a30b0323  docs/r41/DIAGNOSTICO_migrations_test.md
+f181132e1a94eeb9b00aaebebbb18d33  docs/r41/RELATORIO_R41.md
+e9684beb795ec6afc9d0733e8845e386  docs/r41/diffs/install_clean.diff
+1fda2a66cbbb827cf8054b909a9fb347  docs/r41/logs/instalacao.log
+af9897dbbac6d05fa8124f03509ca0be  docs/r41/logs/integracao.log
+512db52b5ebf771739260a7f25a15e60  docs/r41/logs/isolamento.log
+17a153eeffb1e5a4e6a9cc824fccf108  docs/r41/logs/migrations.md5
+08bcef08e0568c3225c30db3b2bea431  docs/r41/logs/npm_test.log
+833e263d4003bff3b77bdacd55280c82  docs/r41/logs/sabotagem.log
+c8ae42a40ad1b17f905d05fba1f706a0  docs/r41/prova/ANTES_copia_tmp.txt
+65119ec1c9895c0f58d4d360baaed2ef  docs/r41/prova/DEPOIS_caminho_versionado.txt
+678b73f8298896134fe673c332e7bb8a  docs/r41/prova/PG_SHDEPEND_E_DROP_OWNED.txt

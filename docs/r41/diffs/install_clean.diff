@@ -1,0 +1,82 @@
+--- /tmp/ic_r40.sh	2026-11-11 07:54:05.362759482 +0000
++++ docs/r38/scripts/install_clean.sh	2026-11-11 07:49:41.821428346 +0000
+@@ -15,10 +15,15 @@
+ #   - EXCECAO inevitavel e declarada: UM comando como `postgres` — a criacao do PRIMEIRO papel do
+ #     cluster (`nexus_infra`), porque um papel inexistente nao pode criar a si mesmo. Em Neon esse
+ #     ato e o "owner" do projeto no console.
+-#   - A invocacao de `/tmp/pg_cleanup.sh` TAMBEM conecta como `postgres` (10 conexoes). Ver D-5
+-#     no relatorio do R39: esse script tem um vazamento de escopo conhecido e NAO foi alterado
+-#     nesta rodada.
++#   - O cleanup de papeis (`docs/r38/scripts/pg_cleanup.sh`) conecta como `postgres` em todas as
++#     suas conexoes. Ele tem escopo destrutivo limitado a TEST_DATABASES desde o R40.
+ # Portanto a afirmacao "sem SUPERUSER em nenhuma etapa" era FALSA e foi removida.
++#
++# R41 — INTEGRIDADE DE EXECUCAO. Este script executa o cleanup VERSIONADO ao lado dele
++# (`$SCRIPT_DIR/pg_cleanup.sh`), resolvido a partir de BASH_SOURCE, com SHA256 conferido contra o
++# artefato auditado no R40 ANTES de qualquer operacao destrutiva. Ate o R40 ele executava
++# `/tmp/pg_cleanup.sh` — uma copia arbitraria; uma versao antiga e insegura em /tmp era executada
++# no lugar do artefato auditado, e o fluxo ainda reportava 29 OK / 0 FALHA.
+ # =================================================================================================
+ set -u
+ export LD_LIBRARY_PATH=/tmp/pg17/package/native/lib
+@@ -28,7 +33,48 @@
+ HBOOT="-h 127.0.0.1 -p 55432 -U nexus_infra"
+ H="-h 127.0.0.1 -p 55432 -U nexus_migrator"
+ DB=nexus_test
+-DBDIR=/home/user/Nexus/packages/database
++
++# -------------------------------------------------------------------------------------------------
++# R41 — RESOLUCAO DE CAMINHOS A PARTIR DA LOCALIZACAO DO PROPRIO SCRIPT
++#
++# DEFEITO (R40 §12.5): o fluxo executava `/tmp/pg_cleanup.sh` por caminho ABSOLUTO e fixo, e
++# `DBDIR` estava fixo em `/home/user/Nexus/packages/database`. Consequencia medida: uma copia
++# ANTIGA e insegura colocada em /tmp era executada no lugar do script versionado e auditado,
++# e o fluxo reportava 29 OK / 0 FALHA. O caminho nao pode vir do diretorio de trabalho nem de
++# um literal: vem da localizacao real do arquivo (BASH_SOURCE), resolvida por symlinks.
++# -------------------------------------------------------------------------------------------------
++# Resolve o caminho REAL do arquivo seguindo symlinks. `BASH_SOURCE` sozinho nao resolve: se o
++# script for invocado por um link em /tmp, `dirname` devolveria /tmp e todo o resto quebraria.
++_self="${BASH_SOURCE[0]}"
++while [ -L "$_self" ]; do
++  _dir=$(cd -- "$(dirname -- "$_self")" > /dev/null 2>&1 && pwd -P)
++  _self=$(readlink -- "$_self")
++  case "$_self" in /*) ;; *) _self="$_dir/$_self" ;; esac
++done
++SCRIPT_DIR=$(cd -- "$(dirname -- "$_self")" > /dev/null 2>&1 && pwd -P) || SCRIPT_DIR=""
++[ -n "$SCRIPT_DIR" ] || { echo "   ABORTADO: nao foi possivel resolver o diretorio do script"; exit 1; }
++
++# DBDIR = raiz do repositorio + packages/database. subimos de docs/r38/scripts ate a raiz.
++REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." > /dev/null 2>&1 && pwd -P) || REPO_ROOT=""
++DBDIR="$REPO_ROOT/packages/database"
++[ -d "$DBDIR" ] || { echo "   ABORTADO: DBDIR nao existe: $DBDIR"; exit 1; }
++
++# O cleanup versionado e o UNICO que pode rodar. Nao ha copia intermediaria em /tmp.
++CLEANUP_SRC="$SCRIPT_DIR/pg_cleanup.sh"
++[ -f "$CLEANUP_SRC" ] || { echo "   ABORTADO: cleanup versionado ausente: $CLEANUP_SRC"; exit 1; }
++[ -x "$CLEANUP_SRC" ] || { echo "   ABORTADO: cleanup versionado nao e executavel: $CLEANUP_SRC"; exit 1; }
++
++# SHA256 do artefato auditado no R40. Se o arquivo em disco divergir, abortamos ANTES de qualquer
++# operacao destrutiva: um cleanup alterado nao e o cleanup auditado.
++CLEANUP_SHA256_ESPERADO=1ccc43fb4397632c4210b3f4588da3df4a1e6e573b87c2bc5b23ceaef67803a2
++CLEANUP_SHA256_REAL=$(sha256sum "$CLEANUP_SRC" | cut -d' ' -f1)
++if [ "$CLEANUP_SHA256_REAL" != "$CLEANUP_SHA256_ESPERADO" ]; then
++  echo "   ABORTADO: SHA256 do cleanup nao confere."
++  echo "     esperado: $CLEANUP_SHA256_ESPERADO"
++  echo "     obtido:   $CLEANUP_SHA256_REAL"
++  echo "     arquivo:  $CLEANUP_SRC"
++  exit 1
++fi
+ OWNER=00000000-0000-4000-8000-000000000004
+ FAILS=0
+ 
+@@ -62,7 +108,9 @@
+ echo "================================================================================="
+ # A limpeza NAO pode ser silenciosa: se sobrar papel de execucao anterior, o CREATE ROLE falha e
+ # queremos o motivo na tela. A saida do cleanup vai para log e o status e conferido.
+-out=$(/tmp/pg_cleanup.sh nexus_migrator nexus_app nexus_anonymous nexus_audit_writer nexus_infra 2>&1); rc=$?
++# R41: executa o artefato VERSIONADO e cujo SHA256 foi conferido acima — nunca /tmp.
++say "   cleanup em uso: $CLEANUP_SRC (sha256 ${CLEANUP_SHA256_REAL:0:16}…)"
++out=$("$CLEANUP_SRC" nexus_migrator nexus_app nexus_anonymous nexus_audit_writer nexus_infra 2>&1); rc=$?
+ echo "$out" > /tmp/cleanup.log
+ [ $rc -eq 0 ] && ok "papeis de execucao anterior removidos (log: /tmp/cleanup.log)" \
+               || { bad "cleanup de papeis"; tail -20 /tmp/cleanup.log; exit 1; }
