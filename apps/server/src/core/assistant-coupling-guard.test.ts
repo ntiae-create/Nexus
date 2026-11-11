@@ -50,7 +50,7 @@ const REPO_ROOT = ((): string => {
   throw new Error(`repository root not found from ${process.cwd()}`);
 })();
 
-const INITIAL_KEYS = ["yui", "alice", "schwi"] as const;
+const INITIAL_KEYS = ["yui", "alice", "schwi", "vivy"] as const;
 const SCANNED_DIRECTORIES = ["apps/server/src", "apps/mobile/src", "packages"] as const;
 
 const KEY_SET: ReadonlySet<string> = new Set(INITIAL_KEYS);
@@ -442,14 +442,14 @@ export function signatureOf(
 export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
   {
     file: "packages/shared/src/schemas/assistants.ts",
-    keys: ["yui", "alice", "schwi"],
+    keys: ["yui", "alice", "schwi", "vivy"],
     pattern: "list",
     reason: "raiz do enum InitialAssistantKey — o acoplamento que a Fase 1 vai desmontar (G1)",
     removedIn: "Fase 1",
   },
   {
     file: "packages/assistant-profiles/src/catalog.ts",
-    keys: ["yui", "alice", "schwi"],
+    keys: ["yui", "alice", "schwi", "vivy"],
     pattern: "catalog",
     anchor: "profiles",
     reason: "catálogo canônico dos perfis — é a fonte de verdade, não uma cópia",
@@ -463,7 +463,7 @@ export const ALLOWED_OCCURRENCES: readonly AllowedOccurrence[] = [
     // ele **é** uma lista literal — mas da política declarada na fonte de verdade, que é
     // exatamente onde a Fase 3 (G2) mandou que ela vivesse. Declarar aqui é o oposto de
     // duplicar: é o único lugar do repositório onde os alvos são nomeados.
-    keys: ["alice", "schwi"],
+    keys: ["alice", "schwi", "vivy"],
     pattern: "list",
     reason: "política de coordenação declarada no perfil canônico — a fonte de verdade (G2)",
     removedIn: "permanente",

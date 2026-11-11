@@ -244,9 +244,13 @@ describe("Fase 3 — política nunca é omitida na projeção (ponto 2)", () => 
     // carregamento do módulo a partir do registro canônico **com a política de produção**. Não é
     // um caminho que possa "esquecer" a política: ele não recebe parâmetros.
     expect(DELEGATION_TARGETS).toBeDefined();
-    expect([...DELEGATION_TARGETS.yui!]).toEqual(["alice", "schwi"]);
+    // Fase 4: VIVY passa a ser alvo da YUI, porque o perfil dela a declara — e `DELEGATION_TARGETS`
+    // é derivado do registro. As asserções negativas continuam: só a YUI tem alvos, e as folhas
+    // permanecem folhas.
+    expect([...DELEGATION_TARGETS.yui!]).toEqual(["alice", "schwi", "vivy"]);
     expect([...DELEGATION_TARGETS.alice!]).toEqual([]);
     expect([...DELEGATION_TARGETS.schwi!]).toEqual([]);
+    expect([...DELEGATION_TARGETS.vivy!]).toEqual([]);
     expect(Object.isFrozen(DELEGATION_TARGETS)).toBe(true);
   });
 });
@@ -301,6 +305,9 @@ describe("Fase 3 — as sete garantias obrigatórias (ponto 3)", () => {
       CANONICAL_PROFILE_REGISTRY.getByKey("yui")!,
       disabledAlice,
       CANONICAL_PROFILE_REGISTRY.getByKey("schwi")!,
+      // Fase 4: a YUI declara `vivy`; o registro exige que todo alvo declarado exista no conjunto.
+      // Incluí-la mantém o cenário isolado em ALICE.
+      CANONICAL_PROFILE_REGISTRY.getByKey("vivy")!,
     ]);
 
     expect(
@@ -309,7 +316,7 @@ describe("Fase 3 — as sete garantias obrigatórias (ponto 3)", () => {
         registry,
         SERVER_DELEGATION_POLICY,
       ),
-    ).toEqual(["schwi"]);
+    ).toEqual(["schwi", "vivy"]);
 
     const error = captureError(() =>
       validateDelegationPlan({
@@ -440,7 +447,7 @@ describe("Fase 3 — as sete garantias obrigatórias (ponto 3)", () => {
     const policy = policyBlocking("alice");
 
     const presented = delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, policy);
-    expect(presented).toEqual(["schwi"]);
+    expect(presented).toEqual(["schwi", "vivy"]);
 
     // O que está na lista passa…
     for (const target of presented) {

@@ -232,8 +232,14 @@ describe("Fase 2 — paridade registro ⇄ seed SQL", () => {
   it("o seed lido é o esperado (guarda contra parser vazio)", () => {
     // Se o formato do seed mudar e o parser não enxergar nada, a paridade abaixo passaria com
     // duas listas vazias. Esta é a guarda contra esse falso verde.
-    expect(seeded.length).toBeGreaterThanOrEqual(3);
-    expect(seeded.map((assistant) => assistant.key)).toEqual(["alice", "schwi", "yui"]);
+    //
+    // O número mínimo e as chaves vêm do catálogo, não de uma lista escrita à mão: uma quinta
+    // assistente deve bastar em `catalog.ts` + migration de seed. Fixar `["alice", "schwi", "yui"]`
+    // aqui seria uma quarta cópia do catálogo dentro de um teste.
+    expect(seeded.length).toBe(profiles.length);
+    expect(seeded.map((assistant) => assistant.key)).toEqual(
+      profiles.map((profile) => profile.key).sort(),
+    );
   });
 
   it("mesmas chaves, mesmos identificadores e mesma ordem de grandeza", () => {
@@ -310,6 +316,7 @@ describe("Fase 2 — paridade registro ⇄ API", () => {
       { id: "1", key: "yui" },
       { id: "2", key: "alice" },
       { id: "3", key: "schwi" },
+      { id: "4", key: "vivy" },
     ];
 
     // Um catálogo manual com as mesmas chaves é indistinguível por chave — e é exatamente por

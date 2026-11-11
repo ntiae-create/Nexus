@@ -1,6 +1,7 @@
 import type {
   FreeEligibility,
   GenerationMessage,
+  ModelCapability,
   ModelGenerationResponse,
 } from "@nexus/shared";
 import {
@@ -77,6 +78,28 @@ export interface MockProviderAdapterOptions {
    */
   readonly costStatus?: "free_confirmed" | "paid" | "unknown";
   /**
+   * Sobrescreve as capabilities do modelo simulado. Existe para o teste negativo da Fase 4:
+   * provar que um modelo `:free` **sem** `code` é recusado para a VIVY em vez de ser usado em
+   * silêncio. O padrão continua sendo o modelo completo.
+   */
+  readonly capabilities?: readonly ModelCapability[];
+  /**
+   * Modelos concorrentes, todos `:free` e disponíveis, para provar que a seleção **escolhe** por
+   * capability em vez de pegar o único modelo disponível.
+   *
+   * Motivo de existir: com um modelo só, um teste positivo de "exigiu `code`" passa mesmo que a
+   * exigência não seja aplicada — não há alternativa para a seleção pegar. Sabotar
+   * `resolveModelCapabilitiesFor` comprovou exatamente isso: o teste de ponta a ponta continuava
+   * verde. Um concorrente que ganha a ordenação automática (contexto maior) e **não** tem a
+   * capability exigida transforma a exigência em algo observável.
+   */
+  readonly competitorModels?: readonly {
+    readonly key: string;
+    readonly capabilities: readonly ModelCapability[];
+    readonly contextWindow?: number | null;
+    readonly maxOutputTokens?: number | null;
+  }[];
+  /**
    * Handler invoked for every generate() call. Return a string for the
    * assistant text, or throw a ProviderError to simulate a failure.
    */
@@ -106,11 +129,13 @@ export function createMockProviderAdapter(
     name: "Nexus Mock Advisor",
     availability: "available",
     capabilities: [
-      "chat",
-      "system_prompt",
-      "structured_output",
-      "reasoning",
-      "code",
+      ...(options.capabilities ?? [
+        "chat",
+        "system_prompt",
+        "structured_output",
+        "reasoning",
+        "code",
+      ]),
     ],
     supportedParameters: [
       "temperature",
@@ -145,6 +170,28 @@ export function createMockProviderAdapter(
     supportedParameters: [...model.supportedParameters],
   };
 
+  // Concorrentes: mesmo provedor, mesma elegibilidade `:free`, capabilities escolhidas pelo teste.
+  const competitorDescriptors: ProviderModelDescriptor[] = (options.competitorModels ?? []).map(
+    (competitor) => ({
+      id: deriveModelId(OPENROUTER_PROVIDER_ID, competitor.key),
+      providerId: OPENROUTER_PROVIDER_ID,
+      providerKey: OPENROUTER_PROVIDER_KEY,
+      key: competitor.key,
+      name: `Nexus Mock Advisor (${competitor.key})`,
+      availability: "available" as const,
+      capabilities: [...competitor.capabilities],
+      supportedParameters: [...model.supportedParameters],
+      contextWindow:
+        competitor.contextWindow === undefined ? model.contextWindow : competitor.contextWindow,
+      maxOutputTokens:
+        competitor.maxOutputTokens === undefined
+          ? model.maxOutputTokens
+          : competitor.maxOutputTokens,
+      freeEligibility: freeEligibility(verifiedAt, options.costStatus),
+    }),
+  );
+  const allModels: readonly ProviderModelDescriptor[] = [model, ...competitorDescriptors];
+
   const adapter: MockProviderAdapter = {
     id: OPENROUTER_PROVIDER_ID,
     key: OPENROUTER_PROVIDER_KEY,
@@ -153,19 +200,20 @@ export function createMockProviderAdapter(
     supportedCapabilities: model.capabilities,
     supportedParameters: model.supportedParameters,
     calls,
-    models: [model],
+    models: allModels,
     isConfigured: () => true,
     getStatus: () => status,
-    listModels: async () => [model],
+    listModels: async () => [...allModels],
     verifyModelEligibility: async (requestedKey) => {
-      if (requestedKey !== model.key) {
+      const found = allModels.find((entry) => entry.key === requestedKey);
+      if (!found) {
         throw new ProviderError(
           "MODEL_NOT_FOUND",
           `Model '${requestedKey}' was not found in provider 'openrouter'`,
           { providerKey: OPENROUTER_PROVIDER_KEY, details: { model: requestedKey } },
         );
       }
-      return model;
+      return found;
     },
     generate: async (call) => {
       invocation += 1;
@@ -199,12 +247,16 @@ export function createMockProviderAdapter(
         });
       }
 
+      // O modelo efetivamente chamado pode ser um concorrente: reportar sempre o primário faria o
+      // teste de seleção medir o rótulo errado.
+      const active = allModels.find((entry) => entry.key === call.model) ?? model;
+
       return {
         id: `mock-completion-${invocation}`,
         providerId: OPENROUTER_PROVIDER_ID,
         providerKey: OPENROUTER_PROVIDER_KEY,
-        modelId: model.id,
-        modelKey: model.key,
+        modelId: active.id,
+        modelKey: active.key,
         content,
         finishReason: "stop" as const,
         usage: {
@@ -213,7 +265,7 @@ export function createMockProviderAdapter(
           totalTokens: 20,
         },
         createdAt: new Date().toISOString(),
-        freeEligibility: model.freeEligibility,
+        freeEligibility: active.freeEligibility,
       } satisfies ModelGenerationResponse;
     },
     complete: async (call) => adapter.generate(call),

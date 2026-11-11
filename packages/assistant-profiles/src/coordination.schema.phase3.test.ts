@@ -48,6 +48,10 @@ const template: AssistantProfile = {
   },
   metadata: { lifecycle: "initial", tags: ["test"], extensible: true },
   configuration: { instructions: ["Responda de forma objetiva."], profileSchemaVersion: 1 },
+  // Fase 4: `modelPreference` passou a ser obrigatório em todo perfil. O template é a base de
+  // todos os cenários deste arquivo, então o campo entra aqui — com lista vazia, porque este
+  // arquivo isola coordenação e não deve introduzir exigência de modelo por acidente.
+  modelPreference: { requiredCapabilities: [] },
 } as AssistantProfile;
 
 async function schema() {

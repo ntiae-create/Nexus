@@ -19,11 +19,16 @@ export const assistantKeySchema = z.string().regex(/^[a-z][a-z0-9-]{1,31}$/);
 /**
  * Frozen initial catalog of assistant keys.
  *
- * Kept verbatim on purpose: the three assistants are the catalog seeded in the initial schema
- * and referenced by the frozen profiles. Widening it is a data decision (a new profile plus
- * seed), not something a contract change should do implicitly.
+ * Kept verbatim on purpose: these are the assistants seeded by the database migrations and
+ * referenced by the frozen profiles. Widening it is a data decision — a new profile plus a new
+ * seed migration —, never something a contract change should do implicitly.
+ *
+ * Growth so far: the three assistants of migration 00001, plus VIVY in migration 00006 (Fase 4).
+ * The enum is the catalog, so it changes only when the catalog does; identifiers outside it remain
+ * valid `AssistantKey`s, and which assistant may actually answer is decided by the profile
+ * registry, not here.
  */
-export const initialAssistantKeySchema = z.enum(["yui", "alice", "schwi"]);
+export const initialAssistantKeySchema = z.enum(["yui", "alice", "schwi", "vivy"]);
 
 export const assistantSchema = z.object({
   id: uuidSchema,

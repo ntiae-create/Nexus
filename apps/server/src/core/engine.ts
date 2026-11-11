@@ -38,6 +38,7 @@ import { redactSecrets } from "../providers/redaction.js";
 import { ExecutionCancellationRegistry } from "./cancellation-registry.js";
 import { ExecutionCancellationWatcher } from "./cancellation-watcher.js";
 import { buildExecutionContext, renderMessagePartsToText } from "./context-builder.js";
+import { resolveModelCapabilitiesFor } from "./model-preference.js";
 import {
   buildDelegationUserPrompt,
   buildSynthesisUserPrompt,
@@ -905,7 +906,9 @@ export class NexusCoreEngine {
         {
           assistantId: profile.id,
           conversationId,
-          requiredCapabilities: ["chat"],
+          // Fase 4 (§5.6): a exigência vem do perfil, não de um literal. Para YUI/ALICE/SCHWI o
+          // resultado continua exatamente `["chat"]`; para VIVY passa a ser `["chat", "code"]`.
+          requiredCapabilities: resolveModelCapabilitiesFor(profile),
           requiredParameters,
           signal: handle.signal,
         },
@@ -1495,7 +1498,9 @@ export class NexusCoreEngine {
     const target = await this.providers.selection.resolveEffectiveSelection(preferences, {
       assistantId: targetProfile.id,
       conversationId,
-      requiredCapabilities: ["chat"],
+      // O mesmo critério do nó raiz. Se a sub-execução usasse `["chat"]` fixo, a delegação seria
+      // uma porta dos fundos para a VIVY rodar em modelo sem `code`.
+      requiredCapabilities: resolveModelCapabilitiesFor(targetProfile),
       requiredParameters: parameterNames(request.parameters),
       signal: parentSignal,
     });

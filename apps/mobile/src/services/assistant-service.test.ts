@@ -153,7 +153,9 @@ describe("Fase 2 — fallback sobrevive a indisponibilidade da API", () => {
     // O que não se admite é o resultado ser vazio (coberto acima) ou conter lixo (coberto a
     // seguir) — e o fallback volta no próximo `resetAssistantCatalog`, nunca é destruído.
     expect(catalogKeys()).toEqual(["yui"]);
-    expect(fallbackKeys()).toEqual(["yui", "alice", "schwi"]);
+    // Fase 4: o fallback agora tem quatro perfis. O ponto do teste — o fallback não é destruído
+    // por uma resposta parcial — continua idêntico.
+    expect(fallbackKeys()).toEqual(["yui", "alice", "schwi", "vivy"]);
   });
 });
 
@@ -204,7 +206,7 @@ describe("Fase 2 — catálogo não vaza entre sessões", () => {
 
     resetAssistantCatalog();
     // `resetAssistantCatalog` troca o conteúdo in-place; um snapshot antigo não pode mudar junto.
-    expect(afterFirst.map((entry) => entry.key)).toEqual(["yui", "alice", "schwi", "delta"]);
+    expect(afterFirst.map((entry) => entry.key)).toEqual(["yui", "alice", "schwi", "vivy", "delta"]);
     expect(catalogKeys()).toEqual(fallbackKeys());
   });
 });

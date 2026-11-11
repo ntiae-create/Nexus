@@ -31,7 +31,11 @@ import { assistantKeyOf, resolveCanonicalAssistantProfile } from "./instructions
  * *identidade* não a impede — a criação é decisão de dados das fases seguintes.
  */
 
+// As três chaves da fase original. Mantidas separadas de propósito: o teste abaixo continua
+// provando que elas não desapareceram quando a Fase 4 acrescentou a quarta.
 const THREE_KEYS = ["yui", "alice", "schwi"] as const;
+const PHASE_4_KEY = "vivy" as const;
+const CURRENT_KEYS = [...THREE_KEYS, PHASE_4_KEY] as const;
 
 /** Chave bem formada que nenhum perfil registrado possui. */
 const UNREGISTERED_KEY = "delta";
@@ -61,10 +65,18 @@ describe("Fase 1 — identificador versus catálogo (G1)", () => {
   });
 
   it("o catálogo inicial continua congelado e explícito", () => {
-    // Compatibilidade: o alias continua sendo a enumeração das três chaves. A fase separa os
+    // Compatibilidade: o alias continua sendo uma enumeração fechada. A fase separa os
     // conceitos, não apaga o catálogo.
-    expect(initialAssistantKeySchema.options).toEqual([...THREE_KEYS]);
-    expect(listAssistantProfiles().map((profile) => profile.key)).toEqual([...THREE_KEYS]);
+    //
+    // Fase 4: a enumeração passou a ter quatro membros, por decisão explícita do contrato — a
+    // quarta assistente precisa ser aceita por `initialAssistantProfileSchema`. O que este teste
+    // garante é o que sempre garantiu: o catálogo é finito, ordenado e idêntico ao registro.
+    // As três chaves originais continuam presentes; nada foi removido para caber a VIVY.
+    expect(initialAssistantKeySchema.options).toEqual([...CURRENT_KEYS]);
+    expect(listAssistantProfiles().map((profile) => profile.key)).toEqual([...CURRENT_KEYS]);
+    for (const key of THREE_KEYS) {
+      expect(initialAssistantKeySchema.options).toContain(key);
+    }
   });
 
   it("o contrato público continua aceitando as três chaves", () => {
@@ -147,7 +159,10 @@ describe("Fase 1 — fronteira de escopo: delegação intacta (Fase 3)", () => {
   it("a política de delegação continua exatamente a mesma", () => {
     // Fase 1 muda o TIPO da chave, não a política. Derivar DELEGATION_TARGETS dos perfis é
     // Fase 3 (G2); este teste congela a política atual para provar que não avançamos.
-    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual(["alice", "schwi"]);
+    // Fase 4: VIVY entra como alvo da YUI. O que não muda — e é o objeto deste teste — é que
+    // ALICE e SCHWI continuam alcançáveis e continuam folhas.
+    expect([...delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)]).toEqual(["alice", "schwi", "vivy"]);
+    expect(delegationTargetsFor("vivy", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
     expect(delegationTargetsFor("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
     expect(delegationTargetsFor("schwi", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
     expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);

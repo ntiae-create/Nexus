@@ -31,12 +31,17 @@ function planError(fn: () => void): CoreExecutionError {
 }
 
 describe("NEXUS CORE delegation policy", () => {
-  it("only authorizes YUI as coordinator of ALICE and SCHWI", () => {
+  it("only authorizes YUI as coordinator — of ALICE, SCHWI and (Fase 4) VIVY", () => {
     expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
     expect(canDelegate("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
     expect(canDelegate("schwi", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
-    expect(delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual(["alice", "schwi"]);
+    // Fase 4: VIVY é alvo, não coordenadora. Ela é a única assistente que entra na lista sem
+    // poder sair dela — a asserção negativa é o que impede a inversão.
+    expect(canDelegate("vivy", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(false);
+    expect(delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual(["alice", "schwi", "vivy"]);
     expect(delegationTargetsFor("alice", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(delegationTargetsFor("schwi", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
+    expect(delegationTargetsFor("vivy", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toEqual([]);
   });
 
   it("accepts a valid plan and flattens nested sub-delegations with depth", () => {

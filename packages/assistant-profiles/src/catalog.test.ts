@@ -12,9 +12,14 @@ import {
 const profiles = listAssistantProfiles();
 
 describe("assistant profile catalog", () => {
-  it("contains the three initial profiles with stable, unique IDs", () => {
-    expect(profiles.map((profile) => profile.key)).toEqual(["yui", "alice", "schwi"]);
-    expect(new Set(profiles.map((profile) => profile.id)).size).toBe(3);
+  it("contains the initial profiles with stable, unique IDs", () => {
+    // Fase 4: a ordem passa a incluir VIVY ao fim. A lista continua sendo explícita — o ponto do
+    // teste é que o catálogo não ganha membros sem que alguém os declare aqui.
+    expect(profiles.map((profile) => profile.key)).toEqual(["yui", "alice", "schwi", "vivy"]);
+    // Unicidade e formato continuam derivados do tamanho real do catálogo: acrescentar um perfil
+    // duplicado quebra a igualdade, não o `toBe(3)`.
+    expect(new Set(profiles.map((profile) => profile.id)).size).toBe(profiles.length);
+    expect(new Set(profiles.map((profile) => profile.key)).size).toBe(profiles.length);
     expect(profiles.every((profile) => /^[0-9a-f-]{36}$/i.test(profile.id))).toBe(true);
   });
 
@@ -56,7 +61,7 @@ describe("assistant profile catalog", () => {
     expect(getAssistantProfileById(yui!.id)).toEqual(yui);
     expect(getAssistantProfileByKey("alice")?.name).toBe("ALICE");
     expect(getAssistantProfileById("missing")).toBeUndefined();
-    expect(listAssistantProfiles()).toHaveLength(3);
+    expect(listAssistantProfiles()).toHaveLength(4);
     expect(Object.isFrozen(profiles)).toBe(true);
     expect(Object.isFrozen(profiles[0]?.tools)).toBe(true);
   });

@@ -253,11 +253,15 @@ describe("HomeScreen — conversation creation", () => {
     await waitFor(() => text(view.host).includes("Nova conversa com YUI"));
 
     const options = [...view.host.querySelectorAll<HTMLButtonElement>(".assistant-option")];
-    expect(options.map((option) => option.getAttribute("aria-checked"))).toEqual([
-      "true",
-      "false",
-      "false",
-    ]);
+    // O que este teste mede: **exatamente uma** opção marcada, e é a primeira (YUI, a padrão).
+    // A Fase 4 acrescentou uma quarta opção; em vez de reescrever o array — que passaria a valer
+    // por repetição e não por regra —, a asserção passa a afirmar a propriedade: uma única marcada,
+    // sempre a primeira, e todas as opções presentes.
+    expect(options).toHaveLength(ASSISTANT_CATALOG.length);
+    expect(options).toHaveLength(4);
+    const checked = options.map((option) => option.getAttribute("aria-checked"));
+    expect(checked.filter((value) => value === "true")).toHaveLength(1);
+    expect(checked[0]).toBe("true");
     view.unmount();
   });
 

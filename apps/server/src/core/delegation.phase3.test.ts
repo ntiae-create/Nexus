@@ -129,15 +129,19 @@ describe("Fase 3 — política derivada do perfil (YUI, ALICE, SCHWI)", () => {
     expect(canDelegate("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY)).toBe(true);
   });
 
-  it("YUI continua coordenando ALICE e SCHWI, e só elas", () => {
+  it("YUI continua coordenando ALICE e SCHWI, e só elas além da VIVY da Fase 4", () => {
     const targets = delegationTargetsFor("yui", CANONICAL_PROFILE_REGISTRY, SERVER_DELEGATION_POLICY);
     expect(targets).toContain("alice");
     expect(targets).toContain("schwi");
-    expect(targets).toHaveLength(2);
+    // Fase 4 acrescenta exatamente uma entrada. Qualquer outro acréscimo — inclusive um alvo
+    // que só exista por efeito colateral — quebra aqui.
+    expect(targets).toContain("vivy");
+    expect(targets).toHaveLength(3);
+    expect(new Set(targets).size).toBe(targets.length);
   });
 
-  it("ALICE e SCHWI são folhas: não coordenam ninguém", () => {
-    for (const key of ["alice", "schwi"] as const) {
+  it("ALICE, SCHWI e VIVY são folhas: não coordenam ninguém", () => {
+    for (const key of ["alice", "schwi", "vivy"] as const) {
       const profile = CANONICAL_PROFILE_REGISTRY.getByKey(key)!;
       expect(profile.coordination.canCoordinate).toBe(false);
       expect(profile.coordination.delegateTo).toBeUndefined();
@@ -181,7 +185,7 @@ describe("Fase 3 — quarta assistente de teste, sem tocar produção", () => {
     // `epsilon` é coordenado por `delta`; e `yui` não conhece `delta` porque não o declara —
     // ser alvo exige declaração explícita de quem coordena, não o contrário.
     expect([...delegationTargetsFor("delta", registry, SERVER_DELEGATION_POLICY)]).toEqual(["epsilon"]);
-    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual(["alice", "schwi"]);
+    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual(["alice", "schwi", "vivy"]);
   });
 
   it("a quarta assistente funciona sem estar em enum, lista ou condicional de produção", () => {
@@ -411,9 +415,13 @@ describe("Fase 3 — alvos inativos não são oferecidos", () => {
       CANONICAL_PROFILE_REGISTRY.getByKey("yui")!,
       disabled,
       CANONICAL_PROFILE_REGISTRY.getByKey("schwi")!,
+      // Fase 4: a YUI declara `vivy` como alvo, e o registro recusa alvo declarado que não exista
+      // no conjunto. O perfil entra aqui inteiro — é o que mantém o cenário isolado: o que se
+      // mede é a saída de ALICE por `disabled`, não a ausência de VIVY.
+      CANONICAL_PROFILE_REGISTRY.getByKey("vivy")!,
     ]);
 
-    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual(["schwi"]);
+    expect(delegationTargetsFor("yui", registry, SERVER_DELEGATION_POLICY)).toEqual(["schwi", "vivy"]);
   });
 
   it("um coordenador desabilitado não coordena", () => {
