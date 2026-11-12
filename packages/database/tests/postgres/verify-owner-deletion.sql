@@ -641,6 +641,7 @@ $sec7$;
 DO $sec8$
 DECLARE
   r record;
+  auditor record;
   amplos text := '';
 BEGIN
   FOR r IN
@@ -655,6 +656,38 @@ BEGIN
 
   IF amplos <> '' THEN
     RAISE EXCEPTION 'Installation roles must not hold SUPERUSER or BYPASSRLS:%', amplos;
+  END IF;
+
+  -- `nexus_audit_writer` — os CINCO atributos, cada um com a sua propria assercao e mensagem.
+  --
+  -- A varredura acima cobre SUPERUSER/BYPASSRLS de todos os papeis, mas nao verifica NOLOGIN,
+  -- NOCREATEDB nem NOCREATEROLE. O escritor da trilha e o papel mais sensivel da instalacao:
+  -- grava em tabela append-only por funcao SECURITY DEFINER. Se ele pudesse logar ou criar
+  -- bancos/papeis, a auditoria deixaria de ser confiavel — e o §8 diria que estava tudo certo.
+  --
+  -- Consulta `pg_roles`, o estado REAL do cluster, e nao o texto do SQL que deveria te-lo
+  -- produzido: um `CREATE ROLE` correto no arquivo nao prova nada se o papel foi alterado depois.
+  -- Assercoes SEPARADAS de proposito: uma unica condicao agrupada esconderia qual atributo
+  -- regrediu.
+  SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole
+    INTO auditor FROM pg_roles WHERE rolname = 'nexus_audit_writer';
+  IF auditor IS NULL THEN
+    RAISE EXCEPTION 'nexus_audit_writer does not exist; the audit trail writer was not provisioned';
+  END IF;
+  IF auditor.rolcanlogin THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOLOGIN (rolcanlogin = true)';
+  END IF;
+  IF auditor.rolsuper THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOSUPERUSER (rolsuper = true)';
+  END IF;
+  IF auditor.rolbypassrls THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOBYPASSRLS (rolbypassrls = true)';
+  END IF;
+  IF auditor.rolcreatedb THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOCREATEDB (rolcreatedb = true)';
+  END IF;
+  IF auditor.rolcreaterole THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOCREATEROLE (rolcreaterole = true)';
   END IF;
 
   -- `nexus_app` continua sem privilegio de escrita em `owner_identity`, e sem escrita destrutiva

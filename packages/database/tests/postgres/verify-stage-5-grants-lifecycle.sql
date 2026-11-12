@@ -349,11 +349,17 @@ BEGIN
   IF r IS NULL THEN
     RAISE EXCEPTION 'Role nexus_audit_writer does not exist';
   END IF;
-  IF r.rolcanlogin THEN RAISE EXCEPTION 'nexus_audit_writer must not be able to log in'; END IF;
-  IF r.rolsuper THEN RAISE EXCEPTION 'nexus_audit_writer must not be SUPERUSER'; END IF;
-  IF r.rolbypassrls THEN RAISE EXCEPTION 'nexus_audit_writer must not have BYPASSRLS'; END IF;
-  IF r.rolcreatedb OR r.rolcreaterole THEN
-    RAISE EXCEPTION 'nexus_audit_writer must not create databases or roles';
+  IF r.rolcanlogin THEN RAISE EXCEPTION 'nexus_audit_writer must be NOLOGIN (rolcanlogin = true)'; END IF;
+  IF r.rolsuper THEN RAISE EXCEPTION 'nexus_audit_writer must be NOSUPERUSER (rolsuper = true)'; END IF;
+  IF r.rolbypassrls THEN RAISE EXCEPTION 'nexus_audit_writer must be NOBYPASSRLS (rolbypassrls = true)'; END IF;
+  -- Assercoes SEPARADAS: agrupar `rolcreatedb OR rolcreaterole` numa unica mensagem esconderia
+  -- qual dos dois atributos regrediu, e cada um tem consequencia distinta (criar bancos x criar
+  -- papeis). Consulta `pg_roles`, o estado real, nao o texto do `CREATE ROLE`.
+  IF r.rolcreatedb THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOCREATEDB (rolcreatedb = true)';
+  END IF;
+  IF r.rolcreaterole THEN
+    RAISE EXCEPTION 'nexus_audit_writer must be NOCREATEROLE (rolcreaterole = true)';
   END IF;
 
   SELECT p.proname, p.prosecdef, p.proconfig,

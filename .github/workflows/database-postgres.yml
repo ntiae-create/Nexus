@@ -103,10 +103,43 @@ jobs:
           GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE;
           SQL
 
-          # O escritor de auditoria nao pode ter atributos amplos: os verificadores de RLS e a
-          # secao §8 do verificador de exclusao dependem disso.
-          test "$(psql -X -Atd postgres -c "SELECT rolsuper FROM pg_roles WHERE rolname='nexus_audit_writer'")" = "f"
-          test "$(psql -X -Atd postgres -c "SELECT rolbypassrls FROM pg_roles WHERE rolname='nexus_audit_writer'")" = "f"
+          # ---------------------------------------------------------------------------------------
+          # `nexus_audit_writer` — os CINCO atributos, um por assercao.
+          # ---------------------------------------------------------------------------------------
+          # O escritor de auditoria grava na trilha append-only por funcao SECURITY DEFINER, sob
+          # FORCE ROW LEVEL SECURITY. Se ele pudesse logar, ter SUPERUSER, BYPASSRLS, CREATE DATABASE
+          # ou CREATEROLE, as provas de isolamento da Fase 5 passariam a exercitar um caminho que
+          # nao existe em producao — e a auditoria deixaria de ser confiavel.
+          #
+          # Uma unica consulta le os cinco atributos de `pg_roles` — o estado REAL do cluster, nao
+          # o texto do `CREATE ROLE` — e devolve `atributo=valor` por linha, ordenado.
+          #
+          # `::text` de um booleano produz `true`/`false`, NAO `t`/`f`: comparar com `f` falharia
+          # sempre (foi o primeiro erro desta mudanca). `::int` da 0/1 sem ambiguidade.
+          audit_writer_attrs=$(psql -X -Atd postgres -c "
+            SELECT 'rolcanlogin='   || rolcanlogin::int   FROM pg_roles WHERE rolname = 'nexus_audit_writer'
+            UNION ALL
+            SELECT 'rolsuper='      || rolsuper::int      FROM pg_roles WHERE rolname = 'nexus_audit_writer'
+            UNION ALL
+            SELECT 'rolbypassrls='  || rolbypassrls::int  FROM pg_roles WHERE rolname = 'nexus_audit_writer'
+            UNION ALL
+            SELECT 'rolcreatedb='   || rolcreatedb::int   FROM pg_roles WHERE rolname = 'nexus_audit_writer'
+            UNION ALL
+            SELECT 'rolcreaterole=' || rolcreaterole::int FROM pg_roles WHERE rolname = 'nexus_audit_writer'
+            ORDER BY 1")
+          if [ -z "$audit_writer_attrs" ]; then
+            echo "nexus_audit_writer does not exist; the audit trail writer was not provisioned." >&2
+            exit 1
+          fi
+          # Assercoes SEPARADAS, cada uma com a sua mensagem: um `OR` agrupado esconderia qual
+          # atributo regrediu. `grep -qx` exige a linha inteira, para `rolsuper=0` nao casar por
+          # prefixo com outra chave.
+          printf '%s\n' "$audit_writer_attrs" | grep -qx 'rolcanlogin=0'   || { echo "nexus_audit_writer must be NOLOGIN (rolcanlogin = true)" >&2; exit 1; }
+          printf '%s\n' "$audit_writer_attrs" | grep -qx 'rolsuper=0'      || { echo "nexus_audit_writer must be NOSUPERUSER (rolsuper = true)" >&2; exit 1; }
+          printf '%s\n' "$audit_writer_attrs" | grep -qx 'rolbypassrls=0'  || { echo "nexus_audit_writer must be NOBYPASSRLS (rolbypassrls = true)" >&2; exit 1; }
+          printf '%s\n' "$audit_writer_attrs" | grep -qx 'rolcreatedb=0'   || { echo "nexus_audit_writer must be NOCREATEDB (rolcreatedb = true)" >&2; exit 1; }
+          printf '%s\n' "$audit_writer_attrs" | grep -qx 'rolcreaterole=0' || { echo "nexus_audit_writer must be NOCREATEROLE (rolcreaterole = true)" >&2; exit 1; }
+          echo "nexus_audit_writer: NOLOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE — verificado"
 
           # Prova negativa: os atributos amplos NAO existem. Sem esta checagem, uma alteracao
           # futura no provisionamento poderia conceder SUPERUSER/BYPASSRLS sem ninguem notar, e
