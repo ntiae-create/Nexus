@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build:packages && npm run build --workspace @nexus/server",
+  "installCommand": "npm install",
+  "git": {
+    "deploymentEnabled": {
+      "nexus": false
+    }
+  }
+}

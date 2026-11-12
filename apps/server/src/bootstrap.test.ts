@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import Fastify from "fastify";
-import { bootstrapServer, BootstrapError } from "./bootstrap.js";
+import {
+  bootstrapServer,
+  BootstrapError,
+  createServerlessApp,
+  SERVERLESS_POOL_OPTIONS,
+} from "./bootstrap.js";
 import type { PostgresNexusDatabase } from "./database.js";
 
 function makeMockDb(
@@ -221,5 +226,55 @@ describe("bootstrapServer", () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+describe("createServerlessApp", () => {
+  it("does not create the pool while building the app or serving /v1/health", async () => {
+    const createDatabase = vi.fn();
+    const app = createServerlessApp(
+      { NEXUS_DATABASE_URL: "postgresql://user:pass@127.0.0.1:1/db" },
+      { createDatabase: createDatabase as never },
+    );
+    try {
+      // Neither construction nor the health probe may touch PostgreSQL: the
+      // serverless instance must stay usable while the database is down.
+      expect(createDatabase).not.toHaveBeenCalled();
+      const health = await app.inject({ method: "GET", url: "/v1/health" });
+      expect(health.statusCode).toBe(200);
+      expect(createDatabase).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("reuses one pool across invocations instead of opening one per request", async () => {
+    const checkConnectivity = vi.fn(async () => undefined);
+    const createDatabase = vi.fn(() => makeMockDb({ checkConnectivity }));
+    const app = createServerlessApp(
+      { NEXUS_DATABASE_URL: "postgresql://user:pass@127.0.0.1:1/db" },
+      { createDatabase: createDatabase as never },
+    );
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        const ready = await app.inject({ method: "GET", url: "/v1/ready" });
+        expect(ready.statusCode).toBe(200);
+      }
+      // Three readiness probes, one pool. Opening a pool per request is what
+      // exhausts a managed PostgreSQL's connection limit under serverless.
+      expect(createDatabase).toHaveBeenCalledTimes(1);
+      expect(checkConnectivity).toHaveBeenCalledTimes(3);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("sizes the serverless pool well below the long-lived server pool", async () => {
+    // A long-lived server keeps one pool of 10 for the whole process. On a
+    // serverless platform the total is instances x max, so the per-instance
+    // ceiling has to be small.
+    expect(SERVERLESS_POOL_OPTIONS.max).toBeLessThan(10);
+    expect(SERVERLESS_POOL_OPTIONS.idleTimeoutMillis).toBeLessThan(30_000);
+    expect(SERVERLESS_POOL_OPTIONS.connectionTimeoutMillis).toBeGreaterThan(0);
   });
 });

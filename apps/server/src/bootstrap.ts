@@ -79,9 +79,32 @@ export interface BootstrappedServer {
 }
 
 /**
+ * Connection-pool sizing for a serverless runtime.
+ *
+ * A long-lived server keeps one pool of 10 for the whole process. A serverless
+ * platform instead runs several instances concurrently, and every instance
+ * would otherwise open up to 10 connections of its own — the total is
+ * `instances x max`, which exhausts a managed PostgreSQL's connection limit
+ * long before traffic is heavy. The pool is therefore small and each
+ * connection is short-lived, while still allowing concurrency inside one
+ * invocation (requests in flight plus a nested read are enough to need 2).
+ *
+ * No `allowExitOnIdle` here: `pg` would then be free to drop the connection
+ * while it sits idle between invocations, which is a `pg`-level process hook
+ * and not something this deployment needs. Dynamic (fluid) compute keeps the
+ * instance alive as long as it is routing traffic, so the pool above with a
+ * 5s idle timeout is the whole story.
+ */
+export const SERVERLESS_POOL_OPTIONS = {
+  max: 3,
+  idleTimeoutMillis: 5_000,
+  connectionTimeoutMillis: 10_000,
+} as const;
+
+/**
  * Builds the Fastify application for a serverless runtime. PostgreSQL is
  * created and checked only when /v1/ready is requested, so app initialization
- * and /v1/health do not depend on Neon availability.
+ * and /v1/health do not depend on database availability.
  */
 export function createServerlessApp(
   env: BootstrapEnv = process.env,
@@ -89,7 +112,11 @@ export function createServerlessApp(
 ): FastifyInstance {
   const createDatabase =
     deps.createDatabase ??
-    ((url: string) => createServerDatabase({ connectionString: url }));
+    ((url: string) =>
+      createServerDatabase({
+        connectionString: url,
+        ...SERVERLESS_POOL_OPTIONS,
+      }));
   const build =
     deps.buildApp ?? ((options?: BuildAppOptions) => buildApp(options));
   let db: PostgresNexusDatabase | undefined;
