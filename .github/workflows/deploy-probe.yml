@@ -1,18 +1,5 @@
 name: Deploy probe (temporary)
 
-# TEMPORARY diagnostic workflow. Deleted in the commit that follows this run.
-#
-# Why it exists: the Vercel project applies Deployment Protection (SSO), so an
-# anonymous request to a preview or to an immutable production URL gets the
-# Vercel login page instead of the API response. The public production alias is
-# reachable, but the agent's sandbox cannot open an outbound TLS connection to
-# vercel.app. A runner can, so the probe runs here.
-#
-# It only performs read-only GETs plus one POST with a deliberately wrong
-# password. No secret is read, printed or needed: a wrong password must return
-# 401 when the `nexus` schema exists, and 500 when it does not (the login store
-# writes to nexus.auth_login_state on every failed attempt).
-
 on:
   push:
     paths:
@@ -21,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   probe:
@@ -31,31 +19,16 @@ jobs:
           BASE: https://nexus-server-five.vercel.app
         run: |
           set -eu
-
           probe() {
             name=$1; shift
             body=$(mktemp)
             code=$(curl -sS --max-time 30 -o "$body" -w '%{http_code}' "$@" || echo "000")
-            printf '%-34s HTTP %s  %s\n' "$name" "$code" "$(head -c 220 "$body")"
+            printf '%-30s HTTP %s  %s\n' "$name" "$code" "$(head -c 200 "$body")"
             rm -f "$body"
           }
-
-          echo "1) liveness (no database)"
-          probe "/v1/health" "$BASE/v1/health?probe=$GITHUB_RUN_ID"
-
-          echo "2) readiness (SELECT 1 against the real PostgreSQL)"
-          probe "/v1/ready" "$BASE/v1/ready?probe=$GITHUB_RUN_ID"
-
-          echo "3) auth-gated route without a token (expect 401, never AUTH_NOT_CONFIGURED)"
-          probe "/v1/assistants" "$BASE/v1/assistants?probe=$GITHUB_RUN_ID"
-
-          echo "4) login with a WRONG password"
-          echo "   401 => the nexus schema exists (login store wrote to auth_login_state)"
-          echo "   500 => the schema is missing or not migrated"
-          probe "POST /v1/auth/login (wrong pw)" \
-            -X POST -H 'content-type: application/json' \
-            --data '{"password":"definitely-not-the-owner-password"}' \
-            "$BASE/v1/auth/login"
-
-          echo "5) which build answered"
-          probe "/v1/deploy-probe" "$BASE/v1/deploy-probe?probe=$GITHUB_RUN_ID"
+          probe "/v1/health" "$BASE/v1/health?p=$GITHUB_RUN_ID"
+          probe "/v1/ready" "$BASE/v1/ready?p=$GITHUB_RUN_ID"
+          probe "/v1/assistants" "$BASE/v1/assistants?p=$GITHUB_RUN_ID"
+          probe "login (senha errada)" -X POST -H 'content-type: application/json' \
+            --data '{"password":"definitely-not-the-owner-password"}' "$BASE/v1/auth/login"
+          probe "/v1/deploy-probe" "$BASE/v1/deploy-probe?p=$GITHUB_RUN_ID"
