@@ -23,7 +23,16 @@ export interface PostgresNexusDatabase extends NexusDatabase {
    */
   close(): Promise<void>;
   /**
-   * Verifies the pool can obtain a connection and run a trivial query.
+   * Verifies the pool can obtain a connection AND that the `nexus` schema has
+   * actually been migrated on that database.
+   *
+   * Why not `SELECT 1`: that succeeds against any reachable PostgreSQL, so it
+   * reports "ready" for a database where the schema was never applied. Measured
+   * in production on 2026-11-12: `/v1/ready` returned 200 while every data route
+   * failed with `42P01 relation "nexus.auth_login_state" does not exist`. A
+   * readiness probe that cannot distinguish "connected" from "migrated" is a
+   * probe that lies, and the deploy was nearly signed off on it.
+   *
    * Used only for process readiness / bootstrap — not a business SQL surface.
    */
   checkConnectivity(): Promise<void>;
@@ -71,7 +80,18 @@ export function createPostgresDatabase(
     }
     const client = await pool.connect();
     try {
-      await client.query("SELECT 1");
+      // `to_regclass` resolves a name without throwing, so it distinguishes the
+      // three states that matter: no connection (connect() threw), connection
+      // but no migration (NULL), and migrated (a non-null OID).
+      const result = await client.query<{ nexus_schema: string | null }>(
+        "SELECT to_regclass('nexus.auth_login_state')::text AS nexus_schema",
+      );
+      if (result.rows[0]?.nexus_schema == null) {
+        throw new Error(
+          "PostgreSQL reachable but the nexus schema is not migrated " +
+            "(nexus.auth_login_state is missing)",
+        );
+      }
     } finally {
       client.release();
     }
