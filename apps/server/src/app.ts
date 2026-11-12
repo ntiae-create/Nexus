@@ -49,12 +49,6 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // Fase 2 (G4): a rota existia mas nunca era chamada — `GET /v1/assistants` respondia 404.
   void registerAssistantRoutes(app, options.assistants ?? {});
 
-  app.get("/v1/deploy-probe", async () => ({
-    probe: "alive",
-    commit: (process.env.VERCEL_GIT_COMMIT_SHA ?? "local").slice(0, 7),
-    authConfigured: Boolean(app.sessionConfig),
-  }));
-
   app.get("/v1/health", async () =>
     healthResponseSchema.parse({ status: "ok" }),
   );
