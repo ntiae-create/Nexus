@@ -1,0 +1,5 @@
+/v1/health                   HTTP 200  {"status":"ok"}
+/v1/ready                    HTTP 200  {"status":"ready"}
+/v1/assistants               HTTP 401  {"error":{"code":"UNAUTHORIZED","message":"Invalid, expired, or revoked session","retryable":false},"timestamp":"2026-11-12T07:08:55.279Z"}
+login senha errada           HTTP 500  {"statusCode":500,"code":"42P01","error":"Internal Server Error","message":"relation \"nexus.auth_login_state\" does not exist"}
+/v1/deploy-probe             HTTP 200  {"probe":"alive","commit":"d4648d2","authConfigured":true}
