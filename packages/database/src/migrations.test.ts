@@ -497,14 +497,17 @@ describe("owner deletion fix (migration 00008)", () => {
     expect(script).toContain("00001 through 00008");
     expect(script).toContain("verify-owner-deletion.sql");
 
-    // O verificador COMINTA a exclusao do owner: depois dele nao existe mais owner. Se qualquer
-    // verificador rodasse depois, falharia por ausencia de dados e nao por defeito real.
+    // O verificador COMINTA a exclusao do owner: depois dele nao existe mais owner.
     const execLine = 'psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-owner-deletion.sql"';
     const execIndex = script.indexOf(execLine);
     expect(execIndex).toBeGreaterThan(-1);
-    // E a ultima LINHA DE EXECUCAO ENTRE OS VERIFICADORES (comentarios depois nao contam como
-    // execucao). Se qualquer verificador rodasse depois, falharia por ausencia de dados e nao por
-    // defeito real.
+    // Roda como o DONO do schema (nao-superuser), nunca como `postgres`: e o papel real de
+    // operacao, e um runner superusuario contornaria RLS e mascararia regressao.
+    expect(execLine).toContain("-U nexus_migrator");
+    expect(execLine).not.toContain("-U postgres");
+
+    // E a ultima LINHA DE EXECUCAO ENTRE OS VERIFICADORES. Se qualquer verificador rodasse
+    // depois, falharia por ausencia de dados e nao por defeito real.
     //
     // EXCECAO DELIBERADA — RESTAURACAO DO BANCO. Depois do verificador, o runner RECRIA
     // `nexus_test` no estado operacional para os passos seguintes do job (`pool.integration`,
@@ -513,23 +516,109 @@ describe("owner deletion fix (migration 00008)", () => {
     // restauracao eles falhavam no CI — nao por defeito de RLS, mas porque o proprio runner tinha
     // esvaziado o banco de proposito.
     //
-    // A excecao e ESTREITA e verificada, nao presumida: as unicas linhas de execucao admitidas
-    // depois do verificador sao as da secao de restauracao, e ela tem de estar marcada, rodar como
-    // `postgres` (unico papel que pode DROP/CREATE DATABASE) e NAO pode reexecutar verificador
-    // nenhum. Assim a prova da Fase 5 continua sendo a ultima verificacao do arquivo, e a
-    // restauracao continua sendo o que ela e: preparacao de estado, nunca uma prova.
+    // A verificacao e ESTRUTURAL, nao textual: olha so para LINHAS DE COMANDO, de modo que um
+    // comentario citando um verificador nao derruba o teste, e um comando real nao escapa por
+    // estar quebrado em duas linhas. Cada comando posterior ao verificador tem de ser parte da
+    // secao de restauracao.
     const after = script.slice(execIndex + execLine.length);
-    const remainingExecs = after
-      .split("\n")
-      .filter((line) => line.trimStart().startsWith("docker exec"));
-    expect(remainingExecs.length).toBeGreaterThan(0);
     expect(after).toContain("RESTAURACAO DO ESTADO OPERACIONAL");
-    // Nenhum verificador pode rodar depois da prova de exclusao.
-    expect(after).not.toContain("verify-");
-    // A restauracao nao pode reintroduzir o superusuario no papel de migracao nem afrouxar o
-    // verificador: a linha do verificador continua exactamente como antes.
-    expect(execLine).toContain("-U nexus_migrator");
-    expect(execLine).not.toContain("-U postgres");
+
+    // Junta as continuacoes de linha (`\` no fim) para obter COMANDOS completos, e descarta
+    // comentarios.
+    const commandBlocks: string[] = [];
+    let pending = "";
+    for (const raw of after.split("\n")) {
+      const line = raw.trim();
+      if (line.startsWith("#") || line === "") continue;
+      pending += (pending ? " " : "") + line.replace(/\\$/, "").trim();
+      if (!line.endsWith("\\")) {
+        commandBlocks.push(pending);
+        pending = "";
+      }
+    }
+    const laterExecs = commandBlocks.filter((block) =>
+      block.includes("docker exec") || block.includes("psql "),
+    );
+    expect(laterExecs.length).toBeGreaterThan(0);
+
+    // Nenhum comando posterior pode executar um VERIFICADOR. Comandos de restauracao so tocam DDL
+    // de banco/papel e os PRE-REQUISITOS `bootstrap.sql`/`integration.sql`, que nao sao provas.
+    //
+    // A lista e DERIVADA do diretorio, nao escrita a mao: um verificador novo passa a ser coberto
+    // automaticamente, e nao fica de fora por esquecimento de quem o adicionar.
+    const verifierDirectory = join(migrationsDirectory, "..", "tests", "postgres");
+    const verifierFiles = (await readdir(verifierDirectory))
+      .filter((name) => name.startsWith("verify-") && name.endsWith(".sql"))
+      .sort();
+    // A lista nao pode esvaziar em silencio: sem esta assercao, um erro de caminho faria o laco
+    // abaixo nao verificar nada e o teste passaria por vacuidade.
+    expect(verifierFiles.length).toBeGreaterThanOrEqual(8);
+    expect(verifierFiles).toContain("verify-owner-deletion.sql");
+
+    // A restauracao opera com `postgres` APENAS para DDL de cluster (DROP/CREATE DATABASE e
+    // DROP ROLE) — unico papel que pode faze-lo — e para ler contagens de conferencia. Ela NAO
+    // pode aplicar MIGRATION como `postgres`: as migrations continuam sendo aplicadas por
+    // `nexus_migrator`, senao o runner voltaria a exercitar um caminho de superusuario que nao
+    // existe em producao, e as tabelas nasceriam de um superusuario.
+    //
+    // A regra e por CONTEUDO do comando, nao por papel citado: qualquer comando da secao de
+    // restauracao que referencie o diretorio de migrations, `apply_migrations_to`, ou um arquivo
+    // `0000*.sql` tem de rodar como `nexus_migrator`. Verificado abaixo, sem depender de o
+    // comando citar `nexus_migrator` para ser considerado suspeito.
+    const restoreSection = script.slice(script.indexOf("RESTAURACAO DO ESTADO OPERACIONAL"));
+    const restoreBlocks: string[] = [];
+    let restorePending = "";
+    for (const raw of restoreSection.split("\n")) {
+      const line = raw.trim();
+      if (line.startsWith("#") || line === "") continue;
+      restorePending += (restorePending ? " " : "") + line.replace(/\\$/, "").trim();
+      if (!line.endsWith("\\")) {
+        restoreBlocks.push(restorePending);
+        restorePending = "";
+      }
+    }
+    const touchesMigrations = (block: string): boolean =>
+      block.includes("apply_migrations_to") ||
+      block.includes("migration_dir") ||
+      /\/migrations\//.test(block) ||
+      /\b0000[0-9]_[a-z_]+\.sql\b/.test(block);
+    // A chamada da funcao (`apply_migrations_to nexus_test`) e o caminho LEGITIMO: o papel esta
+    // dentro da funcao, em `run_sql_as_migrator_with_context`, que usa `-U nexus_migrator`.
+    const isApplyCall = (block: string): boolean => /^apply_migrations_to\s+\S+$/.test(block);
+    const migrationsAsNonMigrator = restoreBlocks
+      .filter(touchesMigrations)
+      .filter((block) => !isApplyCall(block))
+      .filter((block) => !block.includes("-U nexus_migrator"))
+      .map((block) => block.slice(0, 120));
+    expect(migrationsAsNonMigrator).toEqual([]);
+    // A chamada tem de ser um COMANDO, nao um texto qualquer: `: apply_migrations_to nexus_test`
+    // (comando neutralizado) ou um comentario nao contam. Sem esta assercao, apagar a
+    // restauracao deixaria a regra de privilegio acima vazia e o teste passaria por vacuidade.
+    const applyCalls = restoreBlocks.filter((block) => /^apply_migrations_to\s+nexus_test$/.test(block));
+    expect(applyCalls).toHaveLength(1);
+
+    // O banco restaurado tem de pertencer a `nexus_migrator`. Com dono `postgres`, a primeira
+    // migration falha com `permission denied for database nexus_test`, porque um papel
+    // nao-superusuario so cria o schema `nexus` se for dono do banco (medido em PostgreSQL 17.11
+    // e documentado no passo de provisionamento do workflow).
+    const createDatabaseBlocks = restoreBlocks.filter((block) =>
+      block.includes("CREATE DATABASE nexus_test"),
+    );
+    expect(createDatabaseBlocks).toHaveLength(1);
+    expect(createDatabaseBlocks[0]).toContain("OWNER nexus_migrator");
+
+    // A proibicao vale para TUDO que vem depois da prova, nao apenas para a secao marcada: um
+    // verificador inserido imediatamente ANTES do marcador tambem rodaria depois da exclusao.
+    // Por isso a busca usa `commandBlocks` (todo o trecho posterior), e nao `restoreBlocks`.
+    //
+    // Busca em TODOS os comandos, nao apenas nos que contem `docker exec`/`psql`: um verificador
+    // pode chegar por variavel (`v=...verify-owner-deletion.sql; psql ... < "$v"`), e a atribuicao,
+    // sozinha, nao parece uma execucao. Comentarios ja foram descartados acima, entao citar o
+    // nome num comentario continua permitido.
+    for (const verifier of verifierFiles) {
+      const offenders = commandBlocks.filter((block) => block.includes(verifier));
+      expect(offenders, `${verifier} must not run after the owner deletion proof`).toEqual([]);
+    }
   });
 
   it("proves the deletion outcome, not merely that the DELETE statement succeeded", async () => {

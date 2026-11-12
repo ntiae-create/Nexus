@@ -174,9 +174,22 @@ docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgre
 # num cluster ja provisionado. Como papeis sao objetos de CLUSTER e o bootstrap os recria logo
 # abaixo com os mesmos atributos, removemos apenas esses dois antes de reaplicar. `nexus_migrator`
 # e `nexus_audit_writer` NAO sao tocados: eles carregam as migrations e a propriedade.
+#
+# A ordem importa: `DROP DATABASE nexus_test` acima leva junto o `GRANT CONNECT ON DATABASE
+# nexus_test` que o `bootstrap.sql` concede (linha 72). Se o papel ainda tivesse privilegio em
+# QUALQUER outro banco, o `DROP ROLE` falharia com "some objects depend on it" — situacao que nao
+# ocorre neste cluster, que so recebe os bancos deste job. Preferimos falhar alto a seguir com o
+# papel antigo: por isso nao usamos `DROP OWNED`/`REASSIGN`, que mexeriam em objetos de outros
+# bancos. A conferencia abaixo torna o estado explicito em vez de presumido.
 for runtime_role in nexus_app nexus_anonymous; do
   docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d postgres \
     -c "DROP ROLE IF EXISTS $runtime_role;"
+  remaining_role=$(docker exec -i "$postgres_container_id" psql -X -w -tA -U postgres -d postgres \
+    -c "SELECT count(*) FROM pg_roles WHERE rolname = '$runtime_role'")
+  if [ "$remaining_role" != "0" ]; then
+    echo "$runtime_role still exists after DROP ROLE; the restored database would inherit stale ACLs." >&2
+    exit 2
+  fi
 done
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d postgres \
   -c "CREATE DATABASE nexus_test OWNER nexus_migrator;"
