@@ -18,17 +18,25 @@ BEGIN
     RAISE EXCEPTION 'Expected PostgreSQL 17, got %', current_setting('server_version');
   END IF;
   SELECT count(*) INTO table_count FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND c.relkind='r';
-  IF table_count <> 24 THEN RAISE EXCEPTION 'Expected 24 tables after persistence migration, found %', table_count; END IF;
+  -- 24 tabelas ate 00006 + 3 da 00007 (tool_grants, tool_grant_audit, user_assistant_preferences).
+  IF table_count <> 27 THEN RAISE EXCEPTION 'Expected 27 tables after Phase 5 migration, found %', table_count; END IF;
   SELECT count(DISTINCT i.indrelid) INTO primary_key_table_count FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND i.indisprimary;
-  IF primary_key_table_count <> 24 THEN RAISE EXCEPTION 'Expected primary keys on all 24 tables, found %', primary_key_table_count; END IF;
+  IF primary_key_table_count <> 27 THEN RAISE EXCEPTION 'Expected primary keys on all 27 tables, found %', primary_key_table_count; END IF;
   SELECT count(*) INTO protected_table_count FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity;
-  IF protected_table_count <> 17 THEN RAISE EXCEPTION 'Expected RLS on 17 personal-data tables, found %', protected_table_count; END IF;
+  -- 17 tabelas com FORCE RLS ate 00006 + 3 da 00007.
+  IF protected_table_count <> 20 THEN RAISE EXCEPTION 'Expected RLS on 20 personal-data tables, found %', protected_table_count; END IF;
   SELECT count(*) INTO policy_count FROM pg_policies WHERE schemaname='nexus';
-  IF policy_count <> 39 THEN RAISE EXCEPTION 'Expected 39 RLS policies, found %', policy_count; END IF;
+  -- 39 policies ate 00006 + 10 da 00007 (tool_grants: 4, tool_grant_audit: 2, preferences: 4).
+  -- A auditoria tem SELECT (owner) + INSERT escopado a `nexus_audit_writer`: ausencia de policy de
+  -- UPDATE/DELETE e intencional (append-only), e nao ha INSERT para `nexus_app` nem para o dono.
+  IF policy_count <> 49 THEN RAISE EXCEPTION 'Expected 49 RLS policies, found %', policy_count; END IF;
   SELECT count(*) INTO foreign_key_count FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='nexus' AND c.contype='f';
-  IF foreign_key_count < 40 THEN RAISE EXCEPTION 'Expected semantic and ownership foreign keys, found %', foreign_key_count; END IF;
+  -- 00007 acrescenta 6 FKs: tool_grants(owner, assistant), tool_grant_audit(owner, assistant)
+  -- e user_assistant_preferences(owner, assistant). Baseline 50 -> 56.
+  IF foreign_key_count < 56 THEN RAISE EXCEPTION 'Expected semantic and ownership foreign keys, found %', foreign_key_count; END IF;
   SELECT count(*) INTO check_constraint_count FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='nexus' AND c.contype='c';
-  IF check_constraint_count < 35 THEN RAISE EXCEPTION 'Expected data integrity checks, found %', check_constraint_count; END IF;
+  -- 79 ate a primeira versao da 00007 + 1 (`user_assistant_preferences_label_not_blank`).
+  IF check_constraint_count < 80 THEN RAISE EXCEPTION 'Expected data integrity checks, found %', check_constraint_count; END IF;
   SELECT count(*) INTO custom_index_count FROM pg_indexes WHERE schemaname='nexus' AND indexname = ANY (ARRAY[
     'conversations_owner_updated_idx', 'conversation_assistants_by_assistant_idx',
     'messages_conversation_sequence_idx', 'messages_owner_created_idx', 'messages_owner_idempotency_idx',
@@ -36,9 +44,12 @@ BEGIN
     'run_steps_by_run_order_idx', 'run_results_by_run_created_idx', 'run_results_by_step_idx',
     'tool_events_by_run_time_idx', 'tool_events_by_step_time_idx',
     'assistant_memories_owner_assistant_idx', 'assistant_memories_owner_visibility_idx',
-    'memory_permissions_active_lookup_idx', 'memory_permission_audit_item_idx', 'tombstones_owner_sequence_idx'
+    'memory_permissions_active_lookup_idx', 'memory_permission_audit_item_idx', 'tombstones_owner_sequence_idx',
+    -- Fase 5 (G13): 00007
+    'tool_grants_active_lookup_idx', 'tool_grants_by_owner_assistant_idx',
+    'tool_grant_audit_by_grant_idx'
   ]);
-  IF custom_index_count <> 18 THEN RAISE EXCEPTION 'Expected all 18 query indexes, found %', custom_index_count; END IF;
+  IF custom_index_count <> 21 THEN RAISE EXCEPTION 'Expected all 21 query indexes, found %', custom_index_count; END IF;
   SELECT count(*) INTO owner_count FROM nexus.owner_identity;
   IF owner_count <> 1 OR NOT (SELECT singleton FROM nexus.owner_identity) THEN
     RAISE EXCEPTION 'Owner identity must be a single singleton row';
@@ -66,10 +77,25 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   nexus.conversations, nexus.conversation_assistants, nexus.messages, nexus.core_runs,
   nexus.core_run_assistants, nexus.run_steps, nexus.run_results, nexus.tool_events, nexus.assistant_memories,
   nexus.memory_permissions, nexus.provider_authorizations, nexus.global_provider_preferences,
-  nexus.assistant_provider_preferences, nexus.conversation_provider_preferences, nexus.sync_cursors
+  nexus.assistant_provider_preferences, nexus.conversation_provider_preferences, nexus.sync_cursors,
+  -- Fase 5 (G13): o owner concede e revoga os proprios grants e preferencias.
+  -- O privilégio de DELETE atende ao CONTRATO DE DOMINIO (o owner apagando um grant seu); nao e o
+  -- que habilita o `ON DELETE CASCADE` de `owner_identity`, porque acoes de integridade
+  -- referencial nao passam pelo RLS como um DELETE da aplicacao.
+  nexus.tool_grants, nexus.user_assistant_preferences
 TO nexus_app;
 GRANT SELECT, INSERT ON nexus.memory_permission_audit, nexus.tombstones TO nexus_app;
+-- Fase 5 (G13): a auditoria de grants e escrita APENAS pelo trigger SECURITY DEFINER de 00007.
+-- `nexus_app` recebe somente SELECT: nem INSERT, nem UPDATE, nem DELETE. E mais restritivo que
+-- `memory_permission_audit` (que hoje aceita INSERT da aplicacao) de proposito: a trilha de
+-- autorizacao nao pode ser forjada por quem tem a credencial da aplicacao.
+GRANT SELECT ON nexus.tool_grant_audit TO nexus_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA nexus TO nexus_app;
+-- Fase 5 (G13): a 00007 revoga o USAGE que `CREATE TYPE` concede a PUBLIC. Como as migrations
+-- rodam ANTES da criacao deste papel, a concessao a `nexus_app` e feita aqui (a 00007 tambem
+-- tenta, de forma condicional, quando o papel ja existe).
+GRANT USAGE ON TYPE nexus.tool_grant_status TO nexus_app;
+GRANT USAGE ON TYPE nexus.tool_grant_action TO nexus_app;
 
 INSERT INTO nexus.providers (id, provider_key, display_name, availability, cost_status)
 VALUES

@@ -1,0 +1,7 @@
+  d1a819f6e80285d4ca09a4cbcef403fa  packages/database/migrations/00001_initial_schema.sql
+  f0c65c8f03a9a3a8328bc74f856a9447  packages/database/migrations/00002_auth_security.sql
+  f7be36f25e4cb55d7c943797e68e521b  packages/database/migrations/00003_persistence_integrity.sql
+  1de2a59512f908b489d956c52da38d22  packages/database/migrations/00004_core_execution_hierarchy.sql
+  428cfbd44bbf67d32b4f6b6e81ff9d60  packages/database/migrations/00005_assistant_seed_parity.sql
+  d5556ff1745b33c317c0ba8b8d4930f5  packages/database/migrations/00006_assistant_seed_vivy.sql
+  538fc52d7edfe2d9623319e694cd03cc  packages/database/migrations/00007_tool_grants_and_preferences.sql

@@ -1,0 +1,14 @@
+d1429d2772b42fd256d8e156671170c6  docs/r38/scripts/pg_cleanup.sh
+88561f155e1eacaa1d7c343b21b34697  docs/r40/INVENTARIO_OPERACOES_DESTRUTIVAS.md
+dd8a4fa37e7e7d7612a63fe0efa462ac  docs/r40/RELATORIO_R40.md
+b036f736b6b5406d11675afd87c4bf98  docs/r40/diffs/pg_cleanup.diff
+7e9adec8a09e1659bd2b0689b992924f  docs/r40/logs/contagem_conexoes.txt
+9504c7b44b3485f86699432961bc8bc9  docs/r40/logs/instalacao.log
+af9897dbbac6d05fa8124f03509ca0be  docs/r40/logs/integration.log
+512db52b5ebf771739260a7f25a15e60  docs/r40/logs/isolamento.log
+e6e65bb311daf228d5cff8a075978884  docs/r40/logs/npm_test.log
+833e263d4003bff3b77bdacd55280c82  docs/r40/logs/sabotagem.log
+adcfbb27df1cba314e4661b742174368  docs/r40/prova/ANTES_defeito.txt
+50b11ecce99e81e6748da27ae8d77ce3  docs/r40/prova/FALHAS_PROPAGACAO.txt
+b99a3ae7df76d6ac17c0137db127c548  docs/r40/prova/ISOLAMENTO.txt
+ee8589b300249b663c20a5b77052dee2  docs/r40/prova/SABOTAGEM_ESCOPO.txt

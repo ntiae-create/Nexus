@@ -1,0 +1,21 @@
+=== R41 — ANTES: install_clean.sh executa a copia de /tmp, nao o versionado ===
+data: 2026-11-11T07:49:16Z
+
+--- /tmp/pg_cleanup.sh (versao ANTIGA, insegura) ---
+  md5:    6a9abfacee4dd3aa723159dee76ac7c8
+  sha256: 4d866aeb87649afadf61860c86f5d825700461f1d216162b3a89c652c66fd367
+--- docs/r38/scripts/pg_cleanup.sh (CORRIGIDA no R40) ---
+  md5:    d1429d2772b42fd256d8e156671170c6
+  sha256: 1ccc43fb4397632c4210b3f4588da3df4a1e6e573b87c2bc5b23ceaef67803a2
+
+--- linha 65 do install_clean.sh (antes da correcao) ---
+    out=$(/tmp/pg_cleanup.sh nexus_migrator nexus_app nexus_anonymous nexus_audit_writer nexus_infra 2>&1); rc=$?
+
+--- execucao ---
+  EXIT=0 ; 29 OK ; 0 FALHA
+
+--- qual cleanup rodou? (marcadores no /tmp/cleanup.log) ---
+  'identificar bancos com dependencias' (versao ANTIGA): 1
+  'pre-voo'                            (versao NOVA) : 0
+
+CONCLUSAO: o fluxo executou a versao insegura e reportou sucesso.

@@ -58,7 +58,6 @@ const profiles = assistantProfileCatalogSchema.parse([
     tools: [
       toolPermission("personal.organize", "personal", "Organização de informações pessoais autorizadas.", true),
       toolPermission("personal.tasks", "personal", "Apoio à organização de tarefas autorizadas.", true),
-      toolPermission("nexus.help", "product_support", "Consulta a informações aprovadas sobre o uso do NEXUS.", true),
     ],
     usageRestrictions: [
       ...commonRestrictions,
@@ -165,7 +164,6 @@ const profiles = assistantProfileCatalogSchema.parse([
     capabilities: ["logical_reasoning", "problem_solving", "step_planning", "system_analysis", "code_analysis", "tradeoff_analysis"],
     tools: [
       toolPermission("technical.code_analysis", "technical_analysis", "Análise técnica de código quando a ferramenta estiver disponível e autorizada.", true),
-      toolPermission("technical.system_inspection", "technical_analysis", "Inspeção técnica de sistemas somente após autorização explícita.", true),
     ],
     usageRestrictions: [
       ...commonRestrictions,

@@ -1,0 +1,37 @@
+=== R41 — ETAPA 3: pg_shdepend compartilhado vs. local, e efeito de DROP OWNED ===
+cluster descartavel 127.0.0.1:55433
+
+1) VISIBILIDADE DO CATALOGO (nao e escopo de remocao)
+   pg_shdepend e COMPARTILHADO: a mesma linha e visivel de qualquer banco.
+   papel alvo oid=17223
+   SEM filtro dbid, cada banco reporta TODAS as dependencias:
+     [postgres] = 4
+     [nexus_test] = 4
+     [sentinela_prod] = 4
+   COM filtro dbid, apenas o que pertence ao banco:
+     [postgres] = 0
+     [nexus_test] = 1
+     [sentinela_prod] = 1
+
+2) EFEITO REAL DE DROP OWNED (medido, nao inferido)
+   DROP OWNED BY alvo CASCADE executado em nexus_test (banco AUTORIZADO):
+     nexus_test.s_auto        ANTES=1  DEPOIS=0   <- removido (estava no banco da conexao)
+     sentinela_prod.s_prod    ANTES=1  DEPOIS=1   <- INTACTO
+     sentinela_dev.s_dev      ANTES=1  DEPOIS=1   <- INTACTO
+     sentinela_prod.s_prod.dado  3 linhas -> 3 linhas
+     sentinela_dev.s_dev.t_dev   2 linhas -> 2 linhas
+     banco_do_alvo (dbid=0)   ANTES=1  DEPOIS=1   <- INTACTO (compartilhado)
+   => DROP OWNED so remove objeto do banco da CONEXAO. Nao cruza bancos.
+
+3) PRE-VOO RECUSA ANTES DE QUALQUER DROP
+   /tmp/c41.sh alvo  (alvo tem objetos em sentinela_prod, sentinela_dev e e dono de banco_do_alvo)
+   saida: [FORA] sentinela_dev / [FORA] sentinela_prod / [FORA] banco_do_alvo
+          ESCOPO AMBIGUO ... Nada foi destruido. Nenhum DROP DATABASE, DROP OWNED ou DROP ROLE foi executado.
+   EXIT=1
+   DEPOIS da recusa: nexus_test.s_auto2=1, sentinela_prod.s_prod=1 (3 linhas),
+                     sentinela_dev.s_dev=1 (2 linhas), banco_do_alvo=1  -> TUDO preservado
+
+4) CONCLUSAO
+   Visibilidade compartilhada do catalogo != escopo de remocao.
+   O pre-voo usa a visibilidade para DETECTAR, com dbid correto para LOCALIZAR,
+   e o DROP OWNED so e emitido para bancos de TEST_DATABASES.

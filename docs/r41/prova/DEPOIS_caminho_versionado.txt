@@ -1,0 +1,38 @@
+=== R41 — DEPOIS: install_clean.sh executa o versionado, com SHA256 conferido ===
+data: 2026-11-11T07:50:01Z
+
+--- resolucao de caminho (BASH_SOURCE + symlinks) ---
+  SCRIPT_DIR = /home/user/Nexus/docs/r38/scripts
+  REPO_ROOT  = /home/user/Nexus
+  DBDIR      = /home/user/Nexus/packages/database
+
+--- SABOTAGEM A: /tmp tem a versao ANTIGA insegura ---
+  /tmp/pg_cleanup.sh md5 = 6a9abfacee4dd3aa723159dee76ac7c8 (a insegura)
+  execucao do install_clean.sh:
+    EXIT=0, 29 OK, 0 FALHA
+    linha impressa: 'cleanup em uso: /home/user/Nexus/docs/r38/scripts/pg_cleanup.sh (sha256 1ccc43fb4397632c…)'
+    marcadores no log do cleanup: 'pre-voo'=2  |  'identificar bancos com dependencias'=0
+  => a copia de /tmp NAO foi executada; o versionado FOI.
+
+--- SABOTAGEM B: linha injetada no pg_cleanup.sh VERSIONADO ---
+  sha256 obtido: 32a3141a0fbfe759664aa3b24ee15f8f2183274138e71af4e97ddf8a1950fa27
+  EXIT=1
+  'ABORTADO: SHA256 do cleanup nao confere.'
+  => abortou ANTES de qualquer operacao destrutiva.
+
+--- SABOTAGEM C: arquivo versionado ausente ---
+  EXIT=1  'ABORTADO: cleanup versionado ausente: …/docs/r38/scripts/pg_cleanup.sh'
+
+--- SABOTAGEM D: bit de execucao removido ---
+  EXIT=1  'ABORTADO: cleanup versionado nao e executavel: …'
+
+--- hash do cleanup REALMENTE executado ---
+  1ccc43fb4397632c4210b3f4588da3df4a1e6e573b87c2bc5b23ceaef67803a2  docs/r38/scripts/pg_cleanup.sh
+
+=== PROVA FINAL (condicoes adversas maximas) ===
+  invocacao: /tmp/inst_link.sh (SYMLINK a partir de cwd=/)
+  /tmp/pg_cleanup.sh: md5 6a9abfacee4dd3aa723159dee76ac7c8 (VERSAO ANTIGA E INSEGURA)
+  resultado: EXIT=0, 29 OK, 0 FALHA
+  em uso: /home/user/Nexus/docs/r38/scripts/pg_cleanup.sh (sha256 1ccc43fb4397632c…)
+  marcadores: 'pre-voo'=2 | 'identificar bancos...'=0
+  => a copia insegura de /tmp NAO foi executada.

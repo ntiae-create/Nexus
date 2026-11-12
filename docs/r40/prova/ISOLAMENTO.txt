@@ -1,0 +1,218 @@
+######################## R40 — PROVA DE ISOLAMENTO DESTRUTIVO ########################
+script: /home/user/Nexus/docs/r38/scripts/pg_cleanup.sh
+copia em teste: /tmp/_cleanup_under_test.sh (porta 55433)
+md5   : eab351242e2beb108b73bb025569d96d
+cluster: 127.0.0.1:55433 (descartavel, criado para esta prova)
+
+===============================================================================
+# CENARIO A — papel com objetos em banco FORA da lista => recusa sem destruir
+===============================================================================
+ERROR:  role "alvo_teste" already exists
+
+===============================================================================
+# ESTADO ANTES — Cenario A
+===============================================================================
+--- bancos ---
+      banco      |   escopo   |     dono      
+-----------------+------------+---------------
+ db_alheio       | FORA       | postgres
+ db_alheio2      | FORA       | postgres
+ nexus_prov_test | AUTORIZADO | postgres
+ nexus_test      | AUTORIZADO | postgres
+ postgres        | FORA       | postgres
+ probe_db        | AUTORIZADO | exec_createdb
+ sentinela_dev   | FORA       | postgres
+ sentinela_prod  | FORA       | postgres
+ sentinela_vazio | FORA       | postgres
+(9 rows)
+
+--- sentinela_prod ---
+  schema s_prod  dono=alvo_teste
+  tabela s_prod.dado  dono=postgres
+--- sentinela_dev ---
+  schema s_dev  dono=alvo_dev
+  tabela s_dev.t_dev  dono=postgres
+--- sentinela_vazio ---
+  schema s_neutro  dono=postgres
+  tabela s_neutro.n  dono=postgres
+--- dados ---
+  sentinela_prod.s_prod.dado : 5
+  sentinela_dev.s_dev.t_dev  : 2
+  sentinela_vazio.s_neutro.n : 1
+--- privilégios (ACL dos schemas) ---
+  s_prod: alvo_teste=UC/alvo_teste, =U/alvo_teste
+  s_dev: (default)
+
+--- EXECUCAO do cleanup ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      --- alvo_teste (oid 16702) ---
+        [teste]   nexus_test: 1 dependencia(s) — dentro do escopo
+        [teste]   probe_db: 1 dependencia(s) — dentro do escopo
+        [FORA]    sentinela_prod: 1 dependencia(s) — BANCO NAO AUTORIZADO
+      FALHA papel alvo_teste tem dependencias fora do escopo: sentinela_prod
+      --- alvo_dev (oid 16720) ---
+        [FORA]    sentinela_dev: 1 dependencia(s) — BANCO NAO AUTORIZADO
+      FALHA papel alvo_dev tem dependencias fora do escopo: sentinela_dev
+   
+   == ESCOPO AMBIGUO: remover estes papeis exigiria destruir objetos fora de TEST_DATABASES ==
+      Nada foi destruido. Nenhum DROP DATABASE, DROP OWNED ou DROP ROLE foi executado.
+      Remova essas dependencias manualmente ou autorize os bancos explicitamente em TEST_DATABASES.
+EXIT=1
+
+===============================================================================
+# ESTADO DEPOIS — Cenario A
+===============================================================================
+--- bancos ---
+      banco      |   escopo   |     dono      
+-----------------+------------+---------------
+ db_alheio       | FORA       | postgres
+ db_alheio2      | FORA       | postgres
+ nexus_prov_test | AUTORIZADO | postgres
+ nexus_test      | AUTORIZADO | postgres
+ postgres        | FORA       | postgres
+ probe_db        | AUTORIZADO | exec_createdb
+ sentinela_dev   | FORA       | postgres
+ sentinela_prod  | FORA       | postgres
+ sentinela_vazio | FORA       | postgres
+(9 rows)
+
+--- sentinela_prod ---
+  schema s_prod  dono=alvo_teste
+  tabela s_prod.dado  dono=postgres
+--- sentinela_dev ---
+  schema s_dev  dono=alvo_dev
+  tabela s_dev.t_dev  dono=postgres
+--- sentinela_vazio ---
+  schema s_neutro  dono=postgres
+  tabela s_neutro.n  dono=postgres
+--- dados ---
+  sentinela_prod.s_prod.dado : 5
+  sentinela_dev.s_dev.t_dev  : 2
+  sentinela_vazio.s_neutro.n : 1
+--- privilégios (ACL dos schemas) ---
+  s_prod: alvo_teste=UC/alvo_teste, =U/alvo_teste
+  s_dev: (default)
+
+===============================================================================
+# CENARIO B — papel com objetos SO em banco autorizado => limpa, sentinelas intactos
+===============================================================================
+ERROR:  role "alvo_teste" already exists
+
+===============================================================================
+# ESTADO ANTES — Cenario B
+===============================================================================
+--- bancos ---
+      banco      |   escopo   |     dono      
+-----------------+------------+---------------
+ db_alheio       | FORA       | postgres
+ db_alheio2      | FORA       | postgres
+ nexus_prov_test | AUTORIZADO | postgres
+ nexus_test      | AUTORIZADO | postgres
+ postgres        | FORA       | postgres
+ probe_db        | AUTORIZADO | exec_createdb
+ sentinela_dev   | FORA       | postgres
+ sentinela_prod  | FORA       | postgres
+ sentinela_vazio | FORA       | postgres
+(9 rows)
+
+--- sentinela_prod ---
+  schema s_prod  dono=alvo_teste
+  tabela s_prod.dado  dono=postgres
+--- sentinela_dev ---
+  schema s_dev  dono=alvo_dev
+  tabela s_dev.t_dev  dono=postgres
+--- sentinela_vazio ---
+  schema s_neutro  dono=postgres
+  tabela s_neutro.n  dono=postgres
+--- dados ---
+  sentinela_prod.s_prod.dado : 5
+  sentinela_dev.s_dev.t_dev  : 2
+  sentinela_vazio.s_neutro.n : 1
+--- privilégios (ACL dos schemas) ---
+  s_prod: alvo_teste=UC/alvo_teste, =U/alvo_teste
+  s_dev: (default)
+
+--- EXECUCAO do cleanup ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      --- alvo_teste (oid 16702) ---
+        [teste]   nexus_test: 1 dependencia(s) — dentro do escopo
+        [teste]   probe_db: 1 dependencia(s) — dentro do escopo
+        [FORA]    sentinela_prod: 1 dependencia(s) — BANCO NAO AUTORIZADO
+      FALHA papel alvo_teste tem dependencias fora do escopo: sentinela_prod
+      --- alvo_dev (oid 16744) ---
+        [FORA]    sentinela_dev: 1 dependencia(s) — BANCO NAO AUTORIZADO
+      FALHA papel alvo_dev tem dependencias fora do escopo: sentinela_dev
+   
+   == ESCOPO AMBIGUO: remover estes papeis exigiria destruir objetos fora de TEST_DATABASES ==
+      Nada foi destruido. Nenhum DROP DATABASE, DROP OWNED ou DROP ROLE foi executado.
+      Remova essas dependencias manualmente ou autorize os bancos explicitamente em TEST_DATABASES.
+ERROR:  database "nexus_test" already exists
+--- EXECUCAO do cleanup, papel so em banco autorizado ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      --- so_teste (oid 16768) ---
+        [teste]   nexus_test: 1 dependencia(s) — dentro do escopo
+   == C. limpar objetos dos papeis nos bancos de TESTE (DROP OWNED) ==
+        so_teste @ nexus_test: DROP OWNED ok
+        so_teste @ nexus_prov_test: DROP OWNED ok
+        so_teste @ nexus_preexist_test: banco nao existe — nada a limpar
+        so_teste @ probe_db: DROP OWNED ok
+   == C.2 derrubar os bancos de TESTE (somente os da lista autorizada) ==
+      nexus_test: removido (ou inexistente)
+      nexus_prov_test: removido (ou inexistente)
+      nexus_preexist_test: removido (ou inexistente)
+      probe_db: removido (ou inexistente)
+   == D. dropar os papeis ==
+      --- so_teste (oid 16768) ---
+        DROP ROLE: ok
+   == E. estado final ==
+      bancos: db_alheio, db_alheio2, postgres, sentinela_dev, sentinela_prod, sentinela_vazio
+      papeis: (nenhum)
+   
+   == LIMPEZA CONCLUIDA: 1 papel(is) removido(s); nenhum objeto fora de TEST_DATABASES foi tocado ==
+EXIT=0
+
+===============================================================================
+# ESTADO DEPOIS — Cenario B
+===============================================================================
+--- bancos ---
+      banco      | escopo |   dono   
+-----------------+--------+----------
+ db_alheio       | FORA   | postgres
+ db_alheio2      | FORA   | postgres
+ postgres        | FORA   | postgres
+ sentinela_dev   | FORA   | postgres
+ sentinela_prod  | FORA   | postgres
+ sentinela_vazio | FORA   | postgres
+(6 rows)
+
+--- sentinela_prod ---
+  schema s_prod  dono=alvo_teste
+  tabela s_prod.dado  dono=postgres
+--- sentinela_dev ---
+  schema s_dev  dono=alvo_dev
+  tabela s_dev.t_dev  dono=postgres
+--- sentinela_vazio ---
+  schema s_neutro  dono=postgres
+  tabela s_neutro.n  dono=postgres
+--- dados ---
+  sentinela_prod.s_prod.dado : 5
+  sentinela_dev.s_dev.t_dev  : 2
+  sentinela_vazio.s_neutro.n : 1
+--- privilégios (ACL dos schemas) ---
+  s_prod: alvo_teste=UC/alvo_teste, =U/alvo_teste
+  s_dev: (default)

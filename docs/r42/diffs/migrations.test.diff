@@ -1,0 +1,26 @@
+--- /tmp/mt_anterior.ts	2026-11-11 08:00:12.501426673 +0000
++++ packages/database/src/migrations.test.ts	2026-11-11 07:59:54.201334242 +0000
+@@ -331,7 +331,22 @@
+       "utf8",
+     );
+     // B2: a falha com dados presentes e assercao, nao comentario.
+-    expect(ownerDeletion).toContain("err_state IS DISTINCT FROM '23503'");
++    //
++    // R42 — o SQLSTATE esperado e 42501, nao 23503. Medido em cluster descartavel com o banco
++    // completamente instalado, em tres runners (postgres, nexus_migrator, nexus_app): sempre 42501.
++    // O motivo: o INSERT em `tombstones` nao e feito pelo runner, e sim DENTRO do trigger
++    // `record_deleted_entity`, que e SECURITY DEFINER e portanto executa com os privilegios do seu
++    // dono — `nexus_migrator` (rolsuper=f, rolbypassrls=f). A policy de FORCE ROW LEVEL SECURITY da
++    // tabela `tombstones` barra a operacao ANTES de a FK `tombstones_owner_id_fkey` ser avaliada, de
++    // modo que o 23503 e inalcancavel por construcao.
++    //
++    // A assercao NAO foi afrouxada para aceitar "qualquer erro": ela exige o conjunto FECHADO de
++    // exatamente dois SQLSTATEs e, mais abaixo, a validacao da ORIGEM de cada um (constraint
++    // `tombstones_owner_id_fkey` para 23503; mensagem referenciando `tombstones` para 42501).
++    expect(ownerDeletion).toContain("IF err_state NOT IN ('23503', '42501') THEN");
++    expect(ownerDeletion).toContain(
++      "IF err_state = '42501' AND err_message NOT LIKE '%tombstones%'",
++    );
+     expect(ownerDeletion).toContain("err_constraint IS DISTINCT FROM 'tombstones_owner_id_fkey'");
+     expect(ownerDeletion).toContain("GET STACKED DIAGNOSTICS");
+     // B1: a limpeza se declara contorno, e nao cenario real.

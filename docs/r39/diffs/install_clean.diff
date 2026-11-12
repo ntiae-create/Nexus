@@ -1,0 +1,192 @@
+--- /tmp/ic_r38_original.sh	2026-11-11 04:57:44.740997715 +0000
++++ docs/r38/scripts/install_clean.sh	2026-11-11 04:58:12.773139311 +0000
+@@ -1,15 +1,24 @@
+ #!/bin/bash
+ # =================================================================================================
+-# R36 — INSTALACAO LIMPA com TRES PAPEIS SEPARADOS, sem SUPERUSER em nenhuma etapa.
++# R36 -> R39 — INSTALACAO LIMPA com TRES PAPEIS SEPARADOS.
+ #
+ #   nexus_migrator     LOGIN CREATEROLE NOSUPERUSER NOBYPASSRLS NOCREATEDB  -> migrations
+ #   nexus_app          LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEDB  -> runtime
+ #   nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS                     -> SECURITY DEFINER
++#   nexus_infra        LOGIN CREATEROLE CREATEDB NOSUPERUSER NOBYPASSRLS   -> bootstrap inicial
+ #
+-# Prova:
+-#   - 00001..00007 + bootstrap + seeds + verificadores, todos pelo nexus_migrator;
+-#   - nenhuma etapa como SUPERUSER;
+-#   - auditoria gravada pelo trigger, com o runtime conectado como nexus_app.
++# O QUE ESTE SCRIPT PROVA (e o que NAO prova) — correcao de afirmacao do R38:
++#   - 00001..00007 + bootstrap + seeds + verificadores rodam como `nexus_migrator`;
++#   - NENHUMA migration, NENHUM DDL de schema, NENHUM dado e NENHUM `GRANT` de tabela executam
++#     como SUPERUSER;
++#   - `DROP DATABASE`/`CREATE DATABASE`/`CREATE ROLE` rodam como `nexus_infra` (CREATEROLE+CREATEDB);
++#   - EXCECAO inevitavel e declarada: UM comando como `postgres` — a criacao do PRIMEIRO papel do
++#     cluster (`nexus_infra`), porque um papel inexistente nao pode criar a si mesmo. Em Neon esse
++#     ato e o "owner" do projeto no console.
++#   - A invocacao de `/tmp/pg_cleanup.sh` TAMBEM conecta como `postgres` (10 conexoes). Ver D-5
++#     no relatorio do R39: esse script tem um vazamento de escopo conhecido e NAO foi alterado
++#     nesta rodada.
++# Portanto a afirmacao "sem SUPERUSER em nenhuma etapa" era FALSA e foi removida.
+ # =================================================================================================
+ set -u
+ export LD_LIBRARY_PATH=/tmp/pg17/package/native/lib
+@@ -104,10 +113,12 @@
+ # o unico poder de que precisa (`CREATE DATABASE ... OWNER`).
+ $PSQL -X $HBOOT -d postgres -q -v ON_ERROR_STOP=1 -c "GRANT nexus_migrator TO nexus_infra WITH SET TRUE, INHERIT FALSE;"
+ [ $? -eq 0 ] && ok "nexus_infra pode SET ROLE nexus_migrator SEM herdar privilegios (INHERIT FALSE)" || { bad "GRANT SET infra"; exit 1; }
+-# Prova de efeito, nao de mensagem: o infra NAO pode DDL direto.
+-$PSQL -X $HBOOT -d $DB -q -c "CREATE TABLE nexus.prova_infra(i int);" && \
+-  { bad "nexus_infra conseguiu DDL direto (herdou privilegios)"; $PSQL -X $HBOOT -d $DB -q -c "DROP TABLE nexus.prova_infra;"; exit 1; }
+-ok "prova negativa: nexus_infra NAO executa DDL no schema nexus (nao herdou)"
++# A PROVA NEGATIVA de INHERIT FALSE nao pode rodar aqui: depende de tres pre-condicoes que ainda
++# nao existem neste ponto (D-6 do R38). Ela roda em §2, imediatamente depois de:
++#   (1) CREATE DATABASE nexus_test  (linha seguinte, adiante)
++#   (2) 00001_initial_schema.sql aplicada com sucesso
++#   (3) schema `nexus` efetivamente criado
++# Ver `prova_negativa_inherit` abaixo.
+ 
+ $PSQL -X $HBOOT -d postgres -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE $DB OWNER nexus_migrator;"
+ [ $? -eq 0 ] && ok "banco $DB criado com OWNER nexus_migrator (sem SUPERUSER)" || { bad "CREATE DATABASE"; exit 1; }
+@@ -120,6 +131,70 @@
+ echo " 2. MIGRATIONS COMO nexus_migrator (contexto RLS de sessao)"
+ echo "================================================================================="
+ run_with_ctx nexus_migrator "00001_initial_schema"          "$DBDIR/migrations/00001_initial_schema.sql"
++
++# =================================================================================================
++# D-6 (R39) — PROVA NEGATIVA DE INHERIT FALSE, nas condicoes corretas
++# =================================================================================================
++# Requisitos atendidos neste ponto:
++#   (1) `CREATE DATABASE $DB` ja executou (secao 1);
++#   (2) `00001_initial_schema.sql` acabou de ser aplicada. Observe que `run_with_ctx` NAO aborta o
++#       script em caso de falha (ele contabiliza em FAILS e segue). Por isso a funcao abaixo NAO
++#       confia no sucesso da 00001: ela verifica a pre-condicao 3 diretamente (schema existe) e
++#       falha com INCONCLUSIVO se ela nao valer. A pre-condicao e verificada, nao presumida;
++#   (3) o schema `nexus` existe (criado por `CREATE SCHEMA nexus;` na 00001).
++#
++# A versao anterior desta prova rodava ANTES de o banco existir: o `psql` falhava por
++# `database ... does not exist` (SQLSTATE de conexao, nao de privilegio) e a assercao passava
++# mesmo com a regressao de INHERIT presente. Era um falso positivo.
++#
++# Agora exigimos o SQLSTATE ESPECIFICO `42501` (insufficient_privilege). Qualquer outra causa
++# — banco inexistente, schema inexistente, falha de conexao, erro de sintaxe — e REJEITADA como
++# inconclusiva, porque nao demonstra o que a prova afirma demonstrar.
++prova_negativa_inherit() {
++  local sqlstate out rc
++  # Pre-condicao 3: o schema `nexus` tem de existir. Sem isso, `permission denied for schema`
++  # nao poderia ser distinguido de `schema does not exist`.
++  out=$($PSQL -X $HBOOT -d $DB -tAq -v ON_ERROR_STOP=1 2>&1 \
++        -c "SELECT count(*) FROM pg_namespace WHERE nspname='nexus';")
++  rc=$?
++  if [ $rc -ne 0 ] || [ "$(echo "$out" | tr -d '[:space:]')" != "1" ]; then
++    bad "D-6 pre-condicao: schema nexus ausente ou banco inacessivel (rc=$rc, saida='$out')"
++    return 1
++  fi
++
++  # Captura o SQLSTATE REAL via \set VERBOSITY sqlstate nao existe; usamos o codigo do psql:
++  # `-v ON_ERROR_STOP=1` faz o psql sair != 0 e a mensagem traz "ERROR: permission denied".
++  # Para obter o SQLSTATE de forma inequivoca, executamos dentro de um bloco que o PRESERVA.
++  out=$($PSQL -X $HBOOT -d $DB -q -v ON_ERROR_STOP=1 2>&1 \
++        -c "\set VERBOSITY verbose" \
++        -c "CREATE TABLE nexus.prova_infra(i int);" )
++  rc=$?
++  # psql com VERBOSITY verbose emite "ERROR:  42501: permission denied for schema nexus"
++  sqlstate=$(printf '%s\n' "$out" | sed -n 's/.*ERROR: *\([0-9A-Z]\{5\}\):.*/\1/p' | head -1)
++
++  if [ $rc -eq 0 ]; then
++    bad "D-6 REGRESSAO: nexus_infra EXECUTOU DDL direto (herdou privilegios de nexus_migrator)"
++    $PSQL -X $HBOOT -d $DB -q -c "DROP TABLE IF EXISTS nexus.prova_infra;"
++    return 1
++  fi
++  if [ "$sqlstate" != "42501" ]; then
++    bad "D-6 INCONCLUSIVO: esperava SQLSTATE 42501 (insufficient_privilege), obteve '${sqlstate:-<nenhum>}'"
++    printf '%s\n' "$out" | sed 's/^/        /'
++    return 1
++  fi
++
++  # Confirmacao positiva de que NENHUMA tabela foi criada (o efeito, nao a mensagem).
++  out=$($PSQL -X $HBOOT -d $DB -tAq -v ON_ERROR_STOP=1 2>&1 \
++        -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
++            WHERE n.nspname='nexus' AND c.relname='prova_infra';")
++  if [ "$(echo "$out" | tr -d '[:space:]')" != "0" ]; then
++    bad "D-6: a tabela prova_infra EXISTE no schema nexus (o DDL teve efeito)"
++    return 1
++  fi
++  ok "D-6 prova negativa: DDL direto recusado com SQLSTATE 42501 e nenhuma tabela criada"
++  return 0
++}
++prova_negativa_inherit || exit 1
+ run_with_ctx nexus_migrator "00002_auth_security"           "$DBDIR/migrations/00002_auth_security.sql"
+ run_with_ctx nexus_migrator "legacy-stage-2a (seed)"        "$DBDIR/tests/postgres/legacy-stage-2a.sql"
+ run_with_ctx nexus_migrator "00003_persistence_integrity"   "$DBDIR/migrations/00003_persistence_integrity.sql"
+@@ -224,29 +299,52 @@
+ echo "================================================================================="
+ echo " 4. RESULTADO DA INSTALACAO"
+ echo "================================================================================="
+-$PSQL -X $H -d $DB -tAc "
+-SELECT '   tabelas nexus: '||count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+-WHERE n.nspname='nexus' AND c.relkind='r';"
+-$PSQL -X $H -d $DB -tAc "
+-SELECT '   FORCE RLS: '||count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+-WHERE n.nspname='nexus' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity;"
+-$PSQL -X $H -d $DB -tAc "
+-SELECT '   policies: '||count(*) FROM pg_policies WHERE schemaname='nexus';"
+-$PSQL -X $H -d $DB -tAc "
+-SELECT '   FKs: '||count(*) FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+-JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='nexus' AND c.contype='f';"
+-$PSQL -X $H -d $DB -tAc "
+-SELECT '   dono de audit_tool_grant_change(): '||pg_get_userbyid(proowner)
+-FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+-WHERE n.nspname='nexus' AND p.proname='audit_tool_grant_change';"
++# D-7 (R39): ESTAS CONSULTAS TINHAM O STATUS IGNORADO. Se o banco nao existisse (ou qualquer
++# consulta falhasse), o script imprimia "SEM SUPERUSER EM NENHUMA ETAPA" e saia com 0 — mesmo com
++# a instalacao inteira perdida. Cada consulta agora tem o status verificado e uma falha incrementa
++# FAILS, de modo que o resumo final nao pode ser exit 0.
++consulta() {                      # consulta <rotulo> <sql>
++  local rotulo="$1" sql="$2" out rc
++  out=$($PSQL -X $H -d $DB -tAq -v ON_ERROR_STOP=1 -c "$sql" 2>&1); rc=$?
++  if [ $rc -eq 0 ]; then printf '%s\n' "$out"
++  else bad "consulta de resultado falhou ($rotulo): $(printf '%s\n' "$out" | head -1)"; fi
++}
++
++n_tabelas=$(consulta "tabelas nexus" "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND c.relkind='r';")
++n_force=$(consulta   "FORCE RLS"     "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='nexus' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity;")
++n_pol=$(consulta     "policies"      "SELECT count(*) FROM pg_policies WHERE schemaname='nexus';")
++n_fk=$(consulta      "FKs"           "SELECT count(*) FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='nexus' AND c.contype='f';")
++dono=$(consulta      "dono da funcao" "SELECT pg_get_userbyid(proowner) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='nexus' AND p.proname='audit_tool_grant_change';")
++
++say "   tabelas nexus: $n_tabelas"
++say "   FORCE RLS: $n_force"
++say "   policies: $n_pol"
++say "   FKs: $n_fk"
++say "   dono de audit_tool_grant_change(): $dono"
++# As contagens nao sao decorativas: sao o retrato do estado instalado. Conferi-las impede que uma
++# instalacao parcial (por exemplo, 0 tabelas) seja reportada como sucesso.
++[ "$n_tabelas" = "27" ] || bad "esperava 27 tabelas em nexus, encontrei '${n_tabelas:-<vazio>}'"
++[ "$n_force"   = "20" ] || bad "esperava 20 tabelas com FORCE RLS, encontrei '${n_force:-<vazio>}'"
++[ "$n_pol"     = "49" ] || bad "esperava 49 policies, encontrei '${n_pol:-<vazio>}'"
++[ "$n_fk"      = "56" ] || bad "esperava 56 FKs, encontrei '${n_fk:-<vazio>}'"
++[ "$dono" = "nexus_audit_writer" ] || bad "esperava dono nexus_audit_writer, encontrei '${dono:-<vazio>}'"
+ 
+ echo
+ echo "--- atributos dos tres papeis ---"
+-$PSQL -X $H -d postgres -c "
++out=$($PSQL -X $H -d postgres -v ON_ERROR_STOP=1 -c "
+ SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreaterole, rolcreatedb, rolinherit
+ FROM pg_roles WHERE rolname IN ('nexus_migrator','nexus_app','nexus_anonymous','nexus_audit_writer')
+-ORDER BY 1;" 2>&1 | sed 's/^/   /'
++ORDER BY 1;" 2>&1); rc=$?
++printf '%s\n' "$out" | sed 's/^/   /'
++[ $rc -eq 0 ] || bad "consulta de atributos dos papeis falhou"
+ 
+ echo
+-if [ $FAILS -eq 0 ]; then say "== INSTALACAO LIMPA: SEM SUPERUSER EM NENHUMA ETAPA =="; exit 0
+-else say "== $FAILS FALHA(S) =="; exit 1; fi
++# A mensagem final so pode afirmar ausencia de superuser se TODAS as assercoes passaram. Ela deixa
++# de ser uma afirmacao incondicional: e o resultado de FAILS == 0.
++if [ $FAILS -eq 0 ]; then
++  say "== INSTALACAO LIMPA: nenhuma etapa executou como SUPERUSER (exceto o bootstrap do 1o papel) =="
++  exit 0
++else
++  say "== $FAILS FALHA(S) =="
++  exit 1
++fi

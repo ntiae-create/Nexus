@@ -1,0 +1,11 @@
+8de42ef6edde0f88cc9045df60d2fb9b  packages/database/src/migrations.test.ts
+01ad3a239cb500f21a4346d2e984c14f  docs/r42/DIAGNOSTICO_DOCUMENTAL.md
+0ed3e1271fc14b64ddd5d4e4eb4fafea  docs/r42/RELATORIO_R42.md
+38276a7d47a27868f8b793bad6609c5e  docs/r42/diffs/migrations.test.diff
+9e5fed6becd996a512083d087f1f488a  docs/r42/logs/ANTES_migrations_test.log
+210e4a11575cf050edddc8e5d693868a  docs/r42/logs/DEPOIS_migrations_test.log
+1fda2a66cbbb827cf8054b909a9fb347  docs/r42/logs/instalacao.log
+af9897dbbac6d05fa8124f03509ca0be  docs/r42/logs/integracao.log
+6452c01bbf0f9d5d64dec0e4eb5847e6  docs/r42/logs/isolamento.log
+98054a2183881635d7dda9bd17aee1b8  docs/r42/logs/npm_test.log
+833e263d4003bff3b77bdacd55280c82  docs/r42/logs/sabotagem.log

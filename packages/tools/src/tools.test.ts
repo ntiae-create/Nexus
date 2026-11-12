@@ -68,13 +68,35 @@ describe("tool catalog and demonstration definitions", () => {
   });
 
   it("keeps tool authorization declarations aligned with assistant profiles", () => {
-    const profileTools = new Map(listAssistantProfiles().map((profile) => [
+    const profiles = listAssistantProfiles();
+    const profileTools = new Map(profiles.map((profile) => [
       profile.key,
       new Set(profile.tools.map((permission) => permission.toolId)),
     ]));
+    const catalogIds = new Set(toolCatalog.list().map((tool) => tool.id));
+
+    // Sentido catálogo -> perfil: toda assistente autorizada pela definição precisa declarar a
+    // ferramenta no próprio perfil (e a ferramenta precisa existir no catálogo por construção).
     for (const tool of toolCatalog.list()) {
       for (const assistantKey of tool.authorizedAssistantKeys) {
-        expect(profileTools.get(assistantKey)?.has(tool.id)).toBe(true);
+        expect(
+          profileTools.get(assistantKey)?.has(tool.id),
+          `${assistantKey} is authorized for '${tool.id}' by the catalog but does not declare it`,
+        ).toBe(true);
+      }
+    }
+
+    // Sentido perfil -> catálogo: uma permissão declarada no perfil para uma ferramenta que não
+    // existe no catálogo é uma permissão órfã. Ela nunca poderia ser executada, e um grant gravado
+    // para esse id apontaria para nada. Este sentido é o que a Fase 5 (G13) tornou obrigatório:
+    // `nexus.tool_grants.tool_id` referencia o catálogo por id, então o catálogo tem de ser a
+    // fonte única de verdade.
+    for (const profile of profiles) {
+      for (const permission of profile.tools) {
+        expect(
+          catalogIds.has(permission.toolId),
+          `${profile.key} declares tool '${permission.toolId}', which does not exist in the catalog`,
+        ).toBe(true);
       }
     }
   });

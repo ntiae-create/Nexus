@@ -1,0 +1,49 @@
+--- a/packages/database/tests/postgres/verify-stage-5-cascade-without-delete-policy.sql
++++ b/packages/database/tests/postgres/verify-stage-5-cascade-without-delete-policy.sql
+@@ -24,6 +24,13 @@
+ -- =============================================================================================
+ -- PRE-CONDICAO: banco recem-criado
+ -- =============================================================================================
++-- Contexto de owner/ator na SESSAO: sob FORCE RLS um runner NAO-superuser so enxerga as linhas
++-- pessoais com o contexto definido. Sem isso, as pre-condicoes de "tabela vazia" e a checagem
++-- pos-ROLLBACK do bloco §4 enxergam 0 linhas sempre — e a de §4 passaria/acusaria por engano.
++-- (Um runner SUPERUSER ve tudo de qualquer forma; definir o contexto nao atrapalha.)
++SELECT set_config('nexus.owner_id', '00000000-0000-4000-8000-000000000004', false);
++SELECT set_config('nexus.actor_type', 'owner', false);
++
+ DO $$
+ BEGIN
+   IF current_database() <> 'nexus_test' THEN
+@@ -201,17 +208,28 @@
+ 
+ DROP POLICY tool_grants_owner_delete ON nexus.tool_grants;
+ 
++-- A premissa correta NAO e "ser o superusuario postgres" — e "ser DONO da tabela", que e quem
++-- pode `DROP POLICY` e cuja escrita nao e barrada pela policy de INSERT. Exigir `postgres` por
++-- nome obrigava a um provisionamento com superusuario, que e exatamente o que o R36 elimina.
+ DO $$
+ DECLARE
+-  affected integer;
++  tbl_owner text;
+ BEGIN
+-  IF current_user <> 'postgres' THEN
+-    RAISE EXCEPTION 'This block must run as the table owner (postgres), got %', current_user;
++  SELECT pg_get_userbyid(relowner) INTO tbl_owner
++  FROM pg_class WHERE oid = 'nexus.tool_grants'::regclass;
++  IF tbl_owner <> current_user THEN
++    RAISE EXCEPTION 'This block must run as the owner of nexus.tool_grants (%), got %',
++      tbl_owner, current_user;
+   END IF;
+ END
+ $$;
+ 
+--- Muda para `nexus_app` e tenta apagar.
++-- Muda para `nexus_app` e tenta apagar. Quem executa este arquivo precisa poder SET ROLE em
++-- `nexus_app`. O provisionador normalmente e o CRIADOR de `nexus_app` e, no PG 16+, o criador
++-- recebe membership automatica com `admin_option` mas `set_option = false` (config
++-- `createrole_self_grant` vazia). `admin_option` sozinho NAO permite `SET ROLE`; e preciso
++-- conceder SET explicitamente (`GRANT nexus_app TO <provisioner> WITH SET TRUE`).
++-- Ver `docs/` do R38 e o script de provisionamento.
+ SET LOCAL ROLE nexus_app;
+ SELECT set_config('nexus.owner_id', '00000000-0000-4000-8000-000000000004', true);
+ SELECT set_config('nexus.actor_type', 'owner', true);

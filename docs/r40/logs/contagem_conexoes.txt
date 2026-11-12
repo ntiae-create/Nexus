@@ -1,0 +1,30 @@
+R40 — CONTAGEM EMPIRICA DE CONEXOES (nao estatica)
+==================================================
+Metodo: wrapper em /tmp/psql_counter.sh que registra cada invocacao e delega ao psql real.
+Instrumentados: install_clean.sh (PSQL=contador) e pg_cleanup.sh (PSQL=contador).
+Cluster: 127.0.0.1:55432 (descartavel).
+
+1) install_clean.sh INTEGRAL (inclui a invocacao do pg_cleanup.sh):
+   conexoes totais medidas ......... 93
+     -U postgres ................... 57
+     -U nexus_migrator ............. 29
+     -U nexus_infra ................  7
+   (contagem estatica de linhas 'PSQL -X' nos fontes: 18 + 10 = 28 -> SUBCONTA,
+    porque funcoes como run_as/run_with_ctx sao chamadas varias vezes em runtime)
+
+2) pg_cleanup.sh CORRIGIDO, medido isoladamente:
+   conexoes totais ................. 16
+     -U postgres ................... 16  (100%)
+
+COMPARACAO COM AS CONTAGENS ANTERIORES
+   R38 afirmou "1 de 20"   -> errado
+   R39 corrigiu para "2 de 30" -> AINDA errado (era contagem estatica de linhas)
+   R40 mede empiricamente: 93 conexoes no fluxo, 57 como postgres.
+   O cleanup sozinho passou de 10 (estatico) para 16 (medido).
+
+POR QUE O CLEANUP AUMENTOU
+   A correcao adiciona verificacoes que antes nao existiam:
+   - consulta de existencia do banco antes de conectar nele (evita erro de conexao mascarado)
+   - consulta de bancos de propriedade do papel
+   - consulta de papeis remanescentes no resumo final
+   Cada verificacao custa uma conexao. E o preco de nao esconder falhas.

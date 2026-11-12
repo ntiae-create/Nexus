@@ -1,0 +1,142 @@
+
+===============================================================================
+# F1 — falha de conexao (porta inexistente 55999)
+===============================================================================
+--- execucao ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      psql: error: connection to server at "127.0.0.1", port 55999 failed: Connection refused
+   	Is the server running on that host and accepting TCP/IP connections?
+      FALHA consulta de oid de alvo_teste falhou (rc=2)
+      pre-voo registrou 1 falha(s); abortando antes de destruir.
+EXIT=1  (esperado != 0)
+
+===============================================================================
+# F2 — papel inexistente (nao e falha: nada a fazer, exit 0)
+===============================================================================
+--- execucao com papel que nao existe ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      inexistente_xyz: nao existe (nada a fazer)
+   == C. limpar objetos dos papeis nos bancos de TESTE (DROP OWNED) ==
+   == C.2 derrubar os bancos de TESTE (somente os da lista autorizada) ==
+      nexus_test: removido (ou inexistente)
+      nexus_prov_test: removido (ou inexistente)
+      nexus_preexist_test: removido (ou inexistente)
+      probe_db: removido (ou inexistente)
+   == D. dropar os papeis ==
+   == E. estado final ==
+      bancos: db_alheio, db_alheio2, postgres, sentinela_vazio
+      papeis: (nenhum)
+   
+   == LIMPEZA CONCLUIDA: 0 papel(is) removido(s); nenhum objeto fora de TEST_DATABASES foi tocado ==
+EXIT=0  (esperado 0: ausencia de papel nao e falha)
+
+===============================================================================
+# F3 — banco autorizado inexistente (deve ser tolerado: IF EXISTS)
+===============================================================================
+--- execucao sem nenhum banco de teste criado ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      alvo_teste: nao existe (nada a fazer)
+   == C. limpar objetos dos papeis nos bancos de TESTE (DROP OWNED) ==
+   == C.2 derrubar os bancos de TESTE (somente os da lista autorizada) ==
+      nexus_test: removido (ou inexistente)
+      nexus_prov_test: removido (ou inexistente)
+      nexus_preexist_test: removido (ou inexistente)
+      probe_db: removido (ou inexistente)
+   == D. dropar os papeis ==
+   == E. estado final ==
+      bancos: db_alheio, db_alheio2, postgres, sentinela_vazio
+      papeis: (nenhum)
+   
+   == LIMPEZA CONCLUIDA: 0 papel(is) removido(s); nenhum objeto fora de TEST_DATABASES foi tocado ==
+EXIT=0  (esperado 0: DROP DATABASE IF EXISTS tolera ausencia)
+
+===============================================================================
+# F4 — DROP DATABASE falha por banco em uso (outra sessao conectada)
+===============================================================================
+--- F4: DROP DATABASE por papel SEM privilegio (nao-superuser) ---
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      alvo_teste: nao existe (nada a fazer)
+   == C. limpar objetos dos papeis nos bancos de TESTE (DROP OWNED) ==
+   == C.2 derrubar os bancos de TESTE (somente os da lista autorizada) ==
+      nexus_test: ERROR:  must be owner of database nexus_test
+      FALHA DROP DATABASE nexus_test falhou (rc=1)
+      nexus_prov_test: removido (ou inexistente)
+      nexus_preexist_test: removido (ou inexistente)
+      probe_db: removido (ou inexistente)
+EXIT=1  (esperado != 0: permissao insuficiente propaga)
+
+===============================================================================
+# F5 — DROP OWNED falha (atinge a etapa D, nao a C)
+===============================================================================
+estado: probe_db pertence a exec_createdb; alvo_teste tem schema la
+        exec_createdb NAO e superuser -> DROP OWNED BY alvo_teste falhara
+   == A. pre-voo: validacao de entrada (somente leitura) ==
+      escopo autorizado: nexus_test
+      escopo autorizado: nexus_prov_test
+      escopo autorizado: nexus_preexist_test
+      escopo autorizado: probe_db
+   == B. pre-voo: mapeamento de dependencias por papel (somente leitura) ==
+      --- alvo_teste (oid 16796) ---
+        [teste]   probe_db: 1 dependencia(s) — dentro do escopo
+   == C. limpar objetos dos papeis nos bancos de TESTE (DROP OWNED) ==
+        alvo_teste @ nexus_test: banco nao existe — nada a limpar
+        alvo_teste @ nexus_prov_test: banco nao existe — nada a limpar
+        alvo_teste @ nexus_preexist_test: banco nao existe — nada a limpar
+        ERROR:  permission denied to drop objects
+   DETAIL:  Only roles with privileges of role "alvo_teste" may drop objects owned by it.
+      FALHA DROP OWNED de alvo_teste em probe_db falhou (rc=1)
+      ABORTADO: falha no DROP OWNED; abortando antes de derrubar qualquer banco
+EXIT=1  (esperado != 0)
+
+===============================================================================
+# F6 — DROP ROLE falha (dependencia fora do escopo) => recusa, exit != 0
+===============================================================================
+ERROR:  role "alvo_teste" already exists
+--- execucao ---
+      --- alvo_teste (oid 16796) ---
+        [teste]   probe_db: 1 dependencia(s) — dentro do escopo
+        [FORA]    sentinela_prod: 1 dependencia(s) — BANCO NAO AUTORIZADO
+      FALHA papel alvo_teste tem dependencias fora do escopo: sentinela_prod
+   
+   == ESCOPO AMBIGUO: remover estes papeis exigiria destruir objetos fora de TEST_DATABASES ==
+      Nada foi destruido. Nenhum DROP DATABASE, DROP OWNED ou DROP ROLE foi executado.
+      Remova essas dependencias manualmente ou autorize os bancos explicitamente em TEST_DATABASES.
+EXIT=1  (esperado 1)
+
+===============================================================================
+# F7 — script auxiliar / entrada invalida (nome de banco inseguro via env nao existe; usa papel)
+===============================================================================
+--- argumento vazio explicito ---
+      ABORTADO: argumento de papel vazio
+EXIT=1  (esperado != 0)
+
+===============================================================================
+# F8 — falha no relatorio final (conexao perdida) nao pode virar exit 0
+===============================================================================
+--- execucao normal, mas com o servidor inalcancavel no passo final ---
+    (demonstrado em F1: toda consulta falha e FAILS>0 => exit 1)
+    verificacao direta: consulta de estado final tem status verificado (bad() em caso de erro)
+     252:      FROM pg_database WHERE NOT datistemplate;" 2>&1 || bad "consulta de estado final falhou"
+     256:  || bad "consulta de papeis remanescentes falhou"
+
+=== FIM ===

@@ -1,0 +1,27 @@
+=== R43-consolidacao: DEFEITO DE EXCLUSAO DO OWNER — AINDA PRESENTE ===
+data: 2026-11-11T08:09:39Z
+cluster: 127.0.0.1:55432 (descartavel)  banco: nexus_test (instalado)
+
+estado antes:
+  conversations=4
+  messages=3
+  owner_identity=1
+
+comando: DELETE FROM nexus.owner_identity WHERE id='00000000-0000-4000-8000-000000000004';
+  ERROR:  new row violates row-level security policy for table "tombstones"
+  CONTEXT:  SQL statement "INSERT INTO nexus.tombstones (id, owner_id, entity_type, entity_id)
+    VALUES (OLD.id, OLD.owner_id, deleted_type, OLD.id)
+    ON CONFLICT (entity_type, entity_id) DO NOTHING"
+  PL/pgSQL function nexus.record_deleted_entity() line 6 at SQL statement
+  EXIT=1
+
+estado depois:
+  owner_identity ainda tem 1 linha(s)  <- NAO foi excluido
+
+CAUSA: o trigger record_deleted_entity (SECURITY DEFINER, dono nexus_migrator) tenta
+       INSERT em nexus.tombstones, que tem FORCE RLS. A policy barra o INSERT antes de
+       qualquer FK ser avaliada -> SQLSTATE 42501 (nao 23503).
+       O nexus_migrator nao tem BYPASSRLS, e nao deve receber um.
+
+STATUS: PENDENCIA ABERTA. A Fase 5.1 NAO resolve este defeito.
+        O R42 apenas alinhou a assercao do teste ao comportamento observado.
