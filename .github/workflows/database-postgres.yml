@@ -50,6 +50,72 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      # =========================================================================================
+      # PROVISIONAMENTO DO PAPEL DE MIGRACAO — espelha `docs/r38/scripts/install_clean.sh`.
+      # =========================================================================================
+      # Sem este passo o runner falha em `GRANT nexus_app TO nexus_migrator`, porque o papel nao
+      # existe: `bootstrap.sql` cria apenas `nexus_app` e `nexus_anonymous`.
+      #
+      # A separacao de privilegios e a mesma da producao:
+      #   * `postgres`         — superusuario do cluster de teste; so CRIA o papel e o banco.
+      #                          Nenhuma migration, verificador ou dado passa por ele.
+      #   * `nexus_migrator`   — NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOINHERIT. Dono do banco e
+      #                          do schema; aplica as migrations e executa o verificador de
+      #                          exclusao. E o papel de operacao real.
+      #   * `nexus_app`        — criado pelo `bootstrap.sql` com apenas os privilegios da aplicacao.
+      #
+      # O dono do banco TEM de ser `nexus_migrator`: com o banco pertencendo a `postgres`, a
+      # primeira migration falha com `permission denied for database nexus_test`, porque um papel
+      # nao-superusuario so cria o schema `nexus` se for dono do banco (verificado em PG 17.11).
+      - name: Provision the migration role (mirrors install_clean.sh)
+        env:
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+        run: |
+          set -eu
+          psql -X -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          -- O cluster de teste nasce com o banco `nexus_test` pertencendo a `postgres`
+          -- (POSTGRES_DB/POSTGRES_USER do servico). Recriamos com o dono correto.
+          DROP DATABASE IF EXISTS nexus_test;
+          DROP ROLE IF EXISTS nexus_migrator;
+          CREATE ROLE nexus_migrator LOGIN CREATEROLE NOSUPERUSER NOBYPASSRLS NOCREATEDB NOINHERIT;
+          CREATE DATABASE nexus_test OWNER nexus_migrator;
+          SQL
+          psql -X -v ON_ERROR_STOP=1 -d nexus_test -c "ALTER SCHEMA public OWNER TO nexus_migrator;"
+
+          # ---------------------------------------------------------------------------------------
+          # Pre-requisitos da migration 00007, identicos ao provisionamento de producao
+          # (`install_clean.sh:263` e `:283`). Ambos sao executados PELO PROPRIO `nexus_migrator`,
+          # nunca por `postgres` — e nenhum concede SUPERUSER ou BYPASSRLS.
+          #
+          # 1. `nexus_audit_writer` — a 00007 transfere a propriedade da funcao de auditoria para
+          #    esse papel. `ALTER FUNCTION ... OWNER TO` exige que o executante possa
+          #    `SET ROLE` ao novo dono. Criar o papel NAO concede isso automaticamente: a
+          #    membresia implicita do `CREATE ROLE` tem `set_option = false` e grantor diferente
+          #    (documentado em `00007`, secao "PROVISIONAMENTO EM INSTALACAO REAL SEM SUPERUSER").
+          # 2. `CREATE` no schema `nexus` para o novo dono — sem isso a transferencia falha com a
+          #    mensagem enganosa `permission denied for schema nexus`. Este GRANT depende da
+          #    existencia do schema, portanto e emitido pelo runner imediatamente antes da 00007,
+          #    no mesmo ponto em que `install_clean.sh:283` o emite em producao.
+          # ---------------------------------------------------------------------------------------
+          psql -X -v ON_ERROR_STOP=1 -d nexus_test -U nexus_migrator <<'SQL'
+          CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+          GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE;
+          SQL
+
+          # O escritor de auditoria nao pode ter atributos amplos: os verificadores de RLS e a
+          # secao §8 do verificador de exclusao dependem disso.
+          test "$(psql -X -Atd postgres -c "SELECT rolsuper FROM pg_roles WHERE rolname='nexus_audit_writer'")" = "f"
+          test "$(psql -X -Atd postgres -c "SELECT rolbypassrls FROM pg_roles WHERE rolname='nexus_audit_writer'")" = "f"
+
+          # Prova negativa: os atributos amplos NAO existem. Sem esta checagem, uma alteracao
+          # futura no provisionamento poderia conceder SUPERUSER/BYPASSRLS sem ninguem notar, e
+          # todos os verificadores de RLS passariam a testar menos do que afirmam.
+          test "$(psql -X -Atd postgres -c "SELECT rolsuper FROM pg_roles WHERE rolname='nexus_migrator'")" = "f"
+          test "$(psql -X -Atd postgres -c "SELECT rolbypassrls FROM pg_roles WHERE rolname='nexus_migrator'")" = "f"
+          test "$(psql -X -Atd postgres -c "SELECT rolcreatedb FROM pg_roles WHERE rolname='nexus_migrator'")" = "f"
+          echo "nexus_migrator: NOSUPERUSER, NOBYPASSRLS, NOCREATEDB — verificado"
+
       - name: Install locked workspace dependencies
         run: npm ci
 

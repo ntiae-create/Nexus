@@ -20,16 +20,72 @@ if [ ! -f "$migration_dir/00001_initial_schema.sql" ]; then
 fi
 
 postgres_container_id=$NEXUS_TEST_POSTGRES_CONTAINER_ID
+
+# =================================================================================================
+# PAPEL DE MIGRACAO — `nexus_migrator`, nao `postgres`
+# =================================================================================================
+# As migrations rodam como o DONO do banco e do schema, exatamente como em producao
+# (`install_clean.sh` cria o banco com `OWNER nexus_migrator` e aplica as migrations nesse papel).
+#
+# `nexus_migrator` e NOSUPERUSER e NOBYPASSRLS. Se as migrations rodassem como `postgres`, todas
+# as tabelas nasceriam de um superusuario, e os verificadores de RLS passariam a exercitar um
+# caminho que nao existe em producao: superusuario ignora RLS. Rodar como o papel real e o que
+# torna as provas de isolamento significativas.
+#
+# O papel e criado pelo workflow (`.github/workflows/database-postgres.yml`, passo
+# "Provision the migration role"). Se ele nao existir, o script falha imediatamente em vez de
+# seguir com atribuicoes erradas.
+if ! docker exec -i "$postgres_container_id" psql -X -w -tA -U postgres -d postgres \
+     -c "SELECT 1 FROM pg_roles WHERE rolname = 'nexus_migrator'" | grep -qx 1; then
+  echo "Role nexus_migrator is missing. The workflow must provision it before running this script." >&2
+  exit 2
+fi
+
+# As migrations sao aplicadas com o CONTEXTO RLS de sessao, exatamente como em producao
+# (`run_with_ctx` em `docs/r38/scripts/install_clean.sh:99`).
+#
+# Por que o contexto e obrigatorio: a 00001 liga `FORCE ROW LEVEL SECURITY` nas tabelas de owner.
+# `FORCE` sujeita tambem o DONO da tabela a RLS — e `nexus_migrator` e o dono. Sem
+# `nexus.owner_id`/`nexus.actor_type` definidos, qualquer INSERT do seed e do proprio DDL falha
+# com "new row violates row-level security policy".
+#
+# Antes da correcao isso nao acontecia porque as migrations rodavam como `postgres`, que e
+# SUPERUSER e portanto ignora RLS. Ou seja: o contexto nao estava "faltando por acaso" — ele
+# estava sendo mascarado pelo superusuario. Fornecer o contexto e o que permite as migrations
+# rodarem no papel real SEM afrouxar RLS nenhuma.
+run_sql_as_migrator_with_context() {
+  context_file=$1
+  context_label=$2
+  {
+    printf "SELECT set_config('nexus.owner_id','%s',false);\n" "00000000-0000-4000-8000-000000000004"
+    printf "SELECT set_config('nexus.actor_type','owner',false);\n"
+    printf "\\\\set ON_ERROR_STOP on\n"
+    cat "$context_file"
+  } > /tmp/nexus_migration_ctx.sql
+  docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 \
+    -U nexus_migrator -d nexus_test -f - < /tmp/nexus_migration_ctx.sql
+  rm -f /tmp/nexus_migration_ctx.sql
+}
+
 for migration_file in "$migration_dir"/*.sql; do
   migration_name=$(basename "$migration_file")
   if [ "$migration_name" = "00003_persistence_integrity.sql" ]; then
     echo "Seeding real Etapa 2A rows before the additive upgrade."
-    docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/legacy-stage-2a.sql"
+    run_sql_as_migrator_with_context "$database_package_dir/tests/postgres/legacy-stage-2a.sql" "legacy-stage-2a"
+  fi
+  # Antes da 00007: o novo dono da funcao de auditoria precisa de `CREATE` no schema onde o
+  # objeto vive, senao `ALTER FUNCTION ... OWNER TO` falha com a mensagem enganosa
+  # `permission denied for schema nexus`. Emitido pelo DONO do schema (`nexus_migrator`) e no
+  # mesmo ponto do fluxo de producao (`install_clean.sh:283`). O schema so existe a partir da
+  # 00001, portanto nao pode ser feito no provisionamento inicial.
+  if [ "$migration_name" = "00007_tool_grants_and_preferences.sql" ]; then
+    docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 \
+      -U nexus_migrator -d nexus_test -c "GRANT USAGE, CREATE ON SCHEMA nexus TO nexus_audit_writer;"
   fi
   echo "Applying $migration_name to isolated nexus_test database."
-  docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$migration_file"
+  run_sql_as_migrator_with_context "$migration_file" "$migration_name"
   if [ "$migration_name" = "00003_persistence_integrity.sql" ]; then
-    docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-2b-migration.sql"
+    run_sql_as_migrator_with_context "$database_package_dir/tests/postgres/verify-stage-2b-migration.sql" "verify-stage-2b-migration"
   fi
 done
 # Fase 2 (G7): a verificação da 00005 reaplica a migration para provar idempotência com
@@ -40,7 +96,7 @@ docker cp "$migration_dir/00005_assistant_seed_parity.sql" "$postgres_container_
 # idempotente rodando duas vezes no banco real.
 docker cp "$migration_dir/00006_assistant_seed_vivy.sql" "$postgres_container_id":/tmp/00006_assistant_seed_vivy.sql
 echo "Verifying assistant seed parity and migrations 00005/00006 idempotency."
-docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-assistant-seed-parity.sql"
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-assistant-seed-parity.sql"
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/bootstrap.sql"
 # `install_clean.sh` (l.305-309) concede ao provisionador o direito de ASSUMIR os papeis de runtime
 # (`GRANT nexus_app TO nexus_migrator WITH SET TRUE`, sem herdar privilegios). O ambiente de teste
@@ -64,13 +120,13 @@ docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0
 # estado final commitado vive em `verify-owner-deletion.sql`, que roda por ultimo e e o unico que
 # comita a exclusao.
 echo "Verifying Phase 5 grant lifecycle, audit and enum ACL."
-docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-grants-lifecycle.sql"
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-grants-lifecycle.sql"
 echo "Verifying Phase 5 assistant preferences display_label."
-docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-preferences.sql"
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-preferences.sql"
 echo "Verifying Phase 5 owner-deletion behavior and cascade."
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-owner-deletion.sql"
 echo "Verifying Phase 5 cascade with the DELETE policy removed."
-docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-cascade-without-delete-policy.sql"
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-cascade-without-delete-policy.sql"
 echo "Verifying Phase 5 tool grants and assistant preferences under RLS."
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U nexus_app -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-stage-5-rls.sql"
 
