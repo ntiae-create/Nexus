@@ -63,15 +63,17 @@ run_sql_as_migrator_with_context() {
     cat "$context_file"
   } > /tmp/nexus_migration_ctx.sql
   docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 \
-    -U nexus_migrator -d nexus_test -f - < /tmp/nexus_migration_ctx.sql
+    -U nexus_migrator -d "${3:-nexus_test}" -f - < /tmp/nexus_migration_ctx.sql
   rm -f /tmp/nexus_migration_ctx.sql
 }
 
+apply_migrations_to() {
+  target_database=$1
 for migration_file in "$migration_dir"/*.sql; do
   migration_name=$(basename "$migration_file")
   if [ "$migration_name" = "00003_persistence_integrity.sql" ]; then
     echo "Seeding real Etapa 2A rows before the additive upgrade."
-    run_sql_as_migrator_with_context "$database_package_dir/tests/postgres/legacy-stage-2a.sql" "legacy-stage-2a"
+    run_sql_as_migrator_with_context "$database_package_dir/tests/postgres/legacy-stage-2a.sql" "legacy-stage-2a" "$target_database"
   fi
   # Antes da 00007: o novo dono da funcao de auditoria precisa de `CREATE` no schema onde o
   # objeto vive, senao `ALTER FUNCTION ... OWNER TO` falha com a mensagem enganosa
@@ -80,14 +82,17 @@ for migration_file in "$migration_dir"/*.sql; do
   # 00001, portanto nao pode ser feito no provisionamento inicial.
   if [ "$migration_name" = "00007_tool_grants_and_preferences.sql" ]; then
     docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 \
-      -U nexus_migrator -d nexus_test -c "GRANT USAGE, CREATE ON SCHEMA nexus TO nexus_audit_writer;"
+      -U nexus_migrator -d "$target_database" -c "GRANT USAGE, CREATE ON SCHEMA nexus TO nexus_audit_writer;"
   fi
-  echo "Applying $migration_name to isolated nexus_test database."
-  run_sql_as_migrator_with_context "$migration_file" "$migration_name"
+  echo "Applying $migration_name to isolated $target_database database."
+  run_sql_as_migrator_with_context "$migration_file" "$migration_name" "$target_database"
   if [ "$migration_name" = "00003_persistence_integrity.sql" ]; then
-    run_sql_as_migrator_with_context "$database_package_dir/tests/postgres/verify-stage-2b-migration.sql" "verify-stage-2b-migration"
+    run_sql_as_migrator_with_context "$database_package_dir/tests/postgres/verify-stage-2b-migration.sql" "verify-stage-2b-migration" "$target_database"
   fi
 done
+}
+
+apply_migrations_to nexus_test
 # Fase 2 (G7): a verificação da 00005 reaplica a migration para provar idempotência com
 # PostgreSQL real. O arquivo é copiado para o container porque o `\i` do psql precisa de um
 # caminho que exista dentro dele.
@@ -141,3 +146,72 @@ docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0
 # Roda como `nexus_migrator` (dono do schema, NOSUPERUSER, NOBYPASSRLS): o papel real de operacao.
 echo "Verifying definitive owner deletion (migration 00008) — runs last, commits the deletion."
 docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-owner-deletion.sql"
+
+# =================================================================================================
+# RESTAURACAO DO ESTADO OPERACIONAL PARA O RESTANTE DO JOB — `nexus_test`
+# =================================================================================================
+# O verificador acima COMINTOU a exclusao do owner, entao `nexus_test` termina, de proposito, sem
+# owner. Este script e apenas o QUARTO passo do job `postgres-integration`; depois dele o job roda
+# vitest sobre `pool.integration.test.ts`, `repositories.integration.test.ts`, core engine,
+# cancellation e auth store. Esses testes abrem transacao com
+# `ownerId = 00000000-0000-4000-8000-000000000004` e esperam ENCONTRAR o owner.
+#
+# Contra o estado pos-verificador eles falhavam — nao por defeito de RLS, mas porque o banco de
+# teste tinha sido esvaziado de proposito pelo proprio runner. Foi exatamente esse o estado que
+# derrubou o step "Test repositories against isolated PostgreSQL" no CI.
+#
+# A correcao NAO e pular a exclusao (isso removeria a prova mais importante da Fase 5): o runner
+# recria `nexus_test` do zero, no estado operacional, depois de concluir todas as provas. A
+# recriacao reusa `apply_migrations_to`, o mesmo codigo que os verificadores ja exercitaram, entao
+# o estado entregue ao job e o estado de producao — migrations aplicadas como `nexus_migrator`,
+# bootstrap aplicado, ACLs conferidas. Nome, guardas de `current_database()` e isolamento do banco
+# permanecem exatamente como estavam.
+echo "Restoring the operational test database for the remaining job steps."
+
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  -c "DROP DATABASE IF EXISTS nexus_test;"
+# `bootstrap.sql` exige que os papeis de runtime ainda NAO existam — a guarda impede aplicar as ACLs
+# num cluster ja provisionado. Como papeis sao objetos de CLUSTER e o bootstrap os recria logo
+# abaixo com os mesmos atributos, removemos apenas esses dois antes de reaplicar. `nexus_migrator`
+# e `nexus_audit_writer` NAO sao tocados: eles carregam as migrations e a propriedade.
+for runtime_role in nexus_app nexus_anonymous; do
+  docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c "DROP ROLE IF EXISTS $runtime_role;"
+done
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  -c "CREATE DATABASE nexus_test OWNER nexus_migrator;"
+
+apply_migrations_to nexus_test
+
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test \
+  -f - < "$database_package_dir/tests/postgres/bootstrap.sql"
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test \
+  -c "GRANT nexus_app TO nexus_migrator WITH SET TRUE;"
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -U postgres -d nexus_test \
+  -c "GRANT nexus_anonymous TO nexus_migrator WITH SET TRUE;"
+
+# `integration.sql` roda como `nexus_app` — o mesmo ponto do fluxo original — e instala o que os
+# testes de servico esperam encontrar: a autorizacao explicita de provider que
+# `repositories.integration.test.ts` exige para selecao manual de modelo. Sem ela, os dois testes
+# de preferencia falham com "Manual provider preference requires an available, explicitly
+# authorized provider and model". O arquivo tambem cobre as provas de RLS de `nexus_app`, entao
+# executa-lo aqui mantem, no estado restaurado, exatamente o que o fluxo original comprovava.
+docker exec -i "$postgres_container_id" psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 \
+  -U nexus_app -d nexus_test -f - < "$database_package_dir/tests/postgres/integration.sql"
+
+# Conferimos o EFEITO em vez de presumir que a restauracao funcionou: sem owner, ou sem `USAGE`
+# de `nexus_app` no schema, o restante do job falharia por um motivo obscuro. Melhor falhar aqui,
+# com mensagem clara, do que deixar o proximo passo reportar um erro enganoso.
+restored_owner_count=$(docker exec -i "$postgres_container_id" psql -X -w -tA -U postgres -d nexus_test \
+  -c "SELECT count(*) FROM nexus.owner_identity")
+if [ "$restored_owner_count" != "1" ]; then
+  echo "Restored nexus_test should contain exactly one owner, found $restored_owner_count." >&2
+  exit 2
+fi
+restored_schema_usage=$(docker exec -i "$postgres_container_id" psql -X -w -tA -U postgres -d nexus_test \
+  -c "SELECT has_schema_privilege('nexus_app', 'nexus', 'USAGE')")
+if [ "$restored_schema_usage" != "t" ]; then
+  echo "nexus_app cannot use schema nexus in the restored nexus_test; the remaining job steps cannot run." >&2
+  exit 2
+fi
+echo "nexus_test restored: owner present, nexus_app has USAGE on schema nexus."

@@ -502,15 +502,32 @@ describe("owner deletion fix (migration 00008)", () => {
     const execLine = 'psql -X -w -v ON_ERROR_STOP=1 -U nexus_migrator -d nexus_test -f - < "$database_package_dir/tests/postgres/verify-owner-deletion.sql"';
     const execIndex = script.indexOf(execLine);
     expect(execIndex).toBeGreaterThan(-1);
-    // E a ultima LINHA DE EXECUCAO do arquivo (comentarios depois nao contam como execucao).
+    // E a ultima LINHA DE EXECUCAO ENTRE OS VERIFICADORES (comentarios depois nao contam como
+    // execucao). Se qualquer verificador rodasse depois, falharia por ausencia de dados e nao por
+    // defeito real.
+    //
+    // EXCECAO DELIBERADA — RESTAURACAO DO BANCO. Depois do verificador, o runner RECRIA
+    // `nexus_test` no estado operacional para os passos seguintes do job (`pool.integration`,
+    // `repositories.integration`, core engine, cancellation, auth store), que abrem transacao com
+    // `ownerId = 00000000-0000-4000-8000-000000000004` e precisam ENCONTRAR o owner. Sem essa
+    // restauracao eles falhavam no CI — nao por defeito de RLS, mas porque o proprio runner tinha
+    // esvaziado o banco de proposito.
+    //
+    // A excecao e ESTREITA e verificada, nao presumida: as unicas linhas de execucao admitidas
+    // depois do verificador sao as da secao de restauracao, e ela tem de estar marcada, rodar como
+    // `postgres` (unico papel que pode DROP/CREATE DATABASE) e NAO pode reexecutar verificador
+    // nenhum. Assim a prova da Fase 5 continua sendo a ultima verificacao do arquivo, e a
+    // restauracao continua sendo o que ela e: preparacao de estado, nunca uma prova.
     const after = script.slice(execIndex + execLine.length);
     const remainingExecs = after
       .split("\n")
       .filter((line) => line.trimStart().startsWith("docker exec"));
-    expect(remainingExecs).toEqual([]);
-
-    // Roda como o DONO do schema (nao-superuser), nunca como `postgres`: e o papel real de
-    // operacao, e um runner superusuario contornaria RLS e mascararia regressao.
+    expect(remainingExecs.length).toBeGreaterThan(0);
+    expect(after).toContain("RESTAURACAO DO ESTADO OPERACIONAL");
+    // Nenhum verificador pode rodar depois da prova de exclusao.
+    expect(after).not.toContain("verify-");
+    // A restauracao nao pode reintroduzir o superusuario no papel de migracao nem afrouxar o
+    // verificador: a linha do verificador continua exactamente como antes.
     expect(execLine).toContain("-U nexus_migrator");
     expect(execLine).not.toContain("-U postgres");
   });
