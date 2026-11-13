@@ -22,7 +22,9 @@
 -- conceder. Se esta secao falhar com "must be owner", as migrations nao foram
 -- aplicadas por nexus_migrator — ver MIGRAR_RAILWAY.md, secao de diagnostico.
 
-GRANT USAGE ON SCHEMA nexus TO nexus_app, nexus_anonymous;
+-- `nexus_anonymous` is NOLOGIN and intentionally receives no access to the
+-- private application schema; no runtime path uses that role.
+GRANT USAGE ON SCHEMA nexus TO nexus_app;
 
 -- Sessao: revogacao de token e estado de tentativas de login.
 -- Sao as duas unicas tabelas de auth, e nenhuma delas tem RLS (medido em

@@ -71,6 +71,45 @@ END
 $$;
 
 \echo ''
+-- The legacy-ledger adoption path runs this verifier before a checksum column exists.
+-- Modern installs require eight valid digests; migrate.sh also compares them to the files.
+SELECT EXISTS (
+  SELECT 1 FROM pg_attribute
+   WHERE attrelid = to_regclass('nexus_migrations.schema_migrations')
+     AND attname = 'checksum' AND attnum > 0 AND NOT attisdropped
+) AS ledger_has_checksum \gset
+\if :ledger_has_checksum
+  SELECT version, filename, checksum, applied_at
+    FROM nexus_migrations.schema_migrations ORDER BY version;
+  DO $$
+  BEGIN
+    IF (SELECT count(*) FROM nexus_migrations.schema_migrations
+         WHERE checksum IS NOT NULL AND checksum ~ '^[0-9a-f]{64}$') <> 8 THEN
+      RAISE EXCEPTION 'FALHA: ledger checksum ausente ou formato inválido';
+    END IF;
+    IF EXISTS (
+      SELECT 1
+        FROM nexus_migrations.schema_migrations m
+        JOIN (VALUES
+          (1, '00001_initial_schema.sql'),
+          (2, '00002_auth_security.sql'),
+          (3, '00003_persistence_integrity.sql'),
+          (4, '00004_core_execution_hierarchy.sql'),
+          (5, '00005_assistant_seed_parity.sql'),
+          (6, '00006_assistant_seed_vivy.sql'),
+          (7, '00007_tool_grants_and_preferences.sql'),
+          (8, '00008_owner_deletion_tombstone_guard.sql')
+        ) expected(version, filename) USING (version)
+       WHERE m.filename IS DISTINCT FROM expected.filename
+    ) THEN
+      RAISE EXCEPTION 'FALHA: ledger filename diverge do contrato 00001-00008';
+    END IF;
+    RAISE NOTICE 'OK  ledger checksums: oito SHA-256 válidos (comparação do arquivo feita pelo runner)';
+  END $$;
+\else
+  \echo 'Ledger legado sem coluna checksum: verificação estrutural; adoção explícita necessária.'
+\endif
+
 \echo '=================================================================='
 \echo '2. TABELAS — as 27 do schema nexus'
 \echo '=================================================================='
@@ -296,7 +335,7 @@ $$;
 \echo '=================================================================='
 \echo '4. PAPEIS — atributos e memberships'
 \echo '=================================================================='
-SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolinherit
+SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolinherit, rolreplication
   FROM pg_roles
  WHERE rolname IN ('nexus_migrator','nexus_app','nexus_anonymous','nexus_audit_writer')
  ORDER BY rolname;
@@ -339,13 +378,13 @@ DECLARE
 BEGIN
   FOR esperado IN
     SELECT * FROM (VALUES
-      ('nexus_migrator'::text, true,  false, false, false, false, false),
-      ('nexus_app'::text,      true,  false, false, false, false, false),
-      ('nexus_audit_writer'::text, false, false, false, false, false, false),
-      ('nexus_anonymous'::text,    false, false, false, false, false, false)
-    ) AS v(rolname, canlogin, superuser, bypassrls, createdb, createrole, inherit)
+      ('nexus_migrator'::text, true,  false, false, false, false, false, false),
+      ('nexus_app'::text,      true,  false, false, false, false, false, false),
+      ('nexus_audit_writer'::text, false, false, false, false, false, false, false),
+      ('nexus_anonymous'::text,    false, false, false, false, false, false, false)
+    ) AS v(rolname, canlogin, superuser, bypassrls, createdb, createrole, inherit, replication)
   LOOP
-    SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolinherit
+    SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolinherit, rolreplication
       INTO atual FROM pg_roles WHERE rolname = esperado.rolname;
     IF NOT FOUND THEN
       RAISE EXCEPTION 'FALHA: papel % nao existe', esperado.rolname;
@@ -364,18 +403,22 @@ BEGIN
     END IF;
 
     IF ROW(atual.rolcanlogin, atual.rolsuper, atual.rolbypassrls,
-           atual.rolcreatedb, atual.rolcreaterole, atual.rolinherit)
+           atual.rolcreatedb, atual.rolcreaterole, atual.rolinherit, atual.rolreplication)
        IS DISTINCT FROM
        ROW(esperado.canlogin, esperado.superuser, esperado.bypassrls,
-           esperado.createdb, esperado.createrole, esperado.inherit) THEN
+           esperado.createdb, esperado.createrole, esperado.inherit, esperado.replication) THEN
       RAISE EXCEPTION
-        'FALHA: papel % tem atributos divergentes (LOGIN=%, SUPERUSER=%, BYPASSRLS=%, CREATEDB=%, CREATEROLE=%, INHERIT=%); esperado (LOGIN=%, SUPERUSER=%, BYPASSRLS=%, CREATEDB=%, CREATEROLE=%, INHERIT=%)',
+        'FALHA: papel % tem atributos divergentes (LOGIN=%, SUPERUSER=%, BYPASSRLS=%, CREATEDB=%, CREATEROLE=%, INHERIT=%, REPLICATION=%); esperado (LOGIN=%, SUPERUSER=%, BYPASSRLS=%, CREATEDB=%, CREATEROLE=%, INHERIT=%, REPLICATION=%)',
         atual.rolname, atual.rolcanlogin, atual.rolsuper, atual.rolbypassrls,
-        atual.rolcreatedb, atual.rolcreaterole, atual.rolinherit,
+        atual.rolcreatedb, atual.rolcreaterole, atual.rolinherit, atual.rolreplication,
         esperado.canlogin, esperado.superuser, esperado.bypassrls,
-        esperado.createdb, esperado.createrole, esperado.inherit;
+        esperado.createdb, esperado.createrole, esperado.inherit, esperado.replication;
     END IF;
   END LOOP;
+
+  IF has_schema_privilege('nexus_anonymous', 'nexus', 'USAGE') THEN
+    RAISE EXCEPTION 'FALHA: nexus_anonymous tem USAGE no schema nexus';
+  END IF;
 
   -- O migrator precisa assumir o escritor para o ALTER FUNCTION ... OWNER TO da 00007.
   IF NOT pg_has_role('nexus_migrator','nexus_audit_writer','SET') THEN
@@ -641,6 +684,64 @@ BEGIN
   END IF;
 
   RAISE NOTICE 'OK  nexus_app: leitura completa, escrita onde precisa, nenhum privilegio a mais';
+END
+$$;
+
+\echo ''
+\echo '=================================================================='
+\echo '8. ALLOWLIST EFETIVA — PUBLIC, memberships, ownership e ACLs'
+\echo '=================================================================='
+\set NEXUS_REQUIRE_APP_GRANTS true
+\ir assert_app_privileges.sql
+
+-- A migration role owns objects it created; the audit SECURITY DEFINER alone
+-- is transferred to nexus_audit_writer. The runtime login must own none.
+DO $$
+DECLARE
+  migrator_oid oid;
+  audit_oid oid;
+BEGIN
+  SELECT oid INTO migrator_oid FROM pg_roles WHERE rolname = 'nexus_migrator';
+  SELECT oid INTO audit_oid FROM pg_roles WHERE rolname = 'nexus_audit_writer';
+  IF migrator_oid IS NULL OR audit_oid IS NULL THEN
+    RAISE EXCEPTION 'FALHA: papéis de ownership ausentes';
+  END IF;
+  IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'nexus') <> migrator_oid THEN
+    RAISE EXCEPTION 'FALHA: schema nexus não pertence a nexus_migrator';
+  END IF;
+  IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'nexus_migrations') <> migrator_oid THEN
+    RAISE EXCEPTION 'FALHA: schema nexus_migrations não pertence a nexus_migrator';
+  END IF;
+  IF (SELECT relowner FROM pg_class WHERE oid = 'nexus_migrations.schema_migrations'::regclass) <> migrator_oid THEN
+    RAISE EXCEPTION 'FALHA: ledger não pertence a nexus_migrator';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'nexus' AND c.relkind IN ('r','p','v','m','f','S')
+       AND c.relowner <> migrator_oid
+  ) THEN
+    RAISE EXCEPTION 'FALHA: tabela/sequência em nexus com ownership inesperado';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+     WHERE n.nspname = 'nexus' AND t.typtype IN ('e','d','r','m')
+       AND t.typowner <> migrator_oid
+  ) THEN
+    RAISE EXCEPTION 'FALHA: tipo em nexus com ownership inesperado';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'nexus'
+       AND ((p.proname = 'audit_tool_grant_change' AND p.proowner <> audit_oid)
+         OR (p.proname <> 'audit_tool_grant_change' AND p.proowner <> migrator_oid))
+  ) THEN
+    RAISE EXCEPTION 'FALHA: função em nexus com ownership inesperado';
+  END IF;
+  IF (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'nexus' AND c.relkind = 'S') <> 3 THEN
+    RAISE EXCEPTION 'FALHA: número de sequências divergente (esperado 3)';
+  END IF;
+  RAISE NOTICE 'OK  ownership: schema, tabelas, sequências, tipos e funções conforme contrato';
 END
 $$;
 

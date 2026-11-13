@@ -1,396 +1,326 @@
-# Migrar o PostgreSQL do Railway — procedimento seguro
+# Instalação segura do banco PostgreSQL de produção
 
-Fecha o único item que separa "deploy correto" de "API funcionando".
+Este runbook descreve o instalador existente em `packages/database/scripts/production/`.
+Ele não altera a arquitetura, não chama os CLIs do Railway/Vercel e não configura
+variáveis nem dispara deploys. A execução contra um banco real é uma ação separada
+do operador; nenhum passo deste trabalho conectou aos serviços de produção.
 
-**Estado atual:** a API no Vercel alcança o PostgreSQL do Railway, mas o schema
-`nexus` não existe. `/v1/ready` responde `503 not_ready` — corretamente.
-
-**Nada foi executado no banco real.** Este documento é o procedimento verificável
-para você executar.
+> **Escopo:** provisionar papéis, aplicar as migrations, conceder os privilégios
+de runtime previstos e verificar os invariantes do banco. A conexão da aplicação
+e qualquer alteração de infraestrutura são etapas externas a este instalador.
 
 ---
 
-## 0. Resumo do que será feito
+## 1. O que o instalador faz
 
-| Fase | Papel que executa | Arquivo | O que faz |
+| Ordem | Conexão | Arquivo/etapa | Efeito |
 |---|---|---|---|
-| 1 | `postgres` (admin) | `00_prepare.sql` | cria os 4 papéis e as permissões administrativas |
-| 1b | `postgres` (admin) | (o instalador faz) | define as senhas via verificador SCRAM |
-| 2 | `nexus_migrator` | `migrate.sh` | aplica as 8 migrations |
-| 3 | `nexus_migrator` | `20_grant_runtime.sql` | GRANTs de runtime para `nexus_app` |
-| — | `nexus_migrator` | `30_verify.sql` | conferência somente-leitura |
+| 1 | `postgres` (administrador) | `00_preflight.sql` + `migrate.sh --check-only` | Só leitura: valida requisitos, papéis, ownership, privilégios efetivos e estado do ledger. O runner usa um advisory lock transitório durante a leitura. |
+| 2 | `postgres` | `00_prepare.sql` | Repete o preflight; cria somente papéis ausentes e concede as permissões administrativas mínimas. Não altera atributos de papéis existentes nem muda ownership. |
+| 3 | `postgres` | `psql \password` iniciado pelo instalador, quando necessário | Define senhas apenas para logins recém-criados ou com `--rotate-passwords` explícito. Senhas existentes são preservadas por padrão. |
+| 4 | `nexus_migrator` | `migrate.sh` | Aplica ou verifica as oito migrations e registra SHA-256 no ledger. |
+| 5 | `nexus_migrator` | `20_grant_runtime.sql` | Concede a allowlist de privilégios de runtime a `nexus_app`; não revoga privilégios. |
+| 6 | `nexus_migrator` | `30_verify.sql` | Confirma ledger, ownership, papéis, RLS, policies e allowlist efetiva. Qualquer invariante obrigatório divergente causa erro e exit code diferente de zero. |
 
-O superusuário atua **só na fase 1**. A partir da fase 2, nenhuma conexão é
-administrativa.
+O administrador não executa migrations. `nexus_migrator` não é superuser,
+não tem `BYPASSRLS`, `CREATEDB` nem `CREATEROLE`; sua única membership prevista
+permite `SET ROLE nexus_audit_writer` sem herança nem ADMIN OPTION. `nexus_app`
+não tem memberships e não é dono de objetos.
 
----
-
-## 1. Quem precisa de quê — a matriz real de privilégios
-
-Levantada lendo as migrations, não por suposição.
-
-### Exige administrador (`postgres`) — só a fase 1
-
-| Comando | Por quê |
-|---|---|
-| `CREATE ROLE nexus_migrator / nexus_app / nexus_anonymous / nexus_audit_writer` | `CREATE ROLE` é objeto de CLUSTER; exige `CREATEROLE` e, para os atributos `NOSUPERUSER`/`NOBYPASSRLS`, na prática o admin |
-| `GRANT CREATE, CONNECT ON DATABASE <db> TO nexus_migrator` | o banco do Railway pertence a `postgres`; só o dono concede |
-| `GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE` | a membership precisa ser criada por quem tem ADMIN no papel |
-| `ALTER ROLE ... PASSWORD` | o instalador aplica como admin; um papel não altera a senha de outro |
-| `CREATE EXTENSION` (se alguma migration exigisse) | as migrations atuais **não** exigem extensão nenhuma |
-
-### Executado por `nexus_migrator` — fases 2 e 3
-
-| Comando | Como funciona sem superuser |
-|---|---|
-| `CREATE SCHEMA nexus` | concedido na fase 1 (`GRANT CREATE ON DATABASE`) |
-| todo o DDL das 8 migrations | o migrator **é o dono** do schema e das tabelas que cria |
-| `ALTER FUNCTION ... OWNER TO nexus_audit_writer` (00007) | exige `SET ROLE` no escritor — concedido na fase 1 com `WITH SET TRUE, INHERIT FALSE` |
-| `GRANT ... TO nexus_app` (fase 3) | o migrator é dono dos objetos, então pode conceder |
-
-### O que **não** foi necessário
-
-- **`CREATEROLE` no migrator.** A 00007 traz um bloco `DO` que cria
-  `nexus_audit_writer` só se ele ainda não existir. Criando o papel na fase 1,
-  esse bloco vira no-op e o migrator nunca precisa de `CREATEROLE`.
-- **`SUPERUSER` em qualquer fase depois da 1.**
-- **`BYPASSRLS` em qualquer papel.** As migrations rodam com `nexus.owner_id` e
-  `nexus.actor_type` definidos na sessão, que é o que as policies exigem.
-
-### Roles e o que cada uma pode
-
-```
-nexus_migrator     LOGIN  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT
-                   + SET ROLE nexus_audit_writer
-nexus_app          LOGIN  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT
-nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
-                   (não é credencial — não tem senha)
-nexus_anonymous    NOLOGIN NOSUPERUSER NOBYPASSRLS
-                   (existe por fidelidade ao modelo; NÃO é usada pelo runtime —
-                    medido: nenhuma migration a referencia e o app não a usa)
-```
+O instalador não executa `DROP`, `REASSIGN OWNED` nem reparos automáticos de
+ownership/ACL. Se encontrar configuração preexistente divergente, falha para
+revisão em vez de removê-la silenciosamente.
 
 ---
 
-## 2. Antes de qualquer coisa: onde está o ledger
+## 2. Pré-requisitos e conexão
 
-**Se o banco já recebeu uma tentativa anterior, não comece pela fase 2.** Leia o
-ledger primeiro. É a instrução do item "não re-executar migrations parcialmente
-aplicadas sem verificar o ledger", e ela tem motivo:
+- Execute de um terminal confiável, de forma interativa, com o cliente `psql`
+  instalado e acesso administrativo PostgreSQL ao banco-alvo.
+- Use o host TCP, a porta e o nome do banco exatos. **Não** forneça uma URL de
+  conexão, senha em argumento, `PGPASSWORD` ou `NEXUS_MIGRATION_DATABASE_URL`.
+- TLS é obrigatório. O padrão é `PGSSLMODE=require`; também são aceitos
+  `verify-ca` e `verify-full` quando a CA/certificado do servidor está configurada.
+- O administrador usado pelo script é `postgres`. O papel precisa ser
+  superuser (ou ter as capacidades verificadas pelo preflight) e ser owner do
+  banco, exceto quando superuser.
+- O script requer PostgreSQL 16 ou superior.
+- `PGDATABASE` deve conter apenas letras, dígitos, ponto, underscore ou hífen;
+  `PGHOST` deve ser hostname/endereço, não URL. A instalação usa TCP.
 
-```
-SELECT version, filename, applied_at
-  FROM nexus_migrations.schema_migrations
- ORDER BY version;
-```
-
-Três resultados possíveis:
-
-| Resultado | Significado | Ação |
-|---|---|---|
-| erro `relation ... does not exist` | nunca se tentou migrar | siga do passo 3 |
-| 8 linhas, versões 1–8 | já migrado | pule para a verificação (passo 6) |
-| menos de 8 | **meio migrado** | veja "Diagnóstico" no fim |
-
-Conexão somente-leitura para isso, sem expor credencial:
-
-```sh
-railway connect postgres          # abre psql dentro do ambiente, sem URL
-```
-
-Depois, dentro do `psql`, cole a consulta acima.
-
----
-
-## 3. Obter acesso sem manipular a senha
-
-Três caminhos. O primeiro é o recomendado.
-
-### 3a. Recomendado — `railway connect` (a URL nunca existe na sua mão)
-
-```sh
-railway login
-railway link                      # escolhe o projeto
-railway connect postgres          # psql interativo, sobre SSH, sem proxy público
-```
-
-O CLI busca as credenciais internamente e abre o `psql`. **Nenhuma senha é
-digitada, colada ou exibida.** Você cai num prompt `psql` como `postgres`.
-
-Se preferir o túnel sem cliente interativo:
-
-```sh
-railway connect postgres --tunnel-only    # imprime host/porta e mantém aberto
-```
-
-Atenção: `--tunnel-only` **imprime a senha**. Use só se for apontar uma ferramenta
-gráfica e não houver outra opção.
-
-### 3b. TCP Proxy (necessário para o Vercel, não para as migrations)
-
-O Vercel está fora da rede do Railway, então a URL privada
-(`postgres.railway.internal`) **não resolve lá**. Para a API, use o host público:
-
-**Postgres → Settings → Networking → TCP Proxy** (ou `railway tcp-proxy create --port 5432`).
-O host sai como `xxxxx.proxy.rlwy.net` e a porta é atribuída.
-
-Essa URL é a que vai para a variável `NEXUS_DATABASE_URL` do Vercel — e ela **é um
-segredo**. Configure pelo painel do Vercel, nunca por linha de comando com `echo`.
-
-### 3c. Executando de dentro do Railway sem túnel
-
-```sh
-railway run --service postgres sh    # shell com as variáveis do serviço
-```
-
-Útil para conferir se a variável existe, sem imprimir o valor:
-
-```sh
-railway variables --service postgres | grep -o '^DATABASE_[A-Z_]*'   # só os nomes
-```
-
-**Nunca** rode `railway variables` sem filtro num terminal compartilhado: ele
-imprime valores.
-
----
-
-## 4. Executar (o comando único)
-
-O instalador faz as três fases na ordem, com o privilégio mínimo de cada uma.
+Confirme o destino por um canal operacional autorizado antes de executar:
 
 ```sh
 cd /caminho/para/Nexus
 
-PGHOST=xxxxx.proxy.rlwy.net \
-PGPORT=12345 \
-PGDATABASE=railway \
+PGHOST=host-do-postgres \
+PGPORT=5432 \
+PGDATABASE=nome-do-banco \
 PGSSLMODE=require \
   sh packages/database/scripts/production/install-production.sh
 ```
 
-Ele pergunta, em sequência, com **eco desligado**:
+O comando pede a senha do administrador com entrada oculta. Não cole senha ou
+URL em chat, histórico do shell, variável de ambiente ou linha de comando. Se o
+cliente não estiver no `PATH`, `PSQL_BIN` pode apontar para o executável `psql`.
 
-1. senha do `postgres`
-2. nova senha para `nexus_migrator` (mínimo 12 caracteres)
-3. nova senha para `nexus_app` (mínimo 12 caracteres)
-4. a senha do `nexus_migrator` de novo, para a fase 2
-
-O que acontece com as senhas:
-
-- o script gera localmente o **verificador SCRAM-SHA-256** e envia só ele; a
-  senha em texto claro nunca vai para o banco, para o log nem para `pg_stat_activity`;
-- nada é escrito em disco; o histórico do shell não recebe nada;
-- ao fim, as variáveis são apagadas da memória do processo.
-
-**Guarde as duas senhas num gerenciador de segredos antes de continuar.** A de
-`nexus_app` é a que irá para o Vercel; sem ela, a API não sobe.
-
-### Se preferir executar fase por fase
-
-```sh
-# Fase 1 (admin)
-psql "$URL_ADMIN" -f packages/database/scripts/production/00_prepare.sql
-# Fase 2 (migrator)
-NEXUS_MIGRATION_DATABASE_URL="$URL_MIGRATOR" NEXUS_MIGRATE_ASSUME_YES=1 \
-  sh packages/database/scripts/migrate.sh
-# Fase 3 (migrator)
-psql "$URL_MIGRATOR" -f packages/database/scripts/production/20_grant_runtime.sql
-# Verificação
-psql "$URL_MIGRATOR" -f packages/database/scripts/production/30_verify.sql
-```
-
-Nesse modo a senha fica na variável e a URL existe na sua máquina. É por isso que
-o instalador é a opção recomendada.
+O instalador cria um diretório temporário privado (`umask 077`), usa passfiles
+libpq com modo `0600` e remove-os no encerramento, inclusive em falhas tratadas.
+Ele não coloca senhas em `argv`, `PGPASSWORD`, SQL visível, logs ou URLs. Isso
+não substitui o armazenamento seguro das credenciais pelo operador nem garante
+apagamento criptográfico da memória/disco do sistema.
 
 ---
 
-## 5. Verificação das oito migrations e das tabelas
+## 3. Senhas e opções explícitas
 
-`30_verify.sql` já roda no fim do instalador. Para repetir depois, isoladamente:
+### Comportamento padrão
+
+- A senha administrativa é pedida a cada execução e não é salva pelo instalador.
+- Se `nexus_migrator` ou `nexus_app` ainda não existia, o instalador cria o
+  respectivo login e `psql` pede a nova senha duas vezes, sem eco.
+- Se o papel já existia, a senha existente não é alterada. O instalador pede a
+  senha atual de `nexus_migrator` para abrir a conexão das migrations.
+- A senha de `nexus_app` não é impressa nem recuperável pelo script. Registre a
+  nova senha diretamente em um gerenciador de segredos apropriado antes de
+  continuar; qualquer uso posterior pela aplicação é uma etapa separada.
+
+O instalador não impõe comprimento mínimo de senha. Escolha senhas únicas,
+fortes e armazenadas em gerenciador de segredos. O comando `\password` evita
+colocar a senha em texto claro no comando SQL, no histórico ou nos argumentos do
+processo; o tipo de verificador armazenado depende da configuração
+`password_encryption` do servidor.
+
+### Rotacionar senhas
+
+Use `--rotate-passwords` somente quando a rotação for intencional e coordenada
+com os consumidores das credenciais:
 
 ```sh
-PGPASSWORD="$(cat ~/.nexus-migrator)" PGUSER=nexus_migrator \
-  psql -h xxxxx.proxy.rlwy.net -p 12345 -d railway -f .../30_verify.sql
+PGHOST=host-do-postgres PGPORT=5432 PGDATABASE=nome-do-banco PGSSLMODE=require \
+  sh packages/database/scripts/production/install-production.sh --rotate-passwords
 ```
 
-Saída esperada — os números abaixo foram **medidos** num banco instalado por este
-mesmo procedimento, não estimados:
+A opção rotaciona `nexus_migrator` e `nexus_app` na mesma transação administrativa.
+Depois, o instalador pede novamente a senha nova de `nexus_migrator` para a fase
+de migrations. Planeje a atualização do consumidor da credencial `nexus_app`
+fora deste procedimento. Não combine rotação com adoção de ledger legado.
 
-| Verificação | Esperado | Medido |
-|---|---|---|
-| linhas no ledger | 8, versões 1–8 | 8 |
-| tabelas no schema `nexus` | 27 | 27 |
-| tabelas com `FORCE ROW LEVEL SECURITY` | 20 | 20 |
-| tabelas com chave primária | 27 | 27 |
-| policies de RLS | 49 | 49 |
-| `owner_identity` | 1 linha, singleton, id `…0004` | igual |
-| providers `test-free`/`test-paid` | **0** (são fixture de teste) | 0 |
-| `record_deleted_entity` pertence a | `nexus_migrator` (exigência da 00008) | igual |
-| `audit_tool_grant_change` pertence a | `nexus_audit_writer` (decisão da 00007) | igual |
-| tabelas com `FALTA GRANT` para `nexus_app` | 0 | 0 |
+### Ledger legado
 
-As 8 migrations, na ordem do ledger:
+`--adopt-legacy-ledger` é uma recuperação excepcional, não uma opção de
+instalação normal. Só é aceito quando existe um ledger legado completo (versões
+1–8, sem checksums), e o instalador exige a validação integral por
+`30_verify.sql` antes de registrar os checksums dos arquivos atuais. A recuperação
+não reexecuta migrations nem altera dados; antes da validação, reaplica somente
+os GRANTs conhecidos de `20_grant_runtime.sql`. Esse arquivo apenas concede
+privilégios e não remove ACLs inesperadas. Faça backup restaurável e revise o
+estado antes de optar por essa recuperação.
 
+```sh
+PGHOST=host-do-postgres PGPORT=5432 PGDATABASE=nome-do-banco PGSSLMODE=require \
+  sh packages/database/scripts/production/install-production.sh --adopt-legacy-ledger
 ```
-1  00001_initial_schema.sql              schema, tipos, tabelas, RLS, seed do owner
-2  00002_auth_security.sql               auth_login_state, revoked_sessions
-3  00003_persistence_integrity.sql       integridade
-4  00004_core_execution_hierarchy.sql    hierarquia de execução
-5  00005_assistant_seed_parity.sql       assistants
-6  00006_assistant_seed_vivy.sql         assistants
-7  00007_tool_grants_and_preferences.sql tool_grants, audit, preferências (+papéis)
-8  00008_owner_deletion_tombstone_guard.sql  guarda de tombstone
-```
+
+Um ledger parcial sem checksums, com lacunas, nomes divergentes ou checksums
+incorretos falha fechado. Não edite o ledger para contornar a checagem.
 
 ---
 
-## 6. Teste da API publicada
+## 4. Backup, restauração e recuperação
 
-### 6.1 Antes: apontar o Vercel para `nexus_app`
+Antes de uma adoção de ledger legado, de uma migração de recuperação ou de
+qualquer ajuste manual, obtenha um backup restaurável e teste a restauração em
+um banco separado. Esta revisão não acessou Railway nem executou backup ou
+restauração de produção.
 
-No painel do Vercel, projeto `nexus-server` → Settings → Environment Variables →
-`NEXUS_DATABASE_URL` → editar (production):
+### Backup lógico
 
-```
-postgresql://nexus_app:<SENHA>@<host do Tcp Proxy>:<porta>/railway?sslmode=require
-```
-
-`sslmode=require` **não é opcional**: o pool do `pg` não define `ssl` sozinho
-(`packages/database/src/postgres/pool.ts`), e o proxy do Railway exige TLS.
-
-Depois: **Redeploy** (mudar variável não reinicia a função já publicada).
-
-### 6.2 Os três testes
-
-Com cache-buster em cada URL (o CDN devolve resposta antiga se a URL se repete):
+Use uma versão de `pg_dump` compatível com a versão principal do servidor. O
+formato custom permite validar o catálogo e restaurar com `pg_restore`. O
+exemplo pede a senha interativamente: não use URL com credenciais, `PGPASSWORD`
+ou senha em argumentos. `PGSSLMODE=require` exige transporte TLS; use
+`verify-full` quando a CA e o nome do servidor estiverem configurados.
 
 ```sh
-BASE=https://nexus-server-five.vercel.app
-N=$(date +%s)
+umask 077
+export PGHOST=host-do-postgres PGPORT=5432 PGDATABASE=nome-do-banco
+export PGUSER=postgres PGSSLMODE=require
+BACKUP_FILE="$HOME/nexus-pre-change-$(date -u +%Y%m%dT%H%M%SZ).dump"
 
-# 1. readiness — o único que prova schema, não só conexão
-curl -s "$BASE/v1/ready?t=$N"
-# esperado: {"status":"ready"}        200
-# se 503: o schema não está lá (ou NEXUS_DATABASE_URL ainda é a antiga)
-
-# 2. login com senha errada — prova que a tabela de auth existe
-curl -s -X POST "$BASE/v1/auth/login?t=$N" \
-     -H 'content-type: application/json' -d '{"password":"errada-de-proposito"}'
-# esperado: 401 {"code":"UNAUTHORIZED"}      (500 / 42P01 = schema ausente)
-
-# 3. login correto, e criar conversa com o token
-TOKEN=$(curl -s -X POST "$BASE/v1/auth/login?t=$N" \
-        -H 'content-type: application/json' \
-        -d "{\"password\":\"$NEXUS_OWNER_PASSWORD\"}" | sed -E 's/.*"token":"([^"]+)".*/\1/')
-
-curl -s -X POST "$BASE/v1/conversations?t=$N" \
-     -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-     -d '{"title":"Teste pos-migracao"}'
-# esperado: 201 {"conversation":{"id":"...", ...}}
+pg_dump --format=custom --password --file="$BACKUP_FILE" "$PGDATABASE"
+chmod 600 "$BACKUP_FILE"
+pg_restore --list "$BACKUP_FILE" > "$BACKUP_FILE.toc"
+sha256sum "$BACKUP_FILE" > "$BACKUP_FILE.sha256"  # macOS: shasum -a 256
+chmod 600 "$BACKUP_FILE.toc" "$BACKUP_FILE.sha256"
 ```
 
-Resultados medidos localmente, num banco instalado por este procedimento e
-acessado como `nexus_app` (não-superuser):
+Guarde o arquivo, catálogo e hash em armazenamento de backup aprovado, fora do
+repositório. Um `pg_dump` de banco não inclui os papéis globais nem suas senhas;
+preserve as credenciais em um gerenciador de segredos e recrie os papéis somente
+com os atributos/memberships aprovados. Dumps e metadados podem revelar nomes de
+objetos/dados: mantenha controles de acesso e retenção apropriados.
 
+### Restauração de ensaio
+
+Nunca restaure sobre o banco de origem como primeiro teste. Crie um banco vazio
+e separado com um nome simples. `00_prepare.sql` valida os papéis existentes,
+cria apenas os ausentes e concede ao migrator os privilégios previstos no banco
+de destino; `pg_restore` conserva ownership e ACLs do dump, por isso os papéis
+referenciados precisam existir antes da restauração.
+
+```sh
+RESTORE_DB=nexus_restore_check
+export PGHOST=host-do-postgres PGPORT=5432 PGUSER=postgres PGSSLMODE=require
+
+# Usa o banco administrativo apenas para criar o destino.
+PGDATABASE=postgres psql --no-psqlrc --password --set ON_ERROR_STOP=1 \
+  --command "CREATE DATABASE \"$RESTORE_DB\""
+
+# Com papéis e privilégios preparados, restaura sem --clean, --create,
+# --no-owner ou --no-acl: não sobrescreve o original e conserva o contrato.
+PGDATABASE="$RESTORE_DB" psql --no-psqlrc --password --set ON_ERROR_STOP=1 \
+  --file packages/database/scripts/production/00_prepare.sql
+PGDATABASE="$RESTORE_DB" pg_restore --password --exit-on-error \
+  --dbname="$RESTORE_DB" "$BACKUP_FILE"
+
+# Executa preflight, confere os checksums, reaplica apenas GRANTs conhecidos,
+# pula migrations já registradas e roda a verificação final, sem rotação.
+PGDATABASE="$RESTORE_DB" \
+  sh packages/database/scripts/production/install-production.sh
 ```
-/v1/health                  200  {"status":"ok"}
-/v1/ready                   200  {"status":"ready"}
-/v1/auth/login (certa)      200  token emitido
-/v1/assistants              200  YUI
-/v1/conversations (POST)    201  conversa criada
-/v1/conversations/:id       200
-/v1/auth/logout             200  {"ok":true}
+
+Todos os comandos acima herdam `PGHOST`, `PGPORT`, `PGUSER=postgres` e
+`PGSSLMODE`. Digite a senha administrativa nos prompts. Se a restauração ocorrer
+em um cluster novo, `00_prepare.sql` cria os logins sem senha. Antes de rodar
+o instalador, abra uma sessão administrativa interativa:
+
+```sh
+PGDATABASE=postgres psql --no-psqlrc --password --set ON_ERROR_STOP=1
 ```
 
-### 6.3 Cuidado com o bloqueio de login
+No prompt do `psql`, defina as credenciais e saia; registre-as no gerenciador de
+segredos. Não execute estes comandos em um cluster onde as senhas devam ser
+preservadas:
 
-`POST /v1/auth/login` **bloqueia por 15 minutos após 5 falhas**
-(`auth_login_state.locked_until`). Não repita o teste de senha errada em loop.
-Se travar:
-
-```sql
-DELETE FROM nexus.auth_login_state WHERE singleton = true;   -- como nexus_migrator
+```text
+\password nexus_migrator
+\password nexus_app
+\q
 ```
+
+Não use `--rotate-passwords` para contornar credenciais ausentes: a rotação é
+explícita e deve ser coordenada com os consumidores.
+
+Só considere o ensaio válido se `pg_restore` terminar sem erro e o instalador
+concluir a verificação de ledger, ownership, memberships, RLS e allowlist. Mantenha
+a origem e o backup até a aprovação operacional; cutover de aplicação ou alteração
+de infraestrutura são etapas separadas.
+
+### Recuperação de estado divergente
+
+Se uma migration antiga deixou um ledger parcial, se um checksum divergir ou se
+a verificação final falhar, não apague schemas nem tente adotar um ledger parcial.
+Preserve o estado e os logs sem credenciais, gere/identifique um backup aprovado,
+restaure-o em um destino isolado conforme o procedimento acima e valide-o antes
+de qualquer decisão sobre a origem. A opção `--adopt-legacy-ledger` é apenas para
+as oito migrations completas sem checksum, após `30_verify.sql`; ela não substitui
+um backup/restauração.
 
 ---
 
-## 7. Diagnóstico
+## 5. Transações, ledger e repetição segura
 
-### `must be able to SET ROLE "nexus_audit_writer"` (na 00007)
+`migrate.sh` exige `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` e um `PGPASSFILE`
+legível. O instalador configura essas variáveis internamente. A execução isolada
+do runner não aceita `PGPASSWORD` nem `NEXUS_MIGRATION_DATABASE_URL`.
 
-A fase 1 não foi executada, ou foi executada sem o `GRANT ... WITH SET TRUE`.
-Rode-a de novo; ela é idempotente. **Não** use superuser para contornar: aplica a
-00007 como superuser deixaria as funções com o dono errado e a 00008 depende de
-`record_deleted_entity` pertencer a `nexus_migrator`.
+- O runner confere a sequência imutável `00001`–`00008` e compara cada checksum
+  SHA-256 do ledger com o arquivo versionado local.
+- Um advisory lock PostgreSQL serializa o cheque, DDL e atualização do ledger
+  de cada migration.
+- `00001` e `00002`, que não abrem transação própria, são encapsuladas pelo
+  runner junto da inserção do ledger. `00003`–`00008` mantêm sua transação e o
+  runner insere a linha do ledger antes do `COMMIT` final. Assim, DDL e registro
+  da versão são confirmados ou revertidos juntos por migration.
+- Um erro interrompe o processo; migrations posteriores não começam. Uma
+  repetição só pula versões cujo nome e checksum coincidem exatamente.
+- Um ledger completo sem checksums requer a opção explícita de adoção acima.
+  `migrate.sh --check-only` é um diagnóstico somente-leitura: retorna `10` para
+  esse estado legado e zero para um ledger vazio/fresco ou checksummed válido.
 
-### `relation "nexus.auth_login_state" does not exist` na API
-
-O schema não foi aplicado, ou o Vercel aponta para outro banco. Confirme qual
-banco a API alcança:
-
-```sh
-curl -s "https://nexus-server-five.vercel.app/v1/ready?t=$(date +%s)"
-```
-
-Se der `503`, o `NEXUS_DATABASE_URL` do Vercel não chegou ao banco migrado.
-
-### `not_ready` logo após migrar, com `ready` no psql
-
-O Vercel guarda a variável por ambiente (production × preview) e não reinicia a
-função sozinho. Confirme que a variável foi alterada em **production** e faça
-redeploy.
-
-### Ledger com menos de 8 linhas (meio migrado)
-
-**Não reaproveite o banco.** Não rode `DROP SCHEMA` para recomeçar — isso destrói
-dado e não trata a causa. Primeiro identifique onde parou:
-
-```sql
-SELECT version, filename FROM nexus_migrations.schema_migrations ORDER BY version;
-```
-
-Se parou em 00001 ou 00002, a causa mais provável é falha de permissão no meio de
-um arquivo que roda em autocommit (essas duas não têm `BEGIN`/`COMMIT`; as demais
-têm). Se o schema já tem objetos, a reaplicação falha em `already exists`.
-
-Nesse caso a saída é uma instalação limpa num banco novo do Railway — **não**
-destrutiva para o banco atual, que pode ser removido só depois de a nova API
-estar validada. Me avise o ledger que aparecer e eu preparo o passo exato.
-
-### `password authentication failed` na fase 1
-
-A senha do `postgres` do Railway está em **Postgres → Variables** e é diferente da
-senha que você usa para entrar no painel. Consulte-a lá; não a cole no chat.
+Se o banco já recebeu uma tentativa antiga, deixe o instalador executar o
+preflight. Não comece aplicando SQL manualmente. Não use `DROP SCHEMA` para
+“recomeçar”: isso pode destruir dados e não corrige a causa original.
 
 ---
 
-## 8. O que ainda depende de você
+## 6. Resultado esperado da verificação final
 
-| Item | Por quê |
+`30_verify.sql` é uma verificação executável, não apenas um relatório. Com
+`ON_ERROR_STOP`, qualquer falha sai com código diferente de zero e o instalador
+não imprime `CONCLUÍDO`. Entre os invariantes conferidos estão:
+
+| Área | Contrato esperado |
 |---|---|
-| **Autorização** para tocar no banco real | combinado: não executo nada sem ela |
-| **Host e porta do Tcp Proxy** | não são segredo, mas eu não os tenho |
-| **Senha do `postgres`** | só você tem; é digitada no script, com eco desligado, e não passa por mim |
-| **Nova senha do `nexus_app`** | você define no script; é a que irá para o Vercel |
+| Ledger | Oito versões contíguas, nomes previstos e oito checksums SHA-256 válidos e iguais aos arquivos locais. |
+| Estrutura | 27 tabelas em `nexus`, 20 com `FORCE ROW LEVEL SECURITY`, 27 com chave primária e 49 policies esperadas. |
+| Dados iniciais | Um único `owner_identity` singleton com o ID previsto; nenhum provider fixture `test-free`/`test-paid`. |
+| Papéis | Atributos exatos, sem superuser/BYPASSRLS/replication ou membership inesperada; `nexus_anonymous` não recebe acesso ao schema privado. |
+| Ownership | Schema, ledger, relações, tipos e funções pertencem aos papéis previstos; a função de auditoria de tool grants pertence a `nexus_audit_writer`. |
+| Runtime | `nexus_app` tem somente os privilégios efetivos da allowlist; não pode alterar o catálogo persistente, forjar auditoria, criar objetos permanentes nem assumir outros papéis. O `TEMPORARY` padrão de `PUBLIC` continua permitido para objetos de sessão. ACLs padrão de `nexus_migrator`/`nexus_audit_writer` não podem conceder privilégios futuros a `PUBLIC` ou `nexus_app`. |
+| Objetos privilegiados | As três funções `SECURITY DEFINER` esperadas têm owner e `search_path` fixos; `PUBLIC` e `nexus_app` não podem executá-las. |
 
-Com esses quatro, o procedimento roda sem que nenhum segredo apareça no chat.
+Esses números são as expectativas codificadas no verificador, não uma alegação
+de que uma instalação de produção foi executada nesta revisão.
 
 ---
 
-## 9. Garantias do que está aqui
+## 7. Diagnóstico e recuperação
 
-Cada afirmação foi medida localmente, num cluster PostgreSQL com `scram-sha-256`
-obrigatório (o mesmo modo de autenticação do Railway):
+### `PREFLIGHT` ou `Unexpected output while reading migration ledger`
 
-| Garantia | Como foi provada |
-|---|---|
-| as 3 fases rodam de ponta a ponta num banco virgem | `applied=8`, ledger 1–8 |
-| idempotência | 2ª execução: `applied=0 skipped=8`, 0 erros nas fases 1 e 3 |
-| `nexus_migrator` não é superuser | `pg_roles` mostra `rolsuper = f` |
-| nenhuma fase 2/3 usa admin | o instalador só conecta como `nexus_migrator` |
-| SCRAM gerado localmente autentica | login real com a senha; hash como senha é recusado |
-| a senha não vaza em log | `grep` nos logs de sucesso e de falha: 0 ocorrências |
-| RLS isola | `nexus_app` sem contexto: 0 conversas; com contexto: 1 |
-| segundo owner é impossível | `CHECK` de singleton recusa a inserção |
-| a API funciona como `nexus_app` | 200/200/200/201/200/200 acima |
-| falha alta, sem mentir | senha errada → exit 1, sem fase 3, sem "CONCLUIDO" |
+Pare e leia a mensagem completa. O preflight verifica o administrador, papéis,
+memberships, ownership e a forma do ledger. `migrate.sh --check-only` verifica
+nomes/checksums contra os arquivos locais. Não altere senhas nem reaplique
+migrations até resolver a divergência indicada.
+
+### Papéis existentes com atributos ou memberships inesperados
+
+`00_prepare.sql` não executa `ALTER ROLE` corretivo e não remove memberships.
+Corrija a configuração manualmente, com aprovação e entendimento do efeito, ou
+use uma instalação/banco limpo conforme a política operacional. Execute o
+preflight novamente antes de prosseguir.
+
+### Migration falha
+
+Leia a primeira mensagem PostgreSQL e o estado do ledger. A migration que
+falhou e sua linha do ledger são revertidas juntas; versões anteriores que já
+foram confirmadas permanecem. Após corrigir a causa, use o mesmo instalador: ele
+validará o prefixo aplicado e só pulará linhas com nome e checksum idênticos.
+Se o estado vier de uma versão antiga do runner e estiver parcial/ambíguo,
+interrompa e faça recuperação manual com backup; não tente adotar um ledger
+parcial.
+
+### Fase 3 (GRANTs) falha após as migrations
+
+As migrations e o ledger já estão confirmados. Corrija a causa; depois, uma nova
+execução validará e pulará migrations já aplicadas, reaplicará os GRANTs
+conhecidos e fará a verificação final. O script não executa REVOKE para limpar
+privilégios adicionais.
+
+### Verificação final falha
+
+Não conecte a aplicação a esse banco até resolver o invariante. A verificação
+não corrige ownership/ACL automaticamente. Preserve logs sem credenciais e
+consulte o preflight/ledger e o runbook antes de qualquer ajuste manual.
+
+---
+
+## 8. Depois da instalação
+
+O sucesso do instalador cobre somente o banco. A variável de conexão da aplicação,
+qualquer mudança em Railway/Vercel e qualquer deploy são procedimentos separados,
+fora do escopo deste script. Não marque a aplicação como pronta apenas pela
+mensagem de conexão: use os testes de readiness e de fluxo da aplicação após a
+configuração independente do consumidor.

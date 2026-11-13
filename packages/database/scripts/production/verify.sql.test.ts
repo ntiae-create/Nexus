@@ -1,5 +1,8 @@
-import { execFileSync, execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /**
@@ -22,19 +25,48 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const adminUrl = process.env.NEXUS_TEST_ADMIN_URL;
 const describeIfPostgres = adminUrl ? describe : describe.skip;
 
-// `new URL(".").pathname` devolve um caminho com barras ("/a/b/"), que NAO
-// serve como nome de banco. O nome do banco descartavel e derivado apenas de
-// pid+timestamp, com caracteres seguros para identifier.
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
+// The database name is derived only from pid+timestamp. Test connections are
+// split into libpq fields (rather than passed as a URL in argv), matching the
+// production migration runner's interface. This test is opt-in and must point
+// only at an isolated loopback PostgreSQL test cluster (PostgreSQL 16+).
+// The separate bootstrap integration workflow is pinned to PostgreSQL 17.
 const here = `${dirname(fileURLToPath(import.meta.url))}/`;
+const preflightSql = `${here}00_preflight.sql`;
 const prepareSql = `${here}00_prepare.sql`;
 const verifySql = `${here}30_verify.sql`;
 const grantSql = `${here}20_grant_runtime.sql`;
 // sobe de scripts/production -> scripts -> database -> packages -> raiz
 const repoRoot = dirname(dirname(dirname(dirname(here))));
 const migrateSh = `${repoRoot}/packages/database/scripts/migrate.sh`;
+
+function parseAdminConnection(value: string | undefined) {
+  if (!value) return null;
+  const url = new URL(value);
+  if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+    throw new Error("NEXUS_TEST_ADMIN_URL precisa usar o protocolo PostgreSQL.");
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  const localHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  if (!localHost) {
+    throw new Error("NEXUS_TEST_ADMIN_URL é restrita a loopback; não aponte testes destrutivos para um host remoto.");
+  }
+  const sslmode = url.searchParams.get("sslmode") ?? "disable";
+  if (!["disable", "require", "verify-ca", "verify-full"].includes(sslmode)) {
+    throw new Error("NEXUS_TEST_ADMIN_URL precisa usar sslmode=disable/require/verify-ca/verify-full.");
+  }
+  const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+  if (!host || !database) throw new Error("NEXUS_TEST_ADMIN_URL precisa incluir host e banco administrativo.");
+  return {
+    host,
+    port: url.port || "5432",
+    database,
+    user: decodeURIComponent(url.username || "postgres"),
+    password: decodeURIComponent(url.password),
+    sslmode,
+  };
+}
+
+const adminConnection = parseAdminConnection(adminUrl);
 
 /**
  * Resolve o binario do psql. O ambiente de teste nem sempre tem psql no PATH
@@ -57,30 +89,88 @@ function resolverPsql(): string {
 
 const PSQL = adminUrl ? resolverPsql() : "psql";
 const RUN = `nexus_verify_test_${process.pid}_${Date.now()}`;
-const runUrl = adminUrl ? adminUrl.replace(/\/[^/?]+(\?.*)?$/, `/${RUN}`) : "";
-/**
- * URL de conexao como `nexus_migrator` (o papel que aplica as migrations).
- * A 00008 depende de `nexus_record_deleted_entity` pertencer a ele; migrar como
- * `postgres` produziria dono `postgres` e a verificacao — corretamente — falha.
- * O cluster de teste usa `trust`, entao nao ha senha.
- */
-function migratorUrl(): string {
-  return runUrl.replace(/^(postgres(?:ql)?:\/\/)[^@/]*@/, "$1nexus_migrator@");
+const RENAMED_APP_ROLE = `nexus_app_preflight_${process.pid}_${Date.now()}`;
+let testWorkdir: string | undefined;
+let testPassfile: string | undefined;
+
+function escapePassfile(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+}
+
+function connectionEnv(database: string, user: string): NodeJS.ProcessEnv {
+  if (!adminConnection) throw new Error("NEXUS_TEST_ADMIN_URL não foi configurada.");
+  if (!testWorkdir) {
+    testWorkdir = mkdtempSync(join(tmpdir(), "nexus-verify-test-"));
+    testPassfile = join(testWorkdir, "test.pgpass");
+    const users = [...new Set([adminConnection.user, "nexus_migrator", "nexus_app", "nexus_anonymous"])];
+    const rows = users.map((role) =>
+      `${escapePassfile(adminConnection.host)}:${escapePassfile(adminConnection.port)}:*:${escapePassfile(role)}:${escapePassfile(adminConnection.password)}`,
+    );
+    writeFileSync(testPassfile, `${rows.join("\n")}\n`, { mode: 0o600 });
+    chmodSync(testPassfile, 0o600);
+  }
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of ["PGPASSWORD", "PGSERVICE", "PGSERVICEFILE", "PGHOSTADDR", "PGOPTIONS", "NEXUS_MIGRATION_DATABASE_URL"]) {
+    delete env[key];
+  }
+  Object.assign(env, {
+    PGHOST: adminConnection.host,
+    PGPORT: adminConnection.port,
+    PGDATABASE: database,
+    PGUSER: user,
+    PGSSLMODE: adminConnection.sslmode,
+    PGPASSFILE: testPassfile,
+  });
+  return env;
+}
+
+function execPsql(args: string[], database: string, user: string): string {
+  return execFileSync(PSQL, args, {
+    encoding: "utf8",
+    env: connectionEnv(database, user),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 function psql(sql: string, opts: { stop?: boolean } = {}): string {
   const args = ["--no-psqlrc", "--quiet", "--tuples-only", "--no-align"];
   if (opts.stop !== false) args.push("--set", "ON_ERROR_STOP=1");
-  args.push("--dbname", runUrl, "--command", sql);
-  return execFileSync(PSQL, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  args.push("--command", sql);
+  return execPsql(args, RUN, adminConnection!.user);
 }
 
 function psqlFile(file: string): string {
-  return execFileSync(
-    PSQL,
-    ["--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1", "--dbname", runUrl, "--file", file],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  // Leitura pelo administrador mantém os testes de atributos do papel válidos:
+  // um LOGIN removido não deve impedir o próprio verificador de diagnosticar a divergência.
+  return execPsql(
+    ["--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1", "--file", file],
+    RUN,
+    adminConnection!.user,
   );
+}
+
+function migrationEnv(user: string): NodeJS.ProcessEnv {
+  const env = connectionEnv(RUN, user);
+  env.PSQL_BIN = PSQL;
+  env.NEXUS_MIGRATE_ASSUME_YES = "1";
+  return env;
+}
+
+function runMigrations(): void {
+  execFileSync("sh", [migrateSh], {
+    encoding: "utf8",
+    env: migrationEnv("nexus_migrator"),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function runMigrationOption(option: string, user: string): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("sh", [migrateSh, option], {
+    encoding: "utf8",
+    env: migrationEnv(user),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 /** Roda 30_verify.sql e devolve { ok, saida }. Nao lanca: a falha e o dado. */
@@ -94,6 +184,15 @@ function runVerify(): { ok: boolean; saida: string; erro: string } {
   }
 }
 
+function runPreflight(): { ok: boolean; saida: string; erro: string } {
+  try {
+    const saida = psqlFile(preflightSql);
+    return { ok: true, saida, erro: "" };
+  } catch (error) {
+    const e = error as { stdout?: string; stderr?: string };
+    return { ok: false, saida: e.stdout ?? "", erro: e.stderr ?? String(error) };
+  }
+}
 
 /**
  * Recria o banco descartavel do zero e aplica a sequencia real do procedimento:
@@ -105,14 +204,16 @@ function runVerify(): { ok: boolean; saida: string; erro: string } {
  * testes; recriar o banco e deterministico.
  */
 function reproduzirBancoInicial(): void {
-  const admin = adminUrl!;
-  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", admin, "-c",
-    `DROP DATABASE IF EXISTS ${RUN} WITH (FORCE)`, "-c", `CREATE DATABASE ${RUN}`],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const admin = adminConnection!.user;
+  execPsql(
+    ["--no-psqlrc", "--quiet", "--command", `DROP DATABASE IF EXISTS ${RUN} WITH (FORCE)`, "--command", `CREATE DATABASE ${RUN}`],
+    adminConnection!.database,
+    admin,
+  );
 
   // Os papeis sao objetos de CLUSTER: existem ou nao, independente do banco.
   // Recriar so o que falta mantem o teste repetivel num cluster reutilizado.
-  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c", `
+  execPsql(["--no-psqlrc", "--quiet", "--command", `
     DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='nexus_migrator') THEN
         CREATE ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
@@ -127,23 +228,22 @@ function reproduzirBancoInicial(): void {
         CREATE ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
       END IF;
     END $$;
-  `], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  `], RUN, admin);
 
   // Estado de atributos e memberships e global ao cluster. Cada caso comeca
   // dos quatro contratos completos, inclusive CREATEDB/CREATEROLE/INHERIT.
   for (const sql of [
-    "ALTER ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
-    "ALTER ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
-    "ALTER ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
-    "ALTER ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
+    "ALTER ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION",
+    "ALTER ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION",
+    "ALTER ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION",
+    "ALTER ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION",
   ]) {
-    execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c", sql],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    execPsql(["--no-psqlrc", "--quiet", "--command", sql], RUN, admin);
   }
 
   // Memberships tambem sao globais. Limpa toda aresta que toca os quatro
   // papeis para impedir que um teste mutante contamine os seguintes.
-  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c", `
+  execPsql(["--no-psqlrc", "--quiet", "--command", `
     DO $$
     DECLARE m record;
     BEGIN
@@ -158,42 +258,40 @@ function reproduzirBancoInicial(): void {
         EXECUTE format('REVOKE %I FROM %I', m.role_name, m.member_name);
       END LOOP;
     END $$;
-  `], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  `], RUN, admin);
 
   // CREATE porque o ledger (schema nexus) e criado pelo proprio migrator;
   // CONNECT porque sem isso ele nem se conecta. Espelha 00_prepare.sql:102.
-  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c",
-    `GRANT CREATE, CONNECT ON DATABASE ${RUN} TO nexus_migrator`],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  execPsql(["--no-psqlrc", "--quiet", "--command",
+    `GRANT CREATE, CONNECT ON DATABASE ${RUN} TO nexus_migrator`], RUN, admin);
 
   // O migrator precisa poder assumir o escritor (o ALTER FUNCTION ... OWNER TO
   // da 00007 depende disso). Na fase 1 real isso e um GRANT com SET TRUE.
-  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c",
-    "GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE, INHERIT FALSE"],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  execPsql(["--no-psqlrc", "--quiet", "--command",
+    "GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE, INHERIT FALSE"], RUN, admin);
 
   // Migrations aplicadas COMO nexus_migrator — e o dono dos objetos, e a 00008
   // exige que nexus_record_deleted_entity pertenca a ele.
-  execFileSync("sh", [migrateSh], {
-    encoding: "utf8",
-    env: { ...process.env, NEXUS_MIGRATION_DATABASE_URL: migratorUrl(), NEXUS_MIGRATE_ASSUME_YES: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  runMigrations();
 
   // Grants de runtime (fase 2) por ultimo.
-  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "--file", grantSql],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  execPsql(["--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1", "--file", grantSql], RUN, "nexus_migrator");
 }
 
 describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
   beforeAll(reproduzirBancoInicial, 120_000);
 
   afterAll(() => {
-    if (!adminUrl) return;
-    try {
-      execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", adminUrl, "-c",
-        `DROP DATABASE IF EXISTS ${RUN} WITH (FORCE)`], { stdio: "ignore" });
-    } catch { /* banco descartavel; nao falhar o job por limpeza */ }
+    if (adminConnection) {
+      try {
+        execPsql(
+          ["--no-psqlrc", "--quiet", "--command", `DROP DATABASE IF EXISTS ${RUN} WITH (FORCE)`],
+          adminConnection.database,
+          adminConnection.user,
+        );
+      } catch { /* banco descartavel; nao falhar o job por limpeza */ }
+    }
+    if (testWorkdir) rmSync(testWorkdir, { recursive: true, force: true });
   });
 
   it("banco valido PASSA", () => {
@@ -203,12 +301,100 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
     expect(r.saida).toContain("VERIFICACAO CONCLUIDA");
   });
 
-  it("segunda execucao continua idempotente e passa", () => {
-    execFileSync("sh", [migrateSh], {
+  it("preflight detecta ACL PUBLIC mesmo quando nexus_app ainda não existe", () => {
+    reproduzirBancoInicial();
+    psql("GRANT SELECT ON nexus.assistants TO PUBLIC");
+    let renamed = false;
+    try {
+      psql(`ALTER ROLE nexus_app RENAME TO ${RENAMED_APP_ROLE}`);
+      renamed = true;
+      const r = runPreflight();
+      expect(r.ok).toBe(false);
+      expect(r.erro).toMatch(/PUBLIC tem privilégio em tabela\/sequência/);
+    } finally {
+      if (renamed) psql(`ALTER ROLE ${RENAMED_APP_ROLE} RENAME TO nexus_app`);
+      psql("REVOKE SELECT ON nexus.assistants FROM PUBLIC");
+    }
+  }, 120_000);
+
+  it("preflight detecta acesso de nexus_anonymous ao schema privado", () => {
+    reproduzirBancoInicial();
+    psql("GRANT USAGE ON SCHEMA nexus TO nexus_anonymous");
+    const r = runPreflight();
+    expect(r.ok).toBe(false);
+    expect(r.erro).toMatch(/nexus_anonymous has USAGE on schema nexus/);
+  }, 120_000);
+
+  it("preflight rejeita ACLs padrão futuras para PUBLIC/nexus_app", () => {
+    reproduzirBancoInicial();
+    psql("ALTER DEFAULT PRIVILEGES FOR ROLE nexus_migrator IN SCHEMA nexus GRANT SELECT ON TABLES TO PUBLIC, nexus_app");
+    const r = runPreflight();
+    expect(r.ok).toBe(false);
+    expect(r.erro).toMatch(/default ACL grants privileges to PUBLIC or nexus_app/);
+  }, 120_000);
+
+  it("preflight rejeita EXECUTE público em SECURITY DEFINER", () => {
+    reproduzirBancoInicial();
+    psql("GRANT EXECUTE ON FUNCTION nexus.audit_tool_grant_change() TO PUBLIC");
+    const r = runPreflight();
+    expect(r.ok).toBe(false);
+    expect(r.erro).toMatch(/nexus_app can EXECUTE SECURITY DEFINER function nexus\.audit_tool_grant_change/);
+  }, 120_000);
+
+  it("preflight rejeita SECURITY DEFINER sem search_path fixo", () => {
+    reproduzirBancoInicial();
+    psql("ALTER FUNCTION nexus.audit_tool_grant_change() RESET search_path");
+    const r = runPreflight();
+    expect(r.ok).toBe(false);
+    expect(r.erro).toMatch(/lacks fixed search_path=pg_catalog/);
+  }, 120_000);
+
+  it("preflight rejeita ownership inesperado de SECURITY DEFINER", () => {
+    reproduzirBancoInicial();
+    psql(`GRANT CREATE ON SCHEMA nexus TO nexus_app;
+          ALTER FUNCTION nexus.audit_tool_grant_change() OWNER TO nexus_app;
+          REVOKE CREATE ON SCHEMA nexus FROM nexus_app`);
+    const r = runPreflight();
+    expect(r.ok).toBe(false);
+    expect(r.erro).toMatch(/ownership de uma ou mais funções de nexus diverge/);
+  }, 120_000);
+
+  it("preflight rejeita filename NULL no ledger", () => {
+    reproduzirBancoInicial();
+    psql(`ALTER TABLE nexus_migrations.schema_migrations ALTER COLUMN filename DROP NOT NULL;
+          UPDATE nexus_migrations.schema_migrations SET filename = NULL WHERE version = 1`);
+    const r = runPreflight();
+    expect(r.ok).toBe(false);
+    expect(r.erro).toMatch(/ledger divergente na versão 1/);
+  }, 120_000);
+
+  it("adota ledger legado completo somente depois da verificação integral", () => {
+    reproduzirBancoInicial();
+    psql("ALTER TABLE nexus_migrations.schema_migrations DROP COLUMN checksum");
+
+    const checkEnv = connectionEnv(RUN, adminConnection!.user);
+    checkEnv.PSQL_BIN = PSQL;
+    const check = spawnSync("sh", [migrateSh, "--check-only"], {
       encoding: "utf8",
-      env: { ...process.env, NEXUS_MIGRATION_DATABASE_URL: migratorUrl(), NEXUS_MIGRATE_ASSUME_YES: "1" },
+      env: checkEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    expect(check.status).toBe(10);
+    expect((check.stdout ?? "") + (check.stderr ?? "")).toContain("Legacy ledger");
+
+    const adoption = runMigrationOption("--adopt-legacy-ledger", "nexus_migrator");
+    expect(adoption.status, adoption.stdout + adoption.stderr).toBe(0);
+    expect(adoption.stdout + adoption.stderr).toContain("Legacy ledger verified and checksums recorded");
+    expect(runVerify().ok).toBe(true);
+
+    // A ledger agora tem hashes; a operação normal pula exatamente as oito
+    // migrations já verificadas, sem reaplicar DDL ou alterar dados.
+    runMigrations();
+    expect(runVerify().ok).toBe(true);
+  }, 120_000);
+
+  it("segunda execucao continua idempotente e passa", () => {
+    runMigrations();
     const r = runVerify();
     expect(r.ok).toBe(true);
   });
@@ -220,6 +406,12 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
       nome: "ledger com migration faltando",
       violar: "DELETE FROM nexus_migrations.schema_migrations WHERE version = 8",
       esperado: /ledger tem 7|versoes ausentes/,
+    },
+    {
+      nome: "ledger com filename nulo",
+      violar: `ALTER TABLE nexus_migrations.schema_migrations ALTER COLUMN filename DROP NOT NULL;
+               UPDATE nexus_migrations.schema_migrations SET filename = NULL WHERE version = 1`,
+      esperado: /filename diverge do contrato/,
     },
     {
       nome: "tabela faltando (contagem errada)",
@@ -265,9 +457,34 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
       violar: "GRANT INSERT ON nexus.assistants TO nexus_app",
       esperado: /escrita no catalogo/,
     },
+    {
+      nome: "nexus_anonymous recebe acesso ao schema privado",
+      violar: "GRANT USAGE ON SCHEMA nexus TO nexus_anonymous",
+      esperado: /nexus_anonymous tem USAGE no schema nexus/,
+    },
+    {
+      nome: "default ACL futuras concedem SELECT a PUBLIC e nexus_app",
+      violar: "ALTER DEFAULT PRIVILEGES FOR ROLE nexus_migrator IN SCHEMA nexus GRANT SELECT ON TABLES TO PUBLIC, nexus_app",
+      esperado: /default ACL grants privileges to PUBLIC or nexus_app/,
+    },
+    {
+      nome: "nexus_app pode executar SECURITY DEFINER",
+      violar: "GRANT EXECUTE ON FUNCTION nexus.audit_tool_grant_change() TO nexus_app",
+      esperado: /nexus_app can EXECUTE SECURITY DEFINER function nexus\.audit_tool_grant_change/,
+    },
+    {
+      nome: "SECURITY DEFINER perde search_path fixo",
+      violar: "ALTER FUNCTION nexus.audit_tool_grant_change() RESET search_path",
+      esperado: /lacks fixed search_path=pg_catalog/,
+    },
+    {
+      nome: "SECURITY DEFINER muda de owner",
+      violar: "ALTER FUNCTION nexus.audit_tool_grant_change() OWNER TO nexus_migrator",
+      esperado: /audit_tool_grant_change pertence a nexus_migrator, esperado nexus_audit_writer/,
+    },
   ];
 
-  // Cada um dos seis atributos e alterado isoladamente em cada papel.
+  // Cada um dos sete atributos e alterado isoladamente em cada papel.
   // Assim, o contrato nao pode regredir para a verificacao parcial anterior.
   const papeis = [
     { nome: "nexus_migrator", login: true },
@@ -282,6 +499,7 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
     { nome: "CREATEDB", habilitar: "CREATEDB", desabilitar: "NOCREATEDB" },
     { nome: "CREATEROLE", habilitar: "CREATEROLE", desabilitar: "NOCREATEROLE" },
     { nome: "INHERIT", habilitar: "INHERIT", desabilitar: "NOINHERIT" },
+    { nome: "REPLICATION", habilitar: "REPLICATION", desabilitar: "NOREPLICATION" },
   ];
   for (const papel of papeis) {
     for (const atributo of atributos) {
@@ -440,8 +658,9 @@ describe("30_verify.sql — estrutura do arquivo", () => {
     expect(conteudo).toMatch(/CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT/);
   });
 
-  it("tem RAISE EXCEPTION para cada familia de invariante", () => {
-    const conteudo = require("node:fs").readFileSync(verifySql, "utf8") as string;
+  it("tem RAISE EXCEPTION para cada família de invariante", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const conteudo = `${fs.readFileSync(verifySql, "utf8")}\n${fs.readFileSync(`${here}assert_app_privileges.sql`, "utf8")}`;
     for (const invariante of [
       /FALHA: ledger/,
       /FALHA: schema nexus tem/,
@@ -455,6 +674,10 @@ describe("30_verify.sql — estrutura do arquivo", () => {
       /FALHA: .*providers de teste/,
       /FALHA: nexus_app nao pode inserir/,
       /FALHA: nexus_app tem INSERT em tool_grant_audit/,
+      /FALHA: nexus_anonymous tem USAGE no schema nexus/,
+      /PREFLIGHT: default ACL grants privileges to PUBLIC or nexus_app/,
+      /nexus_app can EXECUTE SECURITY DEFINER function/,
+      /lacks fixed search_path=pg_catalog/,
     ]) {
       expect(conteudo).toMatch(invariante);
     }

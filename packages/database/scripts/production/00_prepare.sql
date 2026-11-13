@@ -20,6 +20,7 @@
 -- =============================================================================
 
 \set ON_ERROR_STOP on
+\ir 00_preflight.sql
 \echo '== Fase 1: papeis =='
 
 -- -----------------------------------------------------------------------------
@@ -32,7 +33,7 @@
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nexus_migrator') THEN
-    CREATE ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+    CREATE ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
     RAISE NOTICE 'nexus_migrator: criado';
   ELSE
     RAISE NOTICE 'nexus_migrator: ja existe (nada a fazer)';
@@ -50,7 +51,7 @@ $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nexus_audit_writer') THEN
-    CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+    CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
     RAISE NOTICE 'nexus_audit_writer: criado';
   ELSE
     RAISE NOTICE 'nexus_audit_writer: ja existe (atributos preservados; 30_verify.sql exige NOINHERIT)';
@@ -66,7 +67,7 @@ $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nexus_app') THEN
-    CREATE ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+    CREATE ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
     RAISE NOTICE 'nexus_app: criado';
   ELSE
     RAISE NOTICE 'nexus_app: ja existe (nada a fazer)';
@@ -83,7 +84,7 @@ $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nexus_anonymous') THEN
-    CREATE ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+    CREATE ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
     RAISE NOTICE 'nexus_anonymous: criado';
   ELSE
     RAISE NOTICE 'nexus_anonymous: ja existe (nada a fazer)';
@@ -116,7 +117,21 @@ $$;
 -- INHERIT FALSE e essencial: sem ele o migrator HERDA os privilegios do
 -- escritor, o que e privilegio a mais. SET TRUE e o unico poder necessario.
 -- -----------------------------------------------------------------------------
-GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE, INHERIT FALSE;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_auth_members am
+      JOIN pg_roles child ON child.oid = am.member
+      JOIN pg_roles parent ON parent.oid = am.roleid
+     WHERE child.rolname = 'nexus_migrator'
+       AND parent.rolname = 'nexus_audit_writer'
+       AND am.set_option AND NOT am.inherit_option AND NOT am.admin_option
+  ) THEN
+    EXECUTE 'GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE, INHERIT FALSE';
+  END IF;
+END
+$$;
 
 -- -----------------------------------------------------------------------------
 -- Relatorio de atributos. Nada e alterado: `ALTER ROLE ... NOSUPERUSER` exige
@@ -130,18 +145,11 @@ SELECT rolname,
        rolcanlogin  AS login,
        rolcreatedb  AS createdb,
        rolcreaterole AS createrole,
-       rolinherit AS inherit
+       rolinherit AS inherit,
+       rolreplication AS replication
   FROM pg_roles
  WHERE rolname IN ('nexus_migrator','nexus_app','nexus_anonymous','nexus_audit_writer')
  ORDER BY rolname;
 
 \echo ''
-\echo '== Fase 1 concluida. Proximo passo: definir as senhas (abaixo) e rodar as migrations. =='
-\echo ''
-\echo 'SENHAS — use o meta-comando de senha do psql (barra + password). Ele pede a senha sem eco,'
-\echo 'nao mostra o valor e nao deixa rastro no historico do shell:'
-\echo ''
-\echo '    \password nexus_migrator     (digite exatamente assim, com a barra)'
-\echo '    \password nexus_app'
-\echo ''
-\echo 'ANOTAR APENAS EM GERENCIADOR DE SEGREDOS. Nao colar no chat, no Git nem no shell.'
+\echo '== Fase 1 concluida. O instalador só define senhas ausentes ou explicitamente rotacionadas. =='

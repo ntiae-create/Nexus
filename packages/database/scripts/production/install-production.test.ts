@@ -1,181 +1,212 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-/**
- * O instalador precisa de duas garantias que ele NAO tinha, e que foram
- * encontradas em revisao do PR #14:
- *
- *   1. falha do psql na verificacao final produz exit code != 0;
- *   2. o instalador nunca imprime "CONCLUIDO" quando a verificacao falha.
- *
- * O defeito original era
- *
- *     psql ... --file 30_verify.sql 2>&1 | redact
- *
- * e o shell reporta o status do `redact` (sempre 0), nao do `psql`. Provar isso
- * com o script real exige um PostgreSQL; provar a PROPRIEDADE (que o script
- * trata o status do psql) pode ser feito com um psql falso, e e o que estes
- * testes fazem — sem depender de banco para rodar.
- *
- * Os testes com banco de verdade ficam em verify.sql.test.ts.
- */
-
 const here = new URL(".", import.meta.url).pathname;
 const script = `${here}install-production.sh`;
+const migrationDir = `${here}../../migrations`;
 
-describe("install-production.sh — falha na verificacao", () => {
+describe("install-production.sh — fluxo e falhas explícitas", () => {
   let fakeBin: string;
   let workdir: string;
+  let psqlPath: string;
 
   beforeAll(() => {
-    workdir = mkdtempSync(join(tmpdir(), "nexus-install-"));
+    workdir = mkdtempSync(join(tmpdir(), "nexus-install-production-test-"));
     fakeBin = join(workdir, "bin");
     execFileSync("mkdir", ["-p", fakeBin]);
+    psqlPath = join(fakeBin, "psql");
 
-    // `psql` falso: responde com sucesso a tudo, MENOS o arquivo 30_verify.sql,
-    // que falha com a mensagem de invariante que o script deve repassar.
-    // As senhas sao lidas de stdin pelo script; aqui ele nao e interativo.
+    // Modelo mínimo de psql: préflight/GRANTs passam, o scanner devolve um
+    // banco vazio antes das migrations e um ledger checksummed depois delas.
+    // Nenhuma conexão ou dado de produção é usado por este teste.
     const psql = `#!/bin/sh
-# --file <arquivo> ... : falha se o arquivo for 30_verify.sql
-for arg in "$@"; do
-  case "$arg" in
-    *30_verify.sql)
-      echo "psql:$arg: ERROR:  FALHA: ledger tem 7 migrations, esperado 8" >&2
-      exit 3
-      ;;
+set -eu
+file=
+command_text=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --file) file=$2; shift 2 ;;
+    --command|-c) command_text=$2; shift 2 ;;
+    *) shift ;;
   esac
 done
+
+if [ -n "$file" ]; then
+  case "$file" in
+    */00_preflight.sql)
+      if [ "$NEXUS_TEST_PREFLIGHT_FAIL" = 1 ]; then
+        echo "psql:$file: ERROR: PREFLIGHT_SENTINEL" >&2
+        exit 3
+      fi
+      ;;
+    */30_verify.sql)
+      if [ "$NEXUS_TEST_VERIFY_FAIL" = 1 ]; then
+        echo "psql:$file: ERROR: FALHA: ledger tem 7 migrations, esperado 8" >&2
+        exit 3
+      fi
+      echo "VERIFICACAO CONCLUIDA"
+      ;;
+    */scan.psql)
+      applied=0
+      if [ -f "$NEXUS_TEST_APPLIED_FILE" ]; then
+        applied=$(wc -l < "$NEXUS_TEST_APPLIED_FILE" | tr -d ' ')
+      fi
+      if [ "$applied" -eq 8 ]; then
+        echo 'META|nexus_exists=t'
+        echo 'META|ledger_exists=t'
+        echo 'META|has_checksum=t'
+        for migration in "$NEXUS_TEST_MIGRATION_DIR"/*.sql; do
+          name=$(basename "$migration")
+          version=$(printf '%s\\n' "$name" | cut -c1-5 | sed 's/^0*//')
+          checksum=$(sha256sum "$migration" | awk '{print $1}')
+          printf 'ROW|%s|%s|%s\\n' "$version" "$name" "$checksum"
+        done
+      else
+        echo 'META|nexus_exists=f'
+        echo 'META|ledger_exists=f'
+      fi
+      ;;
+    *)
+      version=$(grep -o 'NEXUS_MIGRATION_APPLY_[0-9]*' "$file" | head -n 1 | cut -d_ -f4 || true)
+      if [ -n "$version" ]; then
+        printf '%s\\n' "$version" >> "$NEXUS_TEST_APPLIED_FILE"
+        printf 'NEXUS_MIGRATION_APPLY_%s\\n' "$version"
+      fi
+      ;;
+  esac
+fi
+
+case "$command_text" in
+  *"rolname = 'nexus_migrator'"*) echo t ;;
+  *"rolname = 'nexus_app'"*) echo t ;;
+esac
 exit 0
 `;
-    writeFileSync(join(fakeBin, "psql"), psql);
-    chmodSync(join(fakeBin, "psql"), 0o755);
-
-    // `stty` falso: sem TTY nos testes, o script usa `stty -echo || true`.
-    writeFileSync(join(fakeBin, "stty"), "#!/bin/sh\nexit 0\n");
-    chmodSync(join(fakeBin, "stty"), 0o755);
+    writeFileSync(psqlPath, psql);
+    chmodSync(psqlPath, 0o755);
   });
 
   afterAll(() => {
     rmSync(workdir, { recursive: true, force: true });
   });
 
-  /** Alimenta as 4 senhas que o instalador pede e devolve o resultado. */
-  function run(opts: { verifyFails?: boolean } = {}): {
+  function run(opts: {
+    verifyFails?: boolean;
+    preflightFails?: boolean;
+    extraEnv?: Record<string, string | undefined>;
+  } = {}): {
     status: number | null;
     stdout: string;
     stderr: string;
+    applied: string[];
   } {
-    if (opts.verifyFails === false) {
-      // psql que sempre passa, para o caminho feliz
-      writeFileSync(join(fakeBin, "psql"), "#!/bin/sh\nexit 0\n");
-      chmodSync(join(fakeBin, "psql"), 0o755);
-    }
-    const r = spawnSync("sh", [script], {
-      encoding: "utf8",
-      input: "senha-admin-1234\nsenha-migrador-1234\nsenha-app-12345678\nsenha-migrador-1234\n",
-      env: {
-        ...process.env,
-        PATH: `${fakeBin}:${process.env.PATH}`,
-        PGHOST: "127.0.0.1",
-        PGPORT: "1",
-        PGDATABASE: "railway",
-        PSQL_BIN: join(fakeBin, "psql"),
-      },
+    const stateFile = join(workdir, `applied-${Date.now()}-${Math.random()}`);
+    writeFileSync(stateFile, "");
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.PGPASSWORD;
+    delete env.NEXUS_MIGRATION_DATABASE_URL;
+    Object.assign(env, {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      PGHOST: "127.0.0.1",
+      PGPORT: "5432",
+      PGDATABASE: "nexus_test",
+      PGSSLMODE: "require",
+      PSQL_BIN: psqlPath,
+      NEXUS_TEST_APPLIED_FILE: stateFile,
+      NEXUS_TEST_MIGRATION_DIR: migrationDir,
+      NEXUS_TEST_VERIFY_FAIL: opts.verifyFails ? "1" : "0",
+      NEXUS_TEST_PREFLIGHT_FAIL: opts.preflightFails ? "1" : "0",
+      ...opts.extraEnv,
     });
-    return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+    const input = "admin-test-secret-do-not-print\nmigrator-test-secret-do-not-print\n";
+    const result = spawnSync("sh", [script], { encoding: "utf8", input, env });
+    const applied = readFileSync(stateFile, "utf8").trim().split(/\s+/).filter(Boolean);
+    rmSync(stateFile, { force: true });
+    return {
+      status: result.status,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      applied,
+    };
   }
 
-  it("sai com codigo != 0 quando a verificacao falha", () => {
-    const r = run({ verifyFails: true });
-    expect(r.status).not.toBe(0);
+  it("sai com código != 0 se a verificação final falhar", () => {
+    const result = run({ verifyFails: true });
+    expect(result.status).not.toBe(0);
+    expect(result.applied).toHaveLength(8);
   });
 
-  it("NAO imprime CONCLUIDO quando a verificacao falha", () => {
-    const r = run({ verifyFails: true });
-    // A mensagem de falha vai para stderr (e diagnostico de erro); o que importa
-    // e que o sucesso NAO apareca em lugar nenhum.
-    expect(r.stdout).not.toContain("CONCLUIDO");
-    expect(r.stderr).toContain("VERIFICACAO FALHOU");
+  it("não imprime CONCLUÍDO quando a verificação falha", () => {
+    const result = run({ verifyFails: true });
+    expect(result.stdout + result.stderr).not.toContain("CONCLUÍDO");
+    expect(result.stderr).toContain("VERIFICAÇÃO FALHOU");
   });
 
   it("repassa a mensagem do invariante violado", () => {
-    const r = run({ verifyFails: true });
-    expect(r.stderr).toContain("FALHA: ledger tem 7 migrations, esperado 8");
+    const result = run({ verifyFails: true });
+    expect(result.stderr).toContain("FALHA: ledger tem 7 migrations, esperado 8");
   });
 
-  it("nao vaza senha nem URL com credencial no log de falha", () => {
-    const r = run({ verifyFails: true });
-    const tudo = r.stdout + r.stderr;
-    for (const segredo of [
-      "senha-admin-1234",
-      "senha-migrador-1234",
-      "senha-app-12345678",
+  it("não vaza credenciais do prompt nos logs", () => {
+    const result = run({ verifyFails: true });
+    const output = result.stdout + result.stderr;
+    for (const secret of [
+      "admin-test-secret-do-not-print",
+      "migrator-test-secret-do-not-print",
     ]) {
-      expect(tudo).not.toContain(segredo);
+      expect(output).not.toContain(secret);
     }
-    expect(tudo).not.toMatch(/postgresql:\/\/[^ :]+:[^ @]+@/);
+    expect(output).not.toMatch(/postgresql:\/\/[^ :]+:[^ @]+@/);
+  });
+
+  it("para no préflight antes de preparar papéis ou iniciar migrations", () => {
+    const result = run({ preflightFails: true });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("PREFLIGHT FALHOU");
+    expect(result.stderr).toContain("PREFLIGHT_SENTINEL");
+    expect(result.stderr).not.toContain("Senha atual/nova de nexus_migrator");
+    expect(result.applied).toHaveLength(0);
+  });
+
+  it("rejeita PGPASSWORD sem revelar seu valor", () => {
+    const result = run({ extraEnv: { PGPASSWORD: "environment-secret-do-not-print" } });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("PGPASSWORD não é aceito");
+    expect(result.stderr).not.toContain("environment-secret-do-not-print");
+    expect(result.applied).toHaveLength(0);
   });
 });
 
-describe("install-production.sh — estrutura (sem executar)", () => {
-  const conteudo = readFileSync(script, "utf8");
+describe("install-production.sh — contrato estrutural", () => {
+  const content = readFileSync(script, "utf8");
 
-  it("nao usa pipe para o psql da verificacao", () => {
-    // A regressao exata: `psql ... --file 30_verify.sql 2>&1 | redact` faz o
-    // status vir do `redact` (sempre 0). O comando do psql se estende por
-    // continuadores de linha, entao a checagem e feita no bloco inteiro:
-    // pega da mencao a 30_verify.sql ate o fim do comando (a primeira linha
-    // que nao termina em barra invertida).
-    const linhas = conteudo.split("\n");
-    const idx = linhas.findIndex((l) => l.includes("30_verify.sql") && l.includes("--file"));
-    expect(idx).toBeGreaterThan(-1);
-
-    // Junta o comando completo a partir de algumas linhas antes.
-    let bloco = "";
-    for (let i = idx; i < linhas.length; i++) {
-      const l = linhas[i];
-      if (l.trimStart().startsWith("#")) continue;
-      bloco += l;
-      if (!l.trimEnd().endsWith("\\")) break;
-      bloco += " ";
-    }
-    // Dentro do comando que roda o verificador nao pode haver pipe.
-    expect(bloco).not.toMatch(/\|\s*redact/);
-    expect(bloco).not.toMatch(/\|\s*$/);
+  it("usa passfiles privados e rejeita URLs/PGPASSWORD", () => {
+    expect(content).toContain("chmod 600 \"$target_file\"");
+    expect(content).toContain("PGPASSFILE=\"$admin_passfile\"");
+    expect(content).toContain("PGPASSFILE=\"$migrator_passfile\"");
+    expect(content).toContain("NEXUS_MIGRATION_DATABASE_URL");
+    expect(content).toContain("PGPASSWORD não é aceito");
+    const slash = String.fromCharCode(92);
+    expect(content).toContain(`--command '${slash}password nexus_migrator'`);
+    expect(content).toContain(`--command '${slash}password nexus_app'`);
+    expect(content).not.toContain(`--command '${slash}${slash}password`);
   });
 
-  it("checa o status da verificacao explicitamente", () => {
-    expect(conteudo).toMatch(/if ! PGPASSWORD=\$PW_migrator_pw[\s\S]{0,400}30_verify\.sql[\s\S]{0,200}then/);
-    expect(conteudo).toContain("VERIFICACAO FALHOU");
-    expect(conteudo).toContain("exit 1");
+  it("confere explicitamente o status da verificação antes do sucesso", () => {
+    expect(content).toContain('if ! run_migrator_file "$verify_sql" "$verify_log"; then');
+    const failure = content.indexOf("VERIFICAÇÃO FALHOU");
+    const success = content.indexOf('echo "CONCLUÍDO');
+    expect(failure).toBeGreaterThan(0);
+    expect(success).toBeGreaterThan(failure);
+    expect(content).toContain("--set ON_ERROR_STOP=1");
   });
 
-  it("o CONCLUIDO so aparece depois do bloco de falha da verificacao", () => {
-    const falha = conteudo.indexOf("VERIFICACAO FALHOU");
-    const concluido = conteudo.indexOf('echo "CONCLUIDO"');
-    expect(falha).toBeGreaterThan(0);
-    expect(concluido).toBeGreaterThan(falha);
+  it("não reescreve senhas existentes sem a opção de rotação", () => {
+    expect(content).toContain("--rotate-passwords");
+    expect(content).toContain('[ "$migrator_existed" -eq 1 ] || set_migrator_password=1');
+    expect(content).toContain('[ "$app_existed" -eq 1 ] || set_app_password=1');
   });
-
-  it("usa ON_ERROR_STOP na verificacao", () => {
-    expect(conteudo).toMatch(/--set ON_ERROR_STOP=1[\s\S]{0,120}30_verify\.sql/);
-  });
-});
-
-describe("arquivos de producao — presenca e nomes reais", () => {
-  const arquivos = [
-    "00_prepare.sql",
-    "20_grant_runtime.sql",
-    "30_verify.sql",
-    "install-production.sh",
-  ];
-
-  for (const f of arquivos) {
-    it(`existe: ${f}`, () => {
-      expect(existsSync(`${here}${f}`)).toBe(true);
-    });
-  }
 });
