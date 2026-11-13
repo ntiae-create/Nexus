@@ -1,11 +1,34 @@
 import pg from "pg";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SYNTHETIC_TEST_CA_PEM } from "../../tests/fixtures/private-ca.js";
 import { requirePostgresTls } from "./connection-string.js";
 import { closePool, createPool } from "./pool.js";
 
 const remoteUrl = "postgresql://nexus_app:do-not-print@db.example.com:5432/nexus";
+const railwayUrl =
+  "postgresql://nexus_app@crossover.proxy.rlwy.net:20087/nexus?sslmode=require&application_name=nexus-test";
+const syntheticCa = SYNTHETIC_TEST_CA_PEM;
+const privateCaEnvName = "NEXUS_DATABASE_SSL_CA";
+const servernameEnvName = "NEXUS_DATABASE_SSL_SERVERNAME";
 
 describe("requirePostgresTls", () => {
+  let originalPrivateCa: string | undefined;
+  let originalServername: string | undefined;
+
+  beforeEach(() => {
+    originalPrivateCa = process.env[privateCaEnvName];
+    originalServername = process.env[servernameEnvName];
+    delete process.env[privateCaEnvName];
+    delete process.env[servernameEnvName];
+  });
+
+  afterEach(() => {
+    if (originalPrivateCa === undefined) delete process.env[privateCaEnvName];
+    else process.env[privateCaEnvName] = originalPrivateCa;
+    if (originalServername === undefined) delete process.env[servernameEnvName];
+    else process.env[servernameEnvName] = originalServername;
+  });
+
   it("defaults remote PostgreSQL URLs to TLS with hostname verification", () => {
     const result = new URL(requirePostgresTls(`${remoteUrl}?application_name=nexus-test`));
 
@@ -20,6 +43,91 @@ describe("requirePostgresTls", () => {
     try {
       const options = (pool as unknown as { options: { connectionString: string } }).options;
       expect(new URL(options.connectionString).searchParams.get("sslmode")).toBe("verify-full");
+    } finally {
+      await closePool(pool);
+    }
+  });
+
+  it("uses the private CA and internal TLS hostname without replacing the public TCP target", async () => {
+    process.env[privateCaEnvName] = syntheticCa;
+    process.env[servernameEnvName] = "postgres.railway.internal";
+
+    const pool = createPool({ connectionString: railwayUrl });
+    try {
+      const options = (pool as unknown as {
+        options: {
+          connectionString: string;
+          ssl?: { ca?: string; servername?: string; rejectUnauthorized?: boolean };
+        };
+      }).options;
+      const target = new URL(options.connectionString);
+
+      expect(target.hostname).toBe("crossover.proxy.rlwy.net");
+      expect(target.port).toBe("20087");
+      expect(target.searchParams.get("application_name")).toBe("nexus-test");
+      expect(target.searchParams.has("sslmode")).toBe(false);
+      expect(options.ssl).toEqual({
+        ca: syntheticCa,
+        servername: "postgres.railway.internal",
+        rejectUnauthorized: true,
+      });
+
+      // Check the options node-postgres will actually use. Its URL parser would
+      // otherwise replace a top-level SSL object when SSL query parameters exist.
+      const client = new pg.Client({
+        connectionString: options.connectionString,
+        ssl: options.ssl,
+      });
+      expect(client.connectionParameters.ssl).toMatchObject({
+        ca: syntheticCa,
+        servername: "postgres.railway.internal",
+        rejectUnauthorized: true,
+      });
+    } finally {
+      await closePool(pool);
+    }
+  });
+
+  it.each([
+    { ca: syntheticCa, servername: undefined },
+    { ca: undefined, servername: "postgres.railway.internal" },
+  ])("rejects incomplete private CA configuration", ({ ca, servername }) => {
+    if (ca === undefined) delete process.env[privateCaEnvName];
+    else process.env[privateCaEnvName] = ca;
+    if (servername === undefined) delete process.env[servernameEnvName];
+    else process.env[servernameEnvName] = servername;
+
+    expect(() => createPool({ connectionString: railwayUrl })).toThrow(
+      /NEXUS_DATABASE_SSL_CA and NEXUS_DATABASE_SSL_SERVERNAME must be configured together/,
+    );
+  });
+
+  it("rejects a structurally invalid private CA PEM", () => {
+    process.env[privateCaEnvName] =
+      "-----BEGIN CERTIFICATE-----\nnot-a-real-certificate\n-----END CERTIFICATE-----";
+    process.env[servernameEnvName] = "postgres.railway.internal";
+
+    expect(() => createPool({ connectionString: railwayUrl })).toThrow(
+      /NEXUS_DATABASE_SSL_CA must contain structurally valid PEM CA certificate/,
+    );
+  });
+
+  it("preserves URL-based verified TLS when private CA variables are absent", async () => {
+    const pool = createPool({ connectionString: railwayUrl });
+    try {
+      const options = (pool as unknown as {
+        options: { connectionString: string; ssl?: unknown };
+      }).options;
+      const connectionString = new URL(options.connectionString);
+      expect(connectionString.hostname).toBe("crossover.proxy.rlwy.net");
+      expect(connectionString.port).toBe("20087");
+      expect(connectionString.searchParams.get("sslmode")).toBe("verify-full");
+      expect(options.ssl).toBeUndefined();
+
+      const client = new pg.Client({ connectionString: options.connectionString });
+      const ssl = client.connectionParameters.ssl;
+      expect(ssl).not.toBe(false);
+      if (typeof ssl === "object") expect(ssl.rejectUnauthorized).not.toBe(false);
     } finally {
       await closePool(pool);
     }

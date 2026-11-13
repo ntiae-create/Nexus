@@ -1,5 +1,6 @@
 import pg from "pg";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SYNTHETIC_TEST_CA_PEM } from "./test-fixtures/private-ca.js";
 import { buildApp } from "../app.js";
 import {
   AUTH_POOL_OPTIONS,
@@ -8,11 +9,26 @@ import {
   postgresAuthStore,
 } from "./postgres-store.js";
 
+const syntheticCa = SYNTHETIC_TEST_CA_PEM;
+
 describe("PostgreSQL auth pool", () => {
   const pools: Array<{ end(): Promise<void> }> = [];
+  let originalCa: string | undefined;
+  let originalServername: string | undefined;
+
+  beforeEach(() => {
+    originalCa = process.env.NEXUS_DATABASE_SSL_CA;
+    originalServername = process.env.NEXUS_DATABASE_SSL_SERVERNAME;
+    delete process.env.NEXUS_DATABASE_SSL_CA;
+    delete process.env.NEXUS_DATABASE_SSL_SERVERNAME;
+  });
 
   afterEach(async () => {
     await Promise.all(pools.splice(0).map((pool) => pool.end()));
+    if (originalCa === undefined) delete process.env.NEXUS_DATABASE_SSL_CA;
+    else process.env.NEXUS_DATABASE_SSL_CA = originalCa;
+    if (originalServername === undefined) delete process.env.NEXUS_DATABASE_SSL_SERVERNAME;
+    else process.env.NEXUS_DATABASE_SSL_SERVERNAME = originalServername;
   });
 
   it("requires verified TLS for remote auth connections and uses bounded timeouts", () => {
@@ -34,6 +50,49 @@ describe("PostgreSQL auth pool", () => {
     expect(options.max).toBe(AUTH_POOL_OPTIONS.max);
     expect(options.idleTimeoutMillis).toBe(AUTH_POOL_OPTIONS.idleTimeoutMillis);
     expect(options.connectionTimeoutMillis).toBe(AUTH_POOL_OPTIONS.connectionTimeoutMillis);
+  });
+
+  it("uses the private CA and internal servername for the authentication pool", () => {
+    const previousCa = process.env.NEXUS_DATABASE_SSL_CA;
+    const previousServername = process.env.NEXUS_DATABASE_SSL_SERVERNAME;
+    process.env.NEXUS_DATABASE_SSL_CA = syntheticCa;
+    process.env.NEXUS_DATABASE_SSL_SERVERNAME = "postgres.railway.internal";
+
+    try {
+      const pool = createPostgresAuthPool(
+        "postgresql://nexus_app@crossover.proxy.rlwy.net:20087/nexus?sslmode=require",
+      );
+      pools.push(pool);
+      const options = (pool as unknown as {
+        options: {
+          connectionString: string;
+          ssl?: { ca?: string; servername?: string; rejectUnauthorized?: boolean };
+        };
+      }).options;
+      const target = new URL(options.connectionString);
+
+      expect(target.hostname).toBe("crossover.proxy.rlwy.net");
+      expect(target.port).toBe("20087");
+      expect(options.ssl).toEqual({
+        ca: syntheticCa,
+        servername: "postgres.railway.internal",
+        rejectUnauthorized: true,
+      });
+      const client = new pg.Client({
+        connectionString: options.connectionString,
+        ssl: options.ssl,
+      }) as unknown as { connectionParameters: { ssl: unknown } };
+      expect(client.connectionParameters.ssl).toMatchObject({
+        ca: syntheticCa,
+        servername: "postgres.railway.internal",
+        rejectUnauthorized: true,
+      });
+    } finally {
+      if (previousCa === undefined) delete process.env.NEXUS_DATABASE_SSL_CA;
+      else process.env.NEXUS_DATABASE_SSL_CA = previousCa;
+      if (previousServername === undefined) delete process.env.NEXUS_DATABASE_SSL_SERVERNAME;
+      else process.env.NEXUS_DATABASE_SSL_SERVERNAME = previousServername;
+    }
   });
 
   it("refuses a remote auth URL that explicitly disables TLS", () => {
