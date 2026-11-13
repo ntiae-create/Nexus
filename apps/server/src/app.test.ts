@@ -79,6 +79,22 @@ describe("GET /v1/ready", () => {
     }
   });
 
+  it("returns 503 without exposing an incomplete migration ledger", async () => {
+    const app = buildApp({
+      checkDatabase: async () => {
+        throw new Error("migration 8 checksum mismatch in nexus_migrations.schema_migrations");
+      },
+    });
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/ready" });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({ status: "not_ready" });
+      expect(response.body).not.toMatch(/migration|checksum|nexus_migrations/i);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("invokes the probe on each readiness request", async () => {
     const checkDatabase = vi.fn(async () => undefined);
     const app = buildApp({ checkDatabase });

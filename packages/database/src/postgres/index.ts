@@ -23,8 +23,14 @@ export interface PostgresNexusDatabase extends NexusDatabase {
    */
   close(): Promise<void>;
   /**
-   * Verifies the pool can obtain a connection and run a trivial query.
-   * Used only for process readiness / bootstrap — not a business SQL surface.
+   * Verifies the pool can obtain a connection and that the checksummed ledger
+   * contains the exact required migrations 00001–00008. It calls the narrowly
+   * granted `nexus.migration_ledger_ready()` SECURITY DEFINER function; the
+   * runtime role never reads `nexus_migrations` directly.
+   *
+   * Any missing function, inaccessible/malformed ledger, absent migration, or
+   * checksum mismatch rejects readiness. Used only for process readiness /
+   * bootstrap — not a business SQL surface.
    */
   checkConnectivity(): Promise<void>;
 }
@@ -71,7 +77,17 @@ export function createPostgresDatabase(
     }
     const client = await pool.connect();
     try {
-      await client.query("SELECT 1");
+      // The function returns a single boolean and deliberately hides ledger
+      // details. A missing/inaccessible function or any query error also fails
+      // readiness and is translated to HTTP 503 by the route.
+      const result = await client.query<{ migrations_ready: boolean | null }>(
+        "SELECT nexus.migration_ledger_ready() AS migrations_ready",
+      );
+      if (result.rows[0]?.migrations_ready !== true) {
+        throw new Error(
+          "PostgreSQL is reachable but its required checksummed migrations are not ready",
+        );
+      }
     } finally {
       client.release();
     }

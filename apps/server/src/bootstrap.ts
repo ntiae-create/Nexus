@@ -79,9 +79,29 @@ export interface BootstrappedServer {
 }
 
 /**
+ * Connection-pool sizing for a serverless runtime.
+ *
+ * A long-lived server uses a data pool of up to 10 connections plus a separate
+ * one-connection authentication pool. Serverless platforms run several
+ * instances concurrently; each is limited to 2 data connections plus 1 auth
+ * connection, for a combined ceiling of 3 per instance. Without
+ * accounting for both pools, the total grows as `instances x pools x max` and
+ * can exhaust a managed PostgreSQL before traffic is heavy. Two data connections
+ * still allow a request and a nested read to run concurrently.
+ *
+ * The 5s idle timeout on both pools bounds how long they retain unused
+ * connections; Vercel controls instance suspension.
+ */
+export const SERVERLESS_POOL_OPTIONS = {
+  max: 2,
+  idleTimeoutMillis: 5_000,
+  connectionTimeoutMillis: 10_000,
+} as const;
+
+/**
  * Builds the Fastify application for a serverless runtime. PostgreSQL is
  * created and checked only when /v1/ready is requested, so app initialization
- * and /v1/health do not depend on Neon availability.
+ * and /v1/health do not depend on database availability.
  */
 export function createServerlessApp(
   env: BootstrapEnv = process.env,
@@ -89,7 +109,11 @@ export function createServerlessApp(
 ): FastifyInstance {
   const createDatabase =
     deps.createDatabase ??
-    ((url: string) => createServerDatabase({ connectionString: url }));
+    ((url: string) =>
+      createServerDatabase({
+        connectionString: url,
+        ...SERVERLESS_POOL_OPTIONS,
+      }));
   const build =
     deps.buildApp ?? ((options?: BuildAppOptions) => buildApp(options));
   let db: PostgresNexusDatabase | undefined;
