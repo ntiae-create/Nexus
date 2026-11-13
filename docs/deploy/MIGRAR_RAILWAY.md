@@ -19,7 +19,7 @@ e qualquer alteração de infraestrutura são etapas externas a este instalador.
 | 2 | `postgres` | `00_prepare.sql` | Repete o preflight; cria somente papéis ausentes e concede as permissões administrativas mínimas. Não altera atributos de papéis existentes nem muda ownership. |
 | 3 | `postgres` | `psql \password` iniciado pelo instalador, quando necessário | Define senhas apenas para logins recém-criados ou com `--rotate-passwords` explícito. Senhas existentes são preservadas por padrão. |
 | 4 | `nexus_migrator` | `migrate.sh` | Aplica ou verifica as oito migrations e registra SHA-256 no ledger. |
-| 5 | `nexus_migrator` | `20_grant_runtime.sql` | Concede a allowlist de privilégios de runtime a `nexus_app`; não revoga privilégios. |
+| 5 | `nexus_migrator` | `20_grant_runtime.sql` | Concede a allowlist de runtime e instala a função restrita de readiness; o único `REVOKE` fixa a ACL mínima dessa função. |
 | 6 | `nexus_migrator` | `30_verify.sql` | Confirma ledger, ownership, papéis, RLS, policies e allowlist efetiva. Qualquer invariante obrigatório divergente causa erro e exit code diferente de zero. |
 
 O administrador não executa migrations. `nexus_migrator` não é superuser,
@@ -237,6 +237,14 @@ do runner não aceita `PGPASSWORD` nem `NEXUS_MIGRATION_DATABASE_URL`.
 
 - O runner confere a sequência imutável `00001`–`00008` e compara cada checksum
   SHA-256 do ledger com o arquivo versionado local.
+- A fase 3 instala `nexus.migration_ledger_ready()`: função `SECURITY DEFINER`
+  sem argumentos, owned por `nexus_migrator`, com `search_path=pg_catalog` e
+  ACL restrita a `nexus_app`. Ela retorna apenas um booleano, comparando todas
+  as oito versões, nomes e SHA-256 esperados; erro, ledger ausente/inacessível,
+  lacuna ou divergência resultam em `false`. `nexus_app` não recebe `USAGE` nem
+  `SELECT` no schema/tabela `nexus_migrations`.
+- `/v1/ready` chama somente essa função. Ledger incompleto/inconsistente ou
+  função ausente faz a rota responder `503`; nenhum detalhe do ledger é exposto.
 - Um advisory lock PostgreSQL serializa o cheque, DDL e atualização do ledger
   de cada migration.
 - `00001` e `00002`, que não abrem transação própria, são encapsuladas pelo
@@ -267,9 +275,9 @@ não imprime `CONCLUÍDO`. Entre os invariantes conferidos estão:
 | Estrutura | 27 tabelas em `nexus`, 20 com `FORCE ROW LEVEL SECURITY`, 27 com chave primária e 49 policies esperadas. |
 | Dados iniciais | Um único `owner_identity` singleton com o ID previsto; nenhum provider fixture `test-free`/`test-paid`. |
 | Papéis | Atributos exatos, sem superuser/BYPASSRLS/replication ou membership inesperada; `nexus_anonymous` não recebe acesso ao schema privado. |
-| Ownership | Schema, ledger, relações, tipos e funções pertencem aos papéis previstos; a função de auditoria de tool grants pertence a `nexus_audit_writer`. |
-| Runtime | `nexus_app` tem somente os privilégios efetivos da allowlist; não pode alterar o catálogo persistente, forjar auditoria, criar objetos permanentes nem assumir outros papéis. O `TEMPORARY` padrão de `PUBLIC` continua permitido para objetos de sessão. ACLs padrão de `nexus_migrator`/`nexus_audit_writer` não podem conceder privilégios futuros a `PUBLIC` ou `nexus_app`. |
-| Objetos privilegiados | As três funções `SECURITY DEFINER` esperadas têm owner e `search_path` fixos; `PUBLIC` e `nexus_app` não podem executá-las. |
+| Ownership | Schema, ledger, relações, tipos e funções pertencem aos papéis previstos; a função de auditoria de tool grants pertence a `nexus_audit_writer`, e a função de readiness a `nexus_migrator`. |
+| Runtime | `nexus_app` tem somente os privilégios efetivos da allowlist; não pode alterar o catálogo persistente, consultar diretamente `nexus_migrations`, forjar auditoria, criar objetos permanentes nem assumir outros papéis. Pode executar somente a função `SECURITY DEFINER` autorizada para readiness. O `TEMPORARY` padrão de `PUBLIC` continua permitido para objetos de sessão. ACLs padrão de `nexus_migrator`/`nexus_audit_writer` não podem conceder privilégios futuros a `PUBLIC` ou `nexus_app`. |
+| Objetos privilegiados | As quatro funções `SECURITY DEFINER` esperadas têm owner e `search_path` fixos; `PUBLIC` não pode executá-las e `nexus_app` só pode executar `nexus.migration_ledger_ready()`. |
 
 Esses números são as expectativas codificadas no verificador, não uma alegação
 de que uma instalação de produção foi executada nesta revisão.
@@ -306,8 +314,10 @@ parcial.
 
 As migrations e o ledger já estão confirmados. Corrija a causa; depois, uma nova
 execução validará e pulará migrations já aplicadas, reaplicará os GRANTs
-conhecidos e fará a verificação final. O script não executa REVOKE para limpar
-privilégios adicionais.
+conhecidos e fará a verificação final. O script não limpa privilégios adicionais
+de tabelas ou esquemas; ele revoga somente EXECUTE de `PUBLIC`/`nexus_app` na
+função de readiness antes de concedê-lo apenas a `nexus_app`. ACLs inesperadas
+em outros objetos continuam sendo detectadas pelo preflight/verificador.
 
 ### Verificação final falha
 

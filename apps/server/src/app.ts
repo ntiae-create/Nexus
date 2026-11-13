@@ -13,8 +13,8 @@ export type DatabaseReadinessProbe = () => Promise<void>;
 export interface BuildAppOptions {
   /**
    * Optional probe used by GET /v1/ready.
-   * Must resolve when PostgreSQL is reachable; reject otherwise.
-   * Must not leak connection strings or credentials in thrown errors that reach clients.
+   * Must resolve only when PostgreSQL and the required checksummed schema are ready.
+   * Must not leak connection strings, ledger data, or credentials to clients.
    */
   checkDatabase?: DatabaseReadinessProbe;
   auth?: AuthPluginOptions;

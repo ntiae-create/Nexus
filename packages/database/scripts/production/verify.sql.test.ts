@@ -139,6 +139,10 @@ function psql(sql: string, opts: { stop?: boolean } = {}): string {
   return execPsql(args, RUN, adminConnection!.user);
 }
 
+function readinessAsApp(): boolean {
+  return psql("SET ROLE nexus_app; SELECT nexus.migration_ledger_ready(); RESET ROLE").trim() === "t";
+}
+
 function psqlFile(file: string): string {
   // Leitura pelo administrador mantém os testes de atributos do papel válidos:
   // um LOGIN removido não deve impedir o próprio verificador de diagnosticar a divergência.
@@ -300,6 +304,59 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
     expect(r.ok).toBe(true);
     expect(r.saida).toContain("VERIFICACAO CONCLUIDA");
   });
+
+  it("readiness aprova o ledger checksummed completo via nexus_app", () => {
+    expect(readinessAsApp()).toBe(true);
+  });
+
+  it("readiness reprova uma migration ausente", () => {
+    reproduzirBancoInicial();
+    psql("DELETE FROM nexus_migrations.schema_migrations WHERE version = 8");
+    expect(readinessAsApp()).toBe(false);
+  }, 120_000);
+
+  it("readiness reprova checksum divergente", () => {
+    reproduzirBancoInicial();
+    psql("UPDATE nexus_migrations.schema_migrations SET checksum = pg_catalog.repeat('0', 64) WHERE version = 1");
+    expect(readinessAsApp()).toBe(false);
+  }, 120_000);
+
+  it("readiness reprova ledger inexistente sem expor erro do catálogo", () => {
+    reproduzirBancoInicial();
+    psql("DROP TABLE nexus_migrations.schema_migrations");
+    expect(readinessAsApp()).toBe(false);
+  }, 120_000);
+
+  it("readiness reprova ledger inacessível ao owner da função", () => {
+    reproduzirBancoInicial();
+    psql(`ALTER TABLE nexus_migrations.schema_migrations OWNER TO CURRENT_USER;
+          REVOKE ALL ON TABLE nexus_migrations.schema_migrations FROM nexus_migrator`);
+    expect(readinessAsApp()).toBe(false);
+  }, 120_000);
+
+  it("nexus_app não consegue consultar diretamente o ledger", () => {
+    reproduzirBancoInicial();
+    expect(psql("SELECT has_table_privilege('nexus_app', 'nexus_migrations.schema_migrations', 'SELECT')").trim()).toBe("f");
+    expect(() => psql("SET ROLE nexus_app; SELECT version FROM nexus_migrations.schema_migrations"))
+      .toThrow(/permission denied/);
+  }, 120_000);
+
+  it("nexus_app só executa a função SECURITY DEFINER autorizada", () => {
+    reproduzirBancoInicial();
+    const privileges = psql(`
+      SELECT has_table_privilege('nexus_app', 'nexus_migrations.schema_migrations', 'SELECT')::text || '|'
+          || has_function_privilege('nexus_app', 'nexus.migration_ledger_ready()', 'EXECUTE')::text || '|'
+          || has_function_privilege('public', 'nexus.migration_ledger_ready()', 'EXECUTE')::text || '|'
+          || (SELECT count(*)::text
+                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'nexus' AND p.prosecdef
+                 AND has_function_privilege('nexus_app', p.oid, 'EXECUTE'))
+    `).trim();
+    expect(privileges).toBe("false|true|false|1");
+    expect(readinessAsApp()).toBe(true);
+    expect(() => psql("SET ROLE nexus_app; SELECT nexus.audit_tool_grant_change()"))
+      .toThrow(/permission denied for function/);
+  }, 120_000);
 
   it("preflight detecta ACL PUBLIC mesmo quando nexus_app ainda não existe", () => {
     reproduzirBancoInicial();

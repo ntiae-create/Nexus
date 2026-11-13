@@ -31,3 +31,12 @@ nao basta como criterio.
 `packages/database/scripts/migrate.sh` (neste repositorio) aplica as 8
 migrations, com o preludio de papeis que a 00007 documenta. Ver o relatorio
 para a sequencia exata e o que precisa existir antes.
+
+## Nota de proveniência temporal
+
+O conteúdo acima é preservado como registro versionado do resultado reportado.
+Nesta revisão, a data efetiva das requisições e a correspondência entre o
+transcript, o deployment identificado e os metadados do Git não foram
+verificadas independentemente. Portanto, este arquivo não constitui, por si só,
+prova independente de um incidente nem confirmação do estado atual de produção.
+Nenhum endpoint de produção foi consultado nesta revisão.

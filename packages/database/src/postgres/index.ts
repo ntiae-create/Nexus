@@ -23,17 +23,14 @@ export interface PostgresNexusDatabase extends NexusDatabase {
    */
   close(): Promise<void>;
   /**
-   * Verifies the pool can obtain a connection AND that the `nexus` schema has
-   * actually been migrated on that database.
+   * Verifies the pool can obtain a connection and that the checksummed ledger
+   * contains the exact required migrations 00001–00008. It calls the narrowly
+   * granted `nexus.migration_ledger_ready()` SECURITY DEFINER function; the
+   * runtime role never reads `nexus_migrations` directly.
    *
-   * Why not `SELECT 1`: that succeeds against any reachable PostgreSQL, so it
-   * reports "ready" for a database where the schema was never applied. Measured
-   * in production on 2026-11-12: `/v1/ready` returned 200 while every data route
-   * failed with `42P01 relation "nexus.auth_login_state" does not exist`. A
-   * readiness probe that cannot distinguish "connected" from "migrated" is a
-   * probe that lies, and the deploy was nearly signed off on it.
-   *
-   * Used only for process readiness / bootstrap — not a business SQL surface.
+   * Any missing function, inaccessible/malformed ledger, absent migration, or
+   * checksum mismatch rejects readiness. Used only for process readiness /
+   * bootstrap — not a business SQL surface.
    */
   checkConnectivity(): Promise<void>;
 }
@@ -80,16 +77,15 @@ export function createPostgresDatabase(
     }
     const client = await pool.connect();
     try {
-      // `to_regclass` resolves a name without throwing, so it distinguishes the
-      // three states that matter: no connection (connect() threw), connection
-      // but no migration (NULL), and migrated (a non-null OID).
-      const result = await client.query<{ nexus_schema: string | null }>(
-        "SELECT to_regclass('nexus.auth_login_state')::text AS nexus_schema",
+      // The function returns a single boolean and deliberately hides ledger
+      // details. A missing/inaccessible function or any query error also fails
+      // readiness and is translated to HTTP 503 by the route.
+      const result = await client.query<{ migrations_ready: boolean | null }>(
+        "SELECT nexus.migration_ledger_ready() AS migrations_ready",
       );
-      if (result.rows[0]?.nexus_schema == null) {
+      if (result.rows[0]?.migrations_ready !== true) {
         throw new Error(
-          "PostgreSQL reachable but the nexus schema is not migrated " +
-            "(nexus.auth_login_state is missing)",
+          "PostgreSQL is reachable but its required checksummed migrations are not ready",
         );
       }
     } finally {

@@ -7,7 +7,7 @@
 #   CREDENCIAIS                         \password do psql só para papéis recém-criados
 #                                       ou com --rotate-passwords explícito
 #   FASE 2     (nexus_migrator)         migrate.sh (DDL + ledger atômicos)
-#   FASE 3     (nexus_migrator)         20_grant_runtime.sql
+#   FASE 3     (nexus_migrator)         20_grant_runtime.sql (GRANTs + readiness restrita)
 #   VERIFICAÇÃO (nexus_migrator)        30_verify.sql
 #
 # Credenciais nunca são passadas em URLs, argv, PGPASSWORD, ambiente ou logs.

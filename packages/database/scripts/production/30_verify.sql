@@ -110,6 +110,22 @@ SELECT EXISTS (
   \echo 'Ledger legado sem coluna checksum: verificação estrutural; adoção explícita necessária.'
 \endif
 
+\echo ''
+\if :ledger_has_checksum
+  \echo 'Readiness — contrato checksummed completo 00001..00008 (esperado: true):'
+  SELECT nexus.migration_ledger_ready() AS ledger_ready;
+  DO $$
+  BEGIN
+    IF NOT nexus.migration_ledger_ready() THEN
+      RAISE EXCEPTION 'FALHA: migration ledger incompleto ou divergente; readiness deve permanecer 503';
+    END IF;
+    RAISE NOTICE 'OK  readiness: todas as migrations obrigatórias e checksums conferem';
+  END
+  $$;
+\else
+  \echo 'Ledger legado sem checksums: readiness continua reprovando até a adoção explícita.'
+\endif
+
 \echo '=================================================================='
 \echo '2. TABELAS — as 27 do schema nexus'
 \echo '=================================================================='
@@ -488,7 +504,7 @@ SELECT p.proname AS funcao,
  WHERE n.nspname = 'nexus'
    AND p.proname IN ('record_deleted_entity','audit_tool_grant_change',
                      'audit_memory_permission_change','prevent_core_run_identity_mutation',
-                     'enforce_tool_grant_lifecycle')
+                     'enforce_tool_grant_lifecycle','migration_ledger_ready')
  ORDER BY p.proname;
 
 -- OBRIGATORIO: os donos que a 00007 e a 00008 exigem.

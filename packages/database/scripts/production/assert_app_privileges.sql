@@ -11,6 +11,7 @@ SELECT set_config('nexus.verify.require_app_grants', :'NEXUS_REQUIRE_APP_GRANTS'
 DO $nexus_app_privilege_contract$
 DECLARE
   app_oid oid;
+  readiness_function_oid oid;
   require_grants boolean := COALESCE(current_setting('nexus.verify.require_app_grants', true), 'false')::boolean;
   object_row record;
   column_row record;
@@ -156,6 +157,34 @@ BEGIN
       RAISE EXCEPTION 'PREFLIGHT: função SECURITY DEFINER de nexus sem search_path fixo';
     END IF;
     RETURN;
+  END IF;
+
+  SELECT pg_catalog.to_regprocedure('nexus.migration_ledger_ready()')::oid
+    INTO readiness_function_oid;
+  IF readiness_function_oid IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM pg_proc p
+     WHERE p.oid = readiness_function_oid
+       AND p.prosecdef
+       AND p.prorettype = 'boolean'::regtype
+  ) THEN
+    RAISE EXCEPTION 'PREFLIGHT: nexus.migration_ledger_ready() must be SECURITY DEFINER and return boolean';
+  END IF;
+  IF require_grants AND readiness_function_oid IS NULL THEN
+    RAISE EXCEPTION 'FALHA: SECURITY DEFINER nexus.migration_ledger_ready() boolean is missing';
+  END IF;
+
+  -- The application must never query the private migration ledger directly;
+  -- it receives only the boolean from migration_ledger_ready().
+  IF EXISTS (
+    SELECT 1
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'nexus_migrations'
+       AND c.relname = 'schema_migrations'
+       AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+       AND has_table_privilege(app_oid, c.oid, 'SELECT')
+  ) THEN
+    RAISE EXCEPTION 'PREFLIGHT: nexus_app has direct SELECT on the migration ledger';
   END IF;
 
   -- nexus_app is intentionally a standalone login. Reject both incoming and
@@ -462,9 +491,10 @@ BEGIN
     RAISE EXCEPTION 'FALHA: nexus tem número de enums divergente do allowlist (esperado 16)';
   END IF;
 
-  -- SECURITY DEFINER routines are an escalation boundary. Their owner and fixed
-  -- search_path are allowlisted, and neither nexus_app nor PUBLIC may execute
-  -- them. Ordinary invoker functions are not constrained by this check.
+  -- SECURITY DEFINER routines are an escalation boundary. Only the specific
+  -- zero-argument boolean readiness function is executable by nexus_app; every
+  -- other SECURITY DEFINER function and PUBLIC remain denied. Ordinary invoker
+  -- functions are not constrained by this check.
   FOR object_row IN
     SELECT p.oid, p.proname, p.proowner, p.prosecdef, p.proconfig, p.proacl,
            n.nspname, pg_get_userbyid(p.proowner) AS owner_name
@@ -477,14 +507,22 @@ BEGIN
       RAISE EXCEPTION 'PREFLIGHT: nexus_app owns function %.%', object_row.nspname, object_row.proname;
     END IF;
     IF object_row.prosecdef THEN
-      IF has_function_privilege(app_oid, object_row.oid, 'EXECUTE') THEN
+      IF object_row.oid = readiness_function_oid THEN
+        IF require_grants AND NOT has_function_privilege(app_oid, object_row.oid, 'EXECUTE') THEN
+          RAISE EXCEPTION 'FALHA: nexus_app não pode executar a função autorizada nexus.migration_ledger_ready()';
+        END IF;
+      ELSIF has_function_privilege(app_oid, object_row.oid, 'EXECUTE') THEN
         RAISE EXCEPTION 'PREFLIGHT: nexus_app can EXECUTE SECURITY DEFINER function %.%', object_row.nspname, object_row.proname;
       END IF;
       IF has_function_privilege('public', object_row.oid, 'EXECUTE') THEN
         RAISE EXCEPTION 'PREFLIGHT: PUBLIC can EXECUTE SECURITY DEFINER function %.%', object_row.nspname, object_row.proname;
       END IF;
       IF object_row.nspname = 'nexus' THEN
-        IF object_row.proname = 'audit_tool_grant_change' THEN
+        IF object_row.oid = readiness_function_oid THEN
+          IF object_row.owner_name <> 'nexus_migrator' THEN
+            RAISE EXCEPTION 'PREFLIGHT: SECURITY DEFINER function nexus.migration_ledger_ready() has owner %, expected nexus_migrator', object_row.owner_name;
+          END IF;
+        ELSIF object_row.proname = 'audit_tool_grant_change' THEN
           IF object_row.owner_name <> 'nexus_audit_writer' THEN
             RAISE EXCEPTION 'PREFLIGHT: SECURITY DEFINER function nexus.% has owner %, expected nexus_audit_writer', object_row.proname, object_row.owner_name;
           END IF;
@@ -497,11 +535,25 @@ BEGIN
       END IF;
     END IF;
   END LOOP;
+
+  -- The readiness routine may execute only for its owner and nexus_app. This
+  -- also rejects PUBLIC, unrelated roles, and EXECUTE grant options.
+  IF readiness_function_oid IS NOT NULL AND EXISTS (
+    SELECT 1
+      FROM pg_proc p
+      CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) acl
+     WHERE p.oid = readiness_function_oid
+       AND (acl.grantee NOT IN (app_oid, p.proowner)
+         OR (acl.grantee = app_oid AND acl.is_grantable))
+  ) THEN
+    RAISE EXCEPTION 'PREFLIGHT: migration readiness function has unexpected EXECUTE ACLs';
+  END IF;
+
   IF require_grants AND (
     SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'nexus' AND p.prosecdef
-  ) <> 3 THEN
-    RAISE EXCEPTION 'FALHA: conjunto de funções SECURITY DEFINER de nexus diverge do allowlist (esperado 3)';
+  ) <> 4 THEN
+    RAISE EXCEPTION 'FALHA: conjunto de funções SECURITY DEFINER de nexus diverge do allowlist (esperado 4)';
   END IF;
 END
 $nexus_app_privilege_contract$;
