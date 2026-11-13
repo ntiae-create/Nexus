@@ -29,6 +29,7 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = `${dirname(fileURLToPath(import.meta.url))}/`;
+const prepareSql = `${here}00_prepare.sql`;
 const verifySql = `${here}30_verify.sql`;
 const grantSql = `${here}20_grant_runtime.sql`;
 // sobe de scripts/production -> scripts -> database -> packages -> raiz
@@ -117,7 +118,7 @@ function reproduzirBancoInicial(): void {
         CREATE ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
       END IF;
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='nexus_audit_writer') THEN
-        CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+        CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
       END IF;
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='nexus_app') THEN
         CREATE ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
@@ -128,17 +129,36 @@ function reproduzirBancoInicial(): void {
     END $$;
   `], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
-  // Estado de atributos e memberships pode ter sido alterado por um caso
-  // anterior que falhou no meio; normaliza para o esperado.
+  // Estado de atributos e memberships e global ao cluster. Cada caso comeca
+  // dos quatro contratos completos, inclusive CREATEDB/CREATEROLE/INHERIT.
   for (const sql of [
-    "ALTER ROLE nexus_app NOBYPASSRLS NOSUPERUSER NOLOGIN",
-    "ALTER ROLE nexus_audit_writer NOLOGIN NOBYPASSRLS NOSUPERUSER",
-    "ALTER ROLE nexus_migrator NOSUPERUSER NOBYPASSRLS",
-    "ALTER ROLE nexus_anonymous NOLOGIN NOBYPASSRLS NOSUPERUSER",
+    "ALTER ROLE nexus_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
+    "ALTER ROLE nexus_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
+    "ALTER ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
+    "ALTER ROLE nexus_anonymous NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
   ]) {
     execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c", sql],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   }
+
+  // Memberships tambem sao globais. Limpa toda aresta que toca os quatro
+  // papeis para impedir que um teste mutante contamine os seguintes.
+  execFileSync(PSQL, ["--no-psqlrc", "--quiet", "--dbname", runUrl, "-c", `
+    DO $$
+    DECLARE m record;
+    BEGIN
+      FOR m IN
+        SELECT child.rolname AS member_name, parent.rolname AS role_name
+          FROM pg_auth_members am
+          JOIN pg_roles child ON child.oid=am.member
+          JOIN pg_roles parent ON parent.oid=am.roleid
+         WHERE child.rolname IN ('nexus_migrator','nexus_app','nexus_audit_writer','nexus_anonymous')
+            OR parent.rolname IN ('nexus_migrator','nexus_app','nexus_audit_writer','nexus_anonymous')
+      LOOP
+        EXECUTE format('REVOKE %I FROM %I', m.role_name, m.member_name);
+      END LOOP;
+    END $$;
+  `], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
   // CREATE porque o ledger (schema nexus) e criado pelo proprio migrator;
   // CONNECT porque sem isso ele nem se conecta. Espelha 00_prepare.sql:102.
@@ -193,9 +213,8 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
     expect(r.ok).toBe(true);
   });
 
-  // Cada caso viola um invariante, confirma que a verificacao FALHA, e desfaz.
-  // O `ROLLBACK` e feito por um segundo comando, porque 30_verify.sql abre a
-  // propria sessao: a violacao e aplicada e desfeita fora dela.
+  // Cada caso viola um invariante e exige que a verificacao FALHE. O banco e
+  // recriado antes de cada mutacao; nao tentamos reverter DDL ou roles na mao.
   const casos: Array<{ nome: string; violar: string; esperado: RegExp }> = [
     {
       nome: "ledger com migration faltando",
@@ -213,16 +232,6 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
       // A falha pode vir pela lista de tabelas ou pela contagem global; ambas
       // nomeiam FORCE ROW LEVEL SECURITY e ambas impedem "CONCLUIDO".
       esperado: /sem FORCE RLS|FORCE ROW LEVEL SECURITY/,
-    },
-    {
-      nome: "papel com BYPASSRLS",
-      violar: "ALTER ROLE nexus_app BYPASSRLS",
-      esperado: /SUPERUSER ou BYPASSRLS/,
-    },
-    {
-      nome: "escritor pode fazer login",
-      violar: "ALTER ROLE nexus_audit_writer LOGIN",
-      esperado: /pode fazer login/,
     },
     {
       nome: "owner duplicado",
@@ -258,6 +267,151 @@ describeIfPostgres("30_verify.sql — invariantes obrigatorios", () => {
     },
   ];
 
+  // Cada um dos seis atributos e alterado isoladamente em cada papel.
+  // Assim, o contrato nao pode regredir para a verificacao parcial anterior.
+  const papeis = [
+    { nome: "nexus_migrator", login: true },
+    { nome: "nexus_app", login: true },
+    { nome: "nexus_audit_writer", login: false },
+    { nome: "nexus_anonymous", login: false },
+  ];
+  const atributos = [
+    { nome: "LOGIN", habilitar: "LOGIN", desabilitar: "NOLOGIN" },
+    { nome: "SUPERUSER", habilitar: "SUPERUSER", desabilitar: "NOSUPERUSER" },
+    { nome: "BYPASSRLS", habilitar: "BYPASSRLS", desabilitar: "NOBYPASSRLS" },
+    { nome: "CREATEDB", habilitar: "CREATEDB", desabilitar: "NOCREATEDB" },
+    { nome: "CREATEROLE", habilitar: "CREATEROLE", desabilitar: "NOCREATEROLE" },
+    { nome: "INHERIT", habilitar: "INHERIT", desabilitar: "NOINHERIT" },
+  ];
+  for (const papel of papeis) {
+    for (const atributo of atributos) {
+      const esperadoAtivo = atributo.nome === "LOGIN" && papel.login;
+      const mutacao = esperadoAtivo ? atributo.desabilitar : atributo.habilitar;
+      const diagnostico = atributo.nome === "SUPERUSER" || atributo.nome === "BYPASSRLS"
+        ? /SUPERUSER ou BYPASSRLS/
+        : atributo.nome === "LOGIN" && !esperadoAtivo
+          ? /pode fazer login/
+          : /atributos divergentes/;
+      casos.push({
+        nome: `atributo ${atributo.nome} divergente em ${papel.nome}`,
+        violar: `ALTER ROLE ${papel.nome} ${mutacao}`,
+        esperado: diagnostico,
+      });
+    }
+  }
+
+  // A unica aresta prevista e migrator -> audit_writer, com SET sem INHERIT
+  // nem ADMIN. Cada teste altera uma opcao ou acrescenta/remove uma membership.
+  casos.push(
+    {
+      nome: "migrator perde SET ROLE no escritor",
+      violar: "REVOKE nexus_audit_writer FROM nexus_migrator",
+      esperado: /nao pode SET ROLE/,
+    },
+    {
+      nome: "migrator herda privilegios do escritor",
+      violar: "GRANT nexus_audit_writer TO nexus_migrator WITH SET TRUE, INHERIT TRUE",
+      esperado: /herda privilegios|membership nexus_migrator|memberships inesperadas/,
+    },
+    {
+      nome: "migrator perde a opcao SET na membership",
+      violar: "GRANT nexus_audit_writer TO nexus_migrator WITH SET FALSE, INHERIT FALSE",
+      esperado: /nao pode SET ROLE/,
+    },
+    {
+      nome: "migrator recebe ADMIN na membership do escritor",
+      violar: "GRANT nexus_audit_writer TO nexus_migrator WITH ADMIN TRUE, SET TRUE, INHERIT FALSE",
+      esperado: /membership nexus_migrator|memberships inesperadas/,
+    },
+    {
+      nome: "nexus_app entra no papel escritor",
+      violar: "GRANT nexus_audit_writer TO nexus_app WITH SET TRUE, INHERIT FALSE",
+      esperado: /nexus_app e membro de nexus_audit_writer/,
+    },
+    {
+      nome: "nexus_app entra em papel adicional nao previsto",
+      violar: "GRANT pg_monitor TO nexus_app WITH SET TRUE, INHERIT FALSE",
+      esperado: /memberships inesperadas ou com opcoes indevidas/,
+    },
+    {
+      nome: "escritor entra em outro papel",
+      violar: "GRANT nexus_anonymous TO nexus_audit_writer WITH SET TRUE, INHERIT FALSE",
+      esperado: /memberships inesperadas ou com opcoes indevidas/,
+    },
+    {
+      nome: "membership cruzada inesperada entre os quatro papeis",
+      violar: "GRANT nexus_app TO nexus_anonymous WITH SET TRUE, INHERIT FALSE",
+      esperado: /memberships inesperadas ou com opcoes indevidas/,
+    },
+    {
+      nome: "papel externo recebe capacidade de assumir o escritor",
+      violar: "GRANT nexus_audit_writer TO pg_monitor WITH SET TRUE, INHERIT FALSE",
+      esperado: /memberships inesperadas ou com opcoes indevidas/,
+    },
+    {
+      nome: "papel externo recebe capacidade de assumir nexus_app",
+      violar: "GRANT nexus_app TO pg_monitor WITH SET TRUE, INHERIT FALSE",
+      esperado: /memberships inesperadas ou com opcoes indevidas/,
+    },
+  );
+
+  // Policies: ausente, identidade (nome/tabela), comando, roles e cada
+  // expressao sao mutadas independentemente para validar a comparacao do set.
+  casos.push(
+    {
+      nome: "policy esperada removida",
+      violar: "DROP POLICY conversations_owner_select ON nexus.conversations",
+      esperado: /policies de RLS, esperado 49.*conversations_owner_select/,
+    },
+    {
+      nome: "policy tem USING alterado",
+      violar: "ALTER POLICY conversations_owner_select ON nexus.conversations USING (true)",
+      esperado: /conjunto de policies divergente.*conversations_owner_select.*USING/,
+    },
+    {
+      nome: "policy tem WITH CHECK alterado",
+      violar: "ALTER POLICY conversations_owner_insert ON nexus.conversations WITH CHECK (true)",
+      esperado: /conjunto de policies divergente.*conversations_owner_insert.*WITH CHECK/,
+    },
+    {
+      nome: "policy tem role alterado",
+      violar: "ALTER POLICY conversations_owner_select ON nexus.conversations TO nexus_app",
+      esperado: /conjunto de policies divergente.*conversations_owner_select.*roles/,
+    },
+    {
+      nome: "policy tem comando alterado",
+      violar: `DROP POLICY conversations_owner_select ON nexus.conversations;
+               CREATE POLICY conversations_owner_select ON nexus.conversations
+                 FOR ALL TO public
+                 USING (owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id())`,
+      esperado: /conjunto de policies divergente.*conversations_owner_select.*cmd/,
+    },
+    {
+      nome: "policy movida para outra tabela",
+      violar: `DROP POLICY conversations_owner_select ON nexus.conversations;
+               CREATE POLICY conversations_owner_select ON nexus.messages
+                 FOR SELECT TO public
+                 USING (owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id())`,
+      esperado: /conjunto de policies divergente.*conversations_owner_select.*messages/,
+    },
+    {
+      nome: "policy renomeada",
+      violar: `DROP POLICY conversations_owner_select ON nexus.conversations;
+               CREATE POLICY conversations_owner_select_revised ON nexus.conversations
+                 FOR SELECT TO public
+                 USING (owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id())`,
+      esperado: /conjunto de policies divergente.*conversations_owner_select.*conversations_owner_select_revised/,
+    },
+    {
+      nome: "policy permissive alterada para restrictive",
+      violar: `DROP POLICY conversations_owner_select ON nexus.conversations;
+               CREATE POLICY conversations_owner_select ON nexus.conversations
+                 AS RESTRICTIVE FOR SELECT TO public
+                 USING (owner_id = nexus.current_owner_id() AND owner_id = nexus.configured_owner_id())`,
+      esperado: /conjunto de policies divergente.*conversations_owner_select.*permissive/,
+    },
+  );
+
   for (const caso of casos) {
     it(`FALHA quando: ${caso.nome}`, () => {
       // Cada caso parte de um banco recem-provisionado. Tentar desfazer a
@@ -279,6 +433,11 @@ describe("30_verify.sql — estrutura do arquivo", () => {
     expect(existsSync(verifySql)).toBe(true);
     const conteudo = require("node:fs").readFileSync(verifySql, "utf8") as string;
     expect(conteudo).toContain("\\set ON_ERROR_STOP on");
+  });
+
+  it("a fase administrativa cria nexus_audit_writer com NOINHERIT", () => {
+    const conteudo = require("node:fs").readFileSync(prepareSql, "utf8") as string;
+    expect(conteudo).toMatch(/CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT/);
   });
 
   it("tem RAISE EXCEPTION para cada familia de invariante", () => {

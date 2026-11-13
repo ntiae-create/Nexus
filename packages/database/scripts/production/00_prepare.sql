@@ -42,17 +42,18 @@ $$;
 
 -- -----------------------------------------------------------------------------
 -- nexus_audit_writer — escritor da trilha de auditoria (00007).
--- NOLOGIN: nao e credencial de login. Os atributos sao exatamente os que a
--- 00007 exige; se divergirem, a propria 00007 falha com mensagem acionavel
--- (bloco de verificacao em 00007_tool_grants_and_preferences.sql:345-356).
+-- NOLOGIN + NOINHERIT: nao e credencial de login nem pode herdar privilegios
+-- de memberships futuras. Os atributos sao exatamente os que o verificador
+-- final exige; os demais tambem sao verificados pela 00007 (bloco em
+-- 00007_tool_grants_and_preferences.sql:345-356).
 -- -----------------------------------------------------------------------------
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nexus_audit_writer') THEN
-    CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+    CREATE ROLE nexus_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
     RAISE NOTICE 'nexus_audit_writer: criado';
   ELSE
-    RAISE NOTICE 'nexus_audit_writer: ja existe (nada a fazer)';
+    RAISE NOTICE 'nexus_audit_writer: ja existe (atributos preservados; 30_verify.sql exige NOINHERIT)';
   END IF;
 END
 $$;
@@ -128,7 +129,8 @@ SELECT rolname,
        rolbypassrls AS bypassrls,
        rolcanlogin  AS login,
        rolcreatedb  AS createdb,
-       rolcreaterole AS createrole
+       rolcreaterole AS createrole,
+       rolinherit AS inherit
   FROM pg_roles
  WHERE rolname IN ('nexus_migrator','nexus_app','nexus_anonymous','nexus_audit_writer')
  ORDER BY rolname;

@@ -149,18 +149,146 @@ $$;
 
 \echo ''
 \echo '=================================================================='
-\echo '3. POLICIES de RLS (esperado: 49)'
+\echo '3. POLICIES de RLS — conjunto exato das migrations (49)'
 \echo '=================================================================='
 SELECT count(*) AS policies FROM pg_policies WHERE schemaname = 'nexus';
 
+-- Contrato derivado de CREATE POLICY nas migrations 00001, 00003 e 00007.
+-- A lista inclui tabela, nome, comando, permissividade, roles e os dois
+-- predicados. Atualizar este contrato junto com uma mudanca intencional de RLS.
 DO $$
-DECLARE n integer;
+DECLARE
+  total integer;
+  ausentes text[];
+  alteradas text[];
+  inesperadas text[];
 BEGIN
-  SELECT count(*) INTO n FROM pg_policies WHERE schemaname='nexus';
-  IF n <> 49 THEN
-    RAISE EXCEPTION 'FALHA: % policies de RLS, esperado 49', n;
+  WITH expected_policy(table_name, policy_name, command_name, permissive, role_names, using_kind, check_kind) AS (
+    VALUES
+      ('assistant_memories', 'assistant_memories_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('assistant_memories', 'assistant_memories_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('assistant_memories', 'assistant_memories_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('assistant_memories', 'assistant_memories_select_policy', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'assistant_memory', NULL::text),
+      ('assistant_provider_preferences', 'assistant_provider_preferences_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('assistant_provider_preferences', 'assistant_provider_preferences_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('assistant_provider_preferences', 'assistant_provider_preferences_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('assistant_provider_preferences', 'assistant_provider_preferences_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_scope', NULL::text),
+      ('conversation_assistants', 'conversation_assistants_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('conversation_provider_preferences', 'conversation_provider_preferences_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('conversation_provider_preferences', 'conversation_provider_preferences_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('conversation_provider_preferences', 'conversation_provider_preferences_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('conversation_provider_preferences', 'conversation_provider_preferences_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_scope', NULL::text),
+      ('conversations', 'conversations_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('conversations', 'conversations_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('conversations', 'conversations_owner_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_scope', NULL::text),
+      ('conversations', 'conversations_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('core_run_assistants', 'core_run_assistants_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('core_runs', 'core_runs_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('global_provider_preferences', 'global_provider_preferences_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('global_provider_preferences', 'global_provider_preferences_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('global_provider_preferences', 'global_provider_preferences_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('global_provider_preferences', 'global_provider_preferences_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_scope', NULL::text),
+      ('memory_permission_audit', 'memory_permission_audit_owner_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('memory_permission_audit', 'memory_permission_audit_trigger_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'trigger_owner'),
+      ('memory_permissions', 'memory_permissions_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('memory_permissions', 'memory_permissions_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('memory_permissions', 'memory_permissions_select_policy', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_or_assistant', NULL::text),
+      ('messages', 'messages_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('provider_authorizations', 'provider_authorizations_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('provider_authorizations', 'provider_authorizations_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('provider_authorizations', 'provider_authorizations_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('provider_authorizations', 'provider_authorizations_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_scope', NULL::text),
+      ('run_results', 'run_results_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('run_steps', 'run_steps_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('sync_cursors', 'sync_cursors_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('tombstones', 'tombstones_owner_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('tombstones', 'tombstones_trigger_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'trigger_owner'),
+      ('tool_events', 'tool_events_owner_access', 'ALL', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('tool_grant_audit', 'tool_grant_audit_owner_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('tool_grant_audit', 'tool_grant_audit_writer_insert', 'INSERT', 'PERMISSIVE', ARRAY['nexus_audit_writer']::text[], NULL::text, 'audit_owner'),
+      ('tool_grants', 'tool_grants_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('tool_grants', 'tool_grants_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('tool_grants', 'tool_grants_owner_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('tool_grants', 'tool_grants_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('user_assistant_preferences', 'user_assistant_preferences_owner_delete', 'DELETE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', NULL::text),
+      ('user_assistant_preferences', 'user_assistant_preferences_owner_insert', 'INSERT', 'PERMISSIVE', ARRAY['public']::text[], NULL::text, 'owner'),
+      ('user_assistant_preferences', 'user_assistant_preferences_owner_update', 'UPDATE', 'PERMISSIVE', ARRAY['public']::text[], 'owner', 'owner'),
+      ('user_assistant_preferences', 'user_assistant_preferences_select', 'SELECT', 'PERMISSIVE', ARRAY['public']::text[], 'owner_scope', NULL::text)
+  ),
+  expression_contract(kind, expression) AS (
+    VALUES
+      ('owner', $expr$((owner_id = nexus.current_owner_id()) AND (owner_id = nexus.configured_owner_id()) AND (nexus.current_actor_type() = 'owner'::text))$expr$),
+      ('owner_scope', $expr$((owner_id = nexus.current_owner_id()) AND (owner_id = nexus.configured_owner_id()))$expr$),
+      ('owner_or_assistant', $expr$((owner_id = nexus.current_owner_id()) AND (owner_id = nexus.configured_owner_id()) AND ((nexus.current_actor_type() = 'owner'::text) OR ((nexus.current_actor_type() = 'assistant'::text) AND (assistant_id = nexus.current_assistant_id()))))$expr$),
+      ('assistant_memory', $expr$((owner_id = nexus.current_owner_id()) AND (owner_id = nexus.configured_owner_id()) AND ((nexus.current_actor_type() = 'owner'::text) OR ((nexus.current_actor_type() = 'assistant'::text) AND (status = 'active'::text) AND (((visibility = 'individual'::nexus.memory_visibility) AND (origin_assistant_id = nexus.current_assistant_id())) OR ((visibility = 'shared'::nexus.memory_visibility) AND (EXISTS ( SELECT 1 FROM nexus.memory_permissions permission WHERE ((permission.owner_id = assistant_memories.owner_id) AND (permission.memory_id = assistant_memories.id) AND (permission.assistant_id = nexus.current_assistant_id()) AND (permission.status = 'granted'::nexus.memory_permission_status)))))))))$expr$),
+      ('trigger_owner', $expr$((owner_id = nexus.current_owner_id()) AND (owner_id = nexus.configured_owner_id()) AND (nexus.current_actor_type() = 'owner'::text) AND (pg_trigger_depth() > 0))$expr$),
+      ('audit_owner', $expr$((nexus.current_owner_id() IS NOT NULL) AND (nexus.configured_owner_id() IS NOT NULL) AND (owner_id = nexus.current_owner_id()) AND (owner_id = nexus.configured_owner_id()) AND (actor_owner_id = owner_id))$expr$)
+  ),
+  expected AS (
+    SELECT e.table_name, e.policy_name, e.command_name, e.permissive, e.role_names,
+           CASE WHEN u.expression IS NULL THEN NULL
+                ELSE regexp_replace(u.expression, '[[:space:]]+', ' ', 'g') END AS qual,
+           CASE WHEN c.expression IS NULL THEN NULL
+                ELSE regexp_replace(c.expression, '[[:space:]]+', ' ', 'g') END AS with_check
+      FROM expected_policy e
+      LEFT JOIN expression_contract u ON u.kind = e.using_kind
+      LEFT JOIN expression_contract c ON c.kind = e.check_kind
+  ),
+  actual AS (
+    SELECT p.tablename AS table_name, p.policyname AS policy_name,
+           p.cmd AS command_name, p.permissive,
+           ARRAY(SELECT r::text FROM unnest(p.roles) AS r ORDER BY r::text) AS role_names,
+           CASE WHEN p.qual IS NULL THEN NULL
+                ELSE regexp_replace(p.qual, '[[:space:]]+', ' ', 'g') END AS qual,
+           CASE WHEN p.with_check IS NULL THEN NULL
+                ELSE regexp_replace(p.with_check, '[[:space:]]+', ' ', 'g') END AS with_check
+      FROM pg_policies p
+     WHERE p.schemaname = 'nexus'
+  )
+  SELECT
+    COALESCE((
+      SELECT array_agg(format('%I.%I', e.table_name, e.policy_name) ORDER BY e.table_name, e.policy_name)
+        FROM expected e
+       WHERE NOT EXISTS (SELECT 1 FROM actual a WHERE a.table_name=e.table_name AND a.policy_name=e.policy_name)
+    ), ARRAY[]::text[]),
+    COALESCE((
+      SELECT array_agg(
+               format('%I.%I (%s)', e.table_name, e.policy_name,
+                 array_to_string(ARRAY_REMOVE(ARRAY[
+                   CASE WHEN a.command_name IS DISTINCT FROM e.command_name THEN 'cmd' END,
+                   CASE WHEN a.permissive IS DISTINCT FROM e.permissive THEN 'permissive' END,
+                   CASE WHEN a.role_names IS DISTINCT FROM e.role_names THEN 'roles' END,
+                   CASE WHEN a.qual IS DISTINCT FROM e.qual THEN 'USING' END,
+                   CASE WHEN a.with_check IS DISTINCT FROM e.with_check THEN 'WITH CHECK' END
+                 ], NULL), ', ')
+               ) ORDER BY e.table_name, e.policy_name
+             )
+        FROM expected e
+        JOIN actual a ON a.table_name=e.table_name AND a.policy_name=e.policy_name
+       WHERE a.command_name IS DISTINCT FROM e.command_name
+          OR a.permissive IS DISTINCT FROM e.permissive
+          OR a.role_names IS DISTINCT FROM e.role_names
+          OR a.qual IS DISTINCT FROM e.qual
+          OR a.with_check IS DISTINCT FROM e.with_check
+    ), ARRAY[]::text[]),
+    COALESCE((
+      SELECT array_agg(format('%I.%I', a.table_name, a.policy_name) ORDER BY a.table_name, a.policy_name)
+        FROM actual a
+       WHERE NOT EXISTS (SELECT 1 FROM expected e WHERE e.table_name=a.table_name AND e.policy_name=a.policy_name)
+    ), ARRAY[]::text[])
+  INTO ausentes, alteradas, inesperadas;
+
+  SELECT count(*) INTO total FROM pg_policies WHERE schemaname='nexus';
+  IF total <> 49 THEN
+    RAISE EXCEPTION 'FALHA: % policies de RLS, esperado 49 (ausentes: %, alteradas: %, inesperadas: %)',
+      total, ausentes, alteradas, inesperadas;
   END IF;
-  RAISE NOTICE 'OK  policies: 49';
+  IF cardinality(ausentes) > 0 OR cardinality(alteradas) > 0 OR cardinality(inesperadas) > 0 THEN
+    RAISE EXCEPTION 'FALHA: conjunto de policies divergente (ausentes: %, alteradas: %, inesperadas: %)',
+      ausentes, alteradas, inesperadas;
+  END IF;
+
+  RAISE NOTICE 'OK  policies: 49; conjunto completo das migrations (tabela/nome/cmd/roles/USING/WITH CHECK)';
 END
 $$;
 
@@ -168,7 +296,7 @@ $$;
 \echo '=================================================================='
 \echo '4. PAPEIS — atributos e memberships'
 \echo '=================================================================='
-SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreatedb, rolcreaterole
+SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolinherit
   FROM pg_roles
  WHERE rolname IN ('nexus_migrator','nexus_app','nexus_anonymous','nexus_audit_writer')
  ORDER BY rolname;
@@ -178,62 +306,127 @@ SELECT rolname, rolsuper, rolbypassrls, rolcanlogin, rolcreatedb, rolcreaterole
 SELECT pg_has_role('nexus_migrator', 'nexus_audit_writer', 'SET') AS pode_assumir_escritor;
 
 \echo ''
-\echo 'Memberships do escritor (esperado: nenhuma — ele nao herda nada de ninguem):'
-SELECT parent.rolname AS membership_indevida
+\echo 'nexus_migrator herda privilegios do escritor? (esperado: false)'
+SELECT pg_has_role('nexus_migrator', 'nexus_audit_writer', 'USAGE') AS herda_escritor;
+
+\echo ''
+\echo 'Memberships que tocam os quatro papeis (esperado: apenas nexus_migrator -> nexus_audit_writer; admins superuser nao ganham privilegio adicional):'
+SELECT child.rolname AS membro, parent.rolname AS papel,
+       am.admin_option, am.inherit_option, am.set_option
+  FROM pg_auth_members am
+  JOIN pg_roles child  ON child.oid  = am.member
+  JOIN pg_roles parent ON parent.oid = am.roleid
+ WHERE child.rolname IN ('nexus_migrator','nexus_app','nexus_audit_writer','nexus_anonymous')
+    OR parent.rolname IN ('nexus_migrator','nexus_app','nexus_audit_writer','nexus_anonymous')
+ ORDER BY child.rolname, parent.rolname;
+
+\echo ''
+\echo 'Memberships do escritor como membro (esperado: nenhuma):'
+SELECT parent.rolname AS membership_indevida,
+       am.admin_option, am.inherit_option, am.set_option
   FROM pg_auth_members am
   JOIN pg_roles child  ON child.oid  = am.member
   JOIN pg_roles parent ON parent.oid = am.roleid
  WHERE child.rolname = 'nexus_audit_writer';
 
--- OBRIGATORIO: os 4 papeis existem com os atributos documentados.
+-- OBRIGATORIO: atributos completos e topologia exata de memberships dos quatro papeis.
 DO $$
 DECLARE
-  r record;
-  esperados text[] := ARRAY['nexus_migrator','nexus_app','nexus_anonymous','nexus_audit_writer'];
+  esperado record;
+  atual record;
+  roles_verificados text[] := ARRAY['nexus_migrator','nexus_app','nexus_audit_writer','nexus_anonymous'];
+  memberships_indevidas text[];
 BEGIN
-  FOR i IN 1..array_length(esperados,1) LOOP
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = esperados[i]) THEN
-      RAISE EXCEPTION 'FALHA: papel % nao existe', esperados[i];
+  FOR esperado IN
+    SELECT * FROM (VALUES
+      ('nexus_migrator'::text, true,  false, false, false, false, false),
+      ('nexus_app'::text,      true,  false, false, false, false, false),
+      ('nexus_audit_writer'::text, false, false, false, false, false, false),
+      ('nexus_anonymous'::text,    false, false, false, false, false, false)
+    ) AS v(rolname, canlogin, superuser, bypassrls, createdb, createrole, inherit)
+  LOOP
+    SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolinherit
+      INTO atual FROM pg_roles WHERE rolname = esperado.rolname;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'FALHA: papel % nao existe', esperado.rolname;
+    END IF;
+
+    -- Mantem o diagnostico de seguranca existente para estes dois atributos.
+    IF atual.rolsuper OR atual.rolbypassrls THEN
+      RAISE EXCEPTION 'FALHA: papel % tem SUPERUSER ou BYPASSRLS', atual.rolname;
+    END IF;
+    -- E preservado tambem o diagnostico explicito anterior para os papeis NOLOGIN.
+    IF atual.rolname = 'nexus_audit_writer' AND atual.rolcanlogin THEN
+      RAISE EXCEPTION 'FALHA: nexus_audit_writer pode fazer login (deveria ser NOLOGIN)';
+    END IF;
+    IF atual.rolname = 'nexus_anonymous' AND atual.rolcanlogin THEN
+      RAISE EXCEPTION 'FALHA: nexus_anonymous pode fazer login (deveria ser NOLOGIN)';
+    END IF;
+
+    IF ROW(atual.rolcanlogin, atual.rolsuper, atual.rolbypassrls,
+           atual.rolcreatedb, atual.rolcreaterole, atual.rolinherit)
+       IS DISTINCT FROM
+       ROW(esperado.canlogin, esperado.superuser, esperado.bypassrls,
+           esperado.createdb, esperado.createrole, esperado.inherit) THEN
+      RAISE EXCEPTION
+        'FALHA: papel % tem atributos divergentes (LOGIN=%, SUPERUSER=%, BYPASSRLS=%, CREATEDB=%, CREATEROLE=%, INHERIT=%); esperado (LOGIN=%, SUPERUSER=%, BYPASSRLS=%, CREATEDB=%, CREATEROLE=%, INHERIT=%)',
+        atual.rolname, atual.rolcanlogin, atual.rolsuper, atual.rolbypassrls,
+        atual.rolcreatedb, atual.rolcreaterole, atual.rolinherit,
+        esperado.canlogin, esperado.superuser, esperado.bypassrls,
+        esperado.createdb, esperado.createrole, esperado.inherit;
     END IF;
   END LOOP;
 
-  -- Nenhum deles pode ser superuser ou ter BYPASSRLS. Se algum for, o RLS
-  -- deixa de valer para ele e o isolamento entre owners e cosmetico.
-  SELECT rolname INTO r FROM pg_roles
-   WHERE rolname = ANY (esperados) AND (rolsuper OR rolbypassrls) LIMIT 1;
-  IF FOUND THEN
-    RAISE EXCEPTION 'FALHA: papel % tem SUPERUSER ou BYPASSRLS', r.rolname;
-  END IF;
-
-  -- O escritor e NOLOGIN por desenho: nao e credencial de login.
-  IF (SELECT rolcanlogin FROM pg_roles WHERE rolname='nexus_audit_writer') THEN
-    RAISE EXCEPTION 'FALHA: nexus_audit_writer pode fazer login (deveria ser NOLOGIN)';
-  END IF;
-  IF (SELECT rolcanlogin FROM pg_roles WHERE rolname='nexus_anonymous') THEN
-    RAISE EXCEPTION 'FALHA: nexus_anonymous pode fazer login (deveria ser NOLOGIN)';
-  END IF;
-
-  -- O migrator precisa poder assumir o escritor para o ALTER FUNCTION ... OWNER TO da 00007.
+  -- O migrator precisa assumir o escritor para o ALTER FUNCTION ... OWNER TO da 00007.
   IF NOT pg_has_role('nexus_migrator','nexus_audit_writer','SET') THEN
     RAISE EXCEPTION 'FALHA: nexus_migrator nao pode SET ROLE nexus_audit_writer (a 00007 exige)';
   END IF;
-
-  -- O escritor nao pode ser membro de ninguem: seria leitura ampla por heranca.
-  IF EXISTS (
-    SELECT 1 FROM pg_auth_members am
-      JOIN pg_roles child ON child.oid = am.member
-     WHERE child.rolname = 'nexus_audit_writer'
+  IF pg_has_role('nexus_migrator','nexus_audit_writer','USAGE') THEN
+    RAISE EXCEPTION 'FALHA: nexus_migrator herda privilegios de nexus_audit_writer';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_auth_members am
+      JOIN pg_roles child  ON child.oid=am.member
+      JOIN pg_roles parent ON parent.oid=am.roleid
+     WHERE child.rolname='nexus_migrator' AND parent.rolname='nexus_audit_writer'
+       AND am.set_option AND NOT am.inherit_option AND NOT am.admin_option
   ) THEN
-    RAISE EXCEPTION 'FALHA: nexus_audit_writer e membro de outro papel (heranca indevida)';
+    RAISE EXCEPTION 'FALHA: membership nexus_migrator -> nexus_audit_writer deve ter SET=true, INHERIT=false e ADMIN=false';
   END IF;
 
-  -- nexus_app nunca pode ser membro do escritor: escalada de privilegio
-  -- (o escritor tem INSERT na trilha de auditoria).
+  -- O escritor nao pode ser assumido por nexus_app, nem receber outros membros
+  -- nao-superuser; ambos criariam escalada para o INSERT da trilha de auditoria.
   IF pg_has_role('nexus_app','nexus_audit_writer','MEMBER') THEN
     RAISE EXCEPTION 'FALHA: nexus_app e membro de nexus_audit_writer (escalada de privilegio)';
   END IF;
 
-  RAISE NOTICE 'OK  papeis: 4 presentes, nenhum com SUPERUSER/BYPASSRLS, sem membership indevida';
+  -- So a aresta acima e permitida. Isso tambem impede nexus_app de entrar em
+  -- papeis adicionais, o escritor de herdar de terceiros, mudancas nas opcoes
+  -- (ADMIN/INHERIT/SET) e qualquer relacao inesperada entre os quatro papeis.
+  -- Um superuser externo ja tem acesso irrestrito sem membership; sua aresta nao
+  -- adiciona privilegio e e ignorada (por exemplo, postgres -> papel audit).
+  SELECT array_agg(
+           format('%s -> %s [ADMIN=%s, INHERIT=%s, SET=%s]',
+                  child.rolname, parent.rolname,
+                  am.admin_option, am.inherit_option, am.set_option)
+           ORDER BY child.rolname, parent.rolname
+         )
+    INTO memberships_indevidas
+    FROM pg_auth_members am
+    JOIN pg_roles child  ON child.oid=am.member
+    JOIN pg_roles parent ON parent.oid=am.roleid
+   WHERE (child.rolname = ANY(roles_verificados) OR parent.rolname = ANY(roles_verificados))
+     AND NOT (
+       child.rolname='nexus_migrator' AND parent.rolname='nexus_audit_writer'
+       AND am.set_option AND NOT am.inherit_option AND NOT am.admin_option
+     )
+     AND NOT (child.rolsuper AND NOT (child.rolname = ANY(roles_verificados)));
+  IF memberships_indevidas IS NOT NULL THEN
+    RAISE EXCEPTION 'FALHA: memberships inesperadas ou com opcoes indevidas: %', memberships_indevidas;
+  END IF;
+
+  RAISE NOTICE 'OK  papeis: atributos completos dos 4 papeis; apenas migrator -> escritor (SET sem heranca), sem membership inesperada';
 END
 $$;
 
