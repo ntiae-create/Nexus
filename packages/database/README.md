@@ -68,6 +68,26 @@ O ator `assistant` só pode ler sua memória individual e itens compartilhados c
 - **SQL de integração e upgrade:** `tests/postgres/` + `scripts/test-postgres-integration.sh` (CI com PostgreSQL 17). O script insere dados no schema 2A antes da `00003` e comprova o backfill de mensagens, execuções e preferências após a migração.
 - Testes estáticos de migração em `src/migrations.test.ts` **não** substituem execução real no PostgreSQL.
 
+## TLS com CA privada
+
+Os pools de dados e autenticação aceitam configuração TLS privada por ambiente:
+
+- `NEXUS_DATABASE_SSL_CA`: certificado ou bundle de CAs em PEM.
+- `NEXUS_DATABASE_SSL_SERVERNAME`: hostname esperado no certificado.
+
+As variáveis devem estar definidas juntas e não podem estar vazias. O CA precisa
+ser um PEM estruturalmente válido contendo certificados de CA; configuração
+incompleta ou inválida falha ao criar o pool. Com o par configurado, o driver usa
+`ca`, o `servername` informado e `rejectUnauthorized: true`. Sem o par, mantém-se
+o comportamento atual: URLs remotas exigem TLS e validação de hostname por
+`sslmode=verify-full`.
+
+Para uma URL Railway via TCP público, mantenha `crossover.proxy.rlwy.net:20087`
+como destino da conexão e configure `NEXUS_DATABASE_SSL_SERVERNAME` com
+`postgres.railway.internal`. O proxy público é o destino TCP; não o use como
+hostname de SNI/verificação do certificado. O conteúdo da CA deve ser fornecido
+pelo operador no ambiente runtime; não o grave neste repositório.
+
 ## Integração no servidor
 
 `apps/server` usa `createServerDatabase()` quando `NEXUS_DATABASE_URL` está definida, registra `onClose` para drenar o pool e **não** cria rotas públicas artificiais nem autenticação inventada.

@@ -1,4 +1,6 @@
+import { X509Certificate } from "node:crypto";
 import { isIP } from "node:net";
+import type { ConnectionOptions } from "node:tls";
 
 const SUPPORTED_SSL_MODES = new Set([
   "disable",
@@ -8,6 +10,31 @@ const SUPPORTED_SSL_MODES = new Set([
   "verify-full",
   "no-verify",
 ]);
+
+const CONNECTION_STRING_SSL_OPTIONS = [
+  "ssl",
+  "sslmode",
+  "sslcert",
+  "sslkey",
+  "sslrootcert",
+  "sslpassword",
+  "sslnegotiation",
+  "uselibpqcompat",
+] as const;
+
+const PEM_CERTIFICATE_BLOCK = /-----BEGIN CERTIFICATE-----\r?\n[\s\S]*?-----END CERTIFICATE-----/g;
+
+export interface PostgresPrivateCaOptions extends ConnectionOptions {
+  ca: string;
+  servername: string;
+  rejectUnauthorized: true;
+}
+
+export interface ResolvedPostgresTlsConfiguration {
+  connectionString: string;
+  /** Present only when the paired private-CA environment variables are set. */
+  ssl?: PostgresPrivateCaOptions;
+}
 
 function lastQueryValue(url: URL, name: string): string | undefined {
   const values = url.searchParams.getAll(name);
@@ -27,6 +54,61 @@ function isLoopbackHost(rawHost: string): boolean {
   const family = isIP(host);
   if (family === 4) return host.split(".")[0] === "127";
   return family === 6 && host === "::1";
+}
+
+function readPrivateCaOptions(): PostgresPrivateCaOptions | undefined {
+  const caValue = process.env.NEXUS_DATABASE_SSL_CA;
+  const servernameValue = process.env.NEXUS_DATABASE_SSL_SERVERNAME;
+  if (caValue === undefined && servernameValue === undefined) return undefined;
+
+  const ca = caValue?.trim();
+  const servername = servernameValue?.trim();
+  if (!ca || !servername) {
+    throw new Error(
+      "NEXUS_DATABASE_SSL_CA and NEXUS_DATABASE_SSL_SERVERNAME must be configured together and non-empty",
+    );
+  }
+  if (
+    /[\u0000-\u0020\u007f/\\?#@]/.test(servername) ||
+    (servername.includes(":") && isIP(servername) === 0)
+  ) {
+    throw new Error("NEXUS_DATABASE_SSL_SERVERNAME must be a hostname without a URL or port");
+  }
+
+  const certificateBlocks = [...ca.matchAll(PEM_CERTIFICATE_BLOCK)].map(([block]) => block);
+  const remainingText = ca.replace(PEM_CERTIFICATE_BLOCK, "").trim();
+  if (certificateBlocks.length === 0 || remainingText.length > 0) {
+    throw new Error("NEXUS_DATABASE_SSL_CA must contain a PEM CA certificate or bundle");
+  }
+
+  try {
+    for (const certificatePem of certificateBlocks) {
+      if (!new X509Certificate(certificatePem).ca) {
+        throw new Error("Certificate is not a CA");
+      }
+    }
+  } catch {
+    // Do not include certificate contents or OpenSSL parser details in errors.
+    throw new Error("NEXUS_DATABASE_SSL_CA must contain structurally valid PEM CA certificate(s)");
+  }
+
+  return {
+    ca,
+    servername,
+    rejectUnauthorized: true,
+  };
+}
+
+function removeConnectionStringSslOptions(connectionString: string): string {
+  // Keep raw Unix-socket paths untouched. The top-level TLS object still applies
+  // if an operator explicitly configures it for such a connection.
+  if (connectionString.startsWith("/")) return connectionString;
+
+  const url = new URL(connectionString);
+  for (const option of CONNECTION_STRING_SSL_OPTIONS) {
+    url.searchParams.delete(option);
+  }
+  return url.toString();
 }
 
 /**
@@ -111,4 +193,26 @@ export function requirePostgresTls(connectionString: string): string {
   }
 
   return sslModeNormalized ? url.toString() : connectionString;
+}
+
+/**
+ * Resolves the verified TLS options shared by the data and authentication pools.
+ * With no private-CA variables, this preserves the existing URL-based behavior.
+ * When the pair is configured, the URL host/port remain the TCP target while
+ * TLS validates against the explicitly supplied servername, not that target.
+ */
+export function resolvePostgresTlsConfiguration(
+  connectionString: string,
+): ResolvedPostgresTlsConfiguration {
+  const ssl = readPrivateCaOptions();
+  const tlsConnectionString = requirePostgresTls(connectionString);
+  if (!ssl) return { connectionString: tlsConnectionString };
+
+  // node-postgres parses connectionString after merging pool options, so any
+  // sslmode/ssl* query parameter would replace the explicit CA configuration.
+  // TLS remains mandatory through `ssl` with rejectUnauthorized=true.
+  return {
+    connectionString: removeConnectionStringSslOptions(tlsConnectionString),
+    ssl,
+  };
 }

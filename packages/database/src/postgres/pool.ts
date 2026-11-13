@@ -1,12 +1,14 @@
 import pg from "pg";
 import type { PostgresDatabaseOptions } from "./types.js";
-import { requirePostgresTls } from "./connection-string.js";
+import { resolvePostgresTlsConfiguration } from "./connection-string.js";
 
 const { Pool } = pg;
 
 export function createPool(options: PostgresDatabaseOptions): pg.Pool {
+  const tls = resolvePostgresTlsConfiguration(options.connectionString);
   const pool = new Pool({
-    connectionString: requirePostgresTls(options.connectionString),
+    connectionString: tls.connectionString,
+    ...(tls.ssl ? { ssl: tls.ssl } : {}),
     max: options.max ?? 10,
     idleTimeoutMillis: options.idleTimeoutMillis ?? 30_000,
     connectionTimeoutMillis: options.connectionTimeoutMillis ?? 15_000,

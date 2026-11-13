@@ -1,5 +1,5 @@
 import pg from "pg";
-import { requirePostgresTls } from "@nexus/database";
+import { resolvePostgresTlsConfiguration } from "@nexus/database";
 import type { AuthStore } from "./store.js";
 const { Pool } = pg;
 
@@ -15,8 +15,10 @@ export const AUTH_POOL_OPTIONS = {
 } as const;
 
 export function createPostgresAuthPool(connectionString: string): pg.Pool {
+  const tls = resolvePostgresTlsConfiguration(connectionString);
   return new Pool({
-    connectionString: requirePostgresTls(connectionString),
+    connectionString: tls.connectionString,
+    ...(tls.ssl ? { ssl: tls.ssl } : {}),
     ...AUTH_POOL_OPTIONS,
     application_name: "nexus-auth",
   });
