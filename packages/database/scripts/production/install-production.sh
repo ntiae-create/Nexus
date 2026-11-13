@@ -216,8 +216,37 @@ echo
 echo "=================================================================="
 echo "VERIFICACAO"
 echo "=================================================================="
-PGPASSWORD=$PW_migrator_pw PGUSER=nexus_migrator \
-  "$psql_bin" --no-psqlrc --file "$script_dir/30_verify.sql" 2>&1 | redact
+# A verificacao roda com ON_ERROR_STOP dentro do 30_verify.sql e FALHA de
+# verdade (RAISE EXCEPTION no primeiro invariante violado).
+#
+# O codigo de saida TEM de vir do psql, nao de um pipe: em
+#     psql ... 2>&1 | redact
+# o shell reporta o status do `redact`, que sempre sai 0 — foi assim que uma
+# versao anterior deste script imprimia "CONCLUIDO" sobre uma verificacao que
+# tinha falhado. Saida vai para arquivo; o status e checado no comando.
+verify_log=$(mktemp)
+if ! PGPASSWORD=$PW_migrator_pw PGUSER=nexus_migrator \
+     "$psql_bin" --no-psqlrc --set ON_ERROR_STOP=1 \
+     --file "$script_dir/30_verify.sql" >"$verify_log" 2>&1; then
+  redact < "$verify_log" >&2
+  rm -f "$verify_log"
+  unset PW_migrator_pw
+  echo >&2
+  echo "==================================================================" >&2
+  echo "VERIFICACAO FALHOU — NAO CONCLUIDO" >&2
+  echo "==================================================================" >&2
+  echo "Um invariante obrigatorio nao se confirmou (ver FALHA: acima)." >&2
+  echo "O banco NAO esta pronto: nao aponte NEXUS_DATABASE_URL para ele nem" >&2
+  echo "libere acesso pela API antes de resolver." >&2
+  echo "" >&2
+  echo "As fases 1-3 ja foram aplicadas; re-executa-las e idempotente. Se a" >&2
+  echo "falha for de privilegio (FALTA GRANT), re-execute so a fase 3:" >&2
+  echo "  psql -f $script_dir/20_grant_runtime.sql" >&2
+  echo "Consulte a secao 'Diagnostico' de docs/deploy/MIGRAR_RAILWAY.md." >&2
+  exit 1
+fi
+redact < "$verify_log"
+rm -f "$verify_log"
 unset PW_migrator_pw
 
 echo
