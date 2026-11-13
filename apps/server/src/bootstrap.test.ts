@@ -7,6 +7,7 @@ import {
   SERVERLESS_POOL_OPTIONS,
 } from "./bootstrap.js";
 import type { PostgresNexusDatabase } from "./database.js";
+import { AUTH_POOL_OPTIONS } from "./auth/postgres-store.js";
 
 function makeMockDb(
   overrides: Partial<PostgresNexusDatabase> = {},
@@ -274,7 +275,10 @@ describe("createServerlessApp", () => {
     // serverless platform the total is instances x max, so the per-instance
     // ceiling has to be small.
     expect(SERVERLESS_POOL_OPTIONS.max).toBeLessThan(10);
+    expect(SERVERLESS_POOL_OPTIONS.max + AUTH_POOL_OPTIONS.max).toBe(3);
     expect(SERVERLESS_POOL_OPTIONS.idleTimeoutMillis).toBeLessThan(30_000);
     expect(SERVERLESS_POOL_OPTIONS.connectionTimeoutMillis).toBeGreaterThan(0);
+    expect(AUTH_POOL_OPTIONS.idleTimeoutMillis).toBeLessThan(30_000);
+    expect(AUTH_POOL_OPTIONS.connectionTimeoutMillis).toBeGreaterThan(0);
   });
 });

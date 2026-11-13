@@ -1,12 +1,17 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { extractBearerToken, issueSessionToken, loadSessionConfig, verifyOwnerPassword, verifySessionToken, OWNER_ID, type SessionConfig, type SessionPayload } from "./session.js";
 import type { AuthStore } from "./store.js";
-import { postgresAuthStore } from "./postgres-store.js";
+import { closePostgresAuthPool, postgresAuthStore } from "./postgres-store.js";
 declare module "fastify" { interface FastifyRequest { session?: SessionPayload; } interface FastifyInstance { sessionConfig?: SessionConfig; authStore?: AuthStore; } }
 export interface AuthPluginOptions { config?: SessionConfig; store?: AuthStore; disabled?: boolean; }
 function tryLoadConfig():SessionConfig|undefined{try{return loadSessionConfig();}catch{return undefined;}}
 export async function authPlugin(app:FastifyInstance, options:AuthPluginOptions={}):Promise<void>{
  const config=options.disabled?undefined:(options.config??tryLoadConfig());const store=options.store??postgresAuthStore;
+ if (store === postgresAuthStore) {
+  app.addHook("onClose", async () => {
+   await closePostgresAuthPool();
+  });
+ }
  if(config)app.decorate("sessionConfig",config);app.decorate("authStore",store);
  app.post("/v1/auth/login",async(request,reply)=>{if(!config)return reply.code(503).send({error:{code:"AUTH_NOT_CONFIGURED",message:"Authentication is not configured",retryable:false},timestamp:new Date().toISOString()});
  const body=request.body as {password?:unknown}|null;const password=typeof body?.password==="string"?body.password:"";

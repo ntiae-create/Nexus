@@ -81,22 +81,19 @@ export interface BootstrappedServer {
 /**
  * Connection-pool sizing for a serverless runtime.
  *
- * A long-lived server keeps one pool of 10 for the whole process. A serverless
- * platform instead runs several instances concurrently, and every instance
- * would otherwise open up to 10 connections of its own — the total is
- * `instances x max`, which exhausts a managed PostgreSQL's connection limit
- * long before traffic is heavy. The pool is therefore small and each
- * connection is short-lived, while still allowing concurrency inside one
- * invocation (requests in flight plus a nested read are enough to need 2).
+ * A long-lived server uses a data pool of up to 10 connections plus a separate
+ * one-connection authentication pool. Serverless platforms run several
+ * instances concurrently; each is limited to 2 data connections plus 1 auth
+ * connection, for a combined ceiling of 3 per instance. Without
+ * accounting for both pools, the total grows as `instances x pools x max` and
+ * can exhaust a managed PostgreSQL before traffic is heavy. Two data connections
+ * still allow a request and a nested read to run concurrently.
  *
- * No `allowExitOnIdle` here: `pg` would then be free to drop the connection
- * while it sits idle between invocations, which is a `pg`-level process hook
- * and not something this deployment needs. Dynamic (fluid) compute keeps the
- * instance alive as long as it is routing traffic, so the pool above with a
- * 5s idle timeout is the whole story.
+ * The 5s idle timeout on both pools bounds how long they retain unused
+ * connections; Vercel controls instance suspension.
  */
 export const SERVERLESS_POOL_OPTIONS = {
-  max: 3,
+  max: 2,
   idleTimeoutMillis: 5_000,
   connectionTimeoutMillis: 10_000,
 } as const;

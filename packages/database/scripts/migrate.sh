@@ -1,7 +1,7 @@
 #!/bin/sh
 # Apply versioned PostgreSQL migrations as nexus_migrator.
 #
-# Connection credentials must be supplied through a mode-0600 libpq passfile
+# Connection credentials must be supplied through a private mode-0600/0400 libpq passfile
 # (PGPASSFILE), never in a URL, argv, PGPASSWORD, or a service definition.
 # `install-production.sh` creates and removes that file around this process.
 #
@@ -25,7 +25,7 @@ usage() {
 Usage: migrate.sh [--check-only|--adopt-legacy-ledger]
 
 Connection settings: PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE and a
-mode-0600 PGPASSFILE. Passwords/URLs in PGPASSWORD or
+private mode-0600/0400 PGPASSFILE. Passwords/URLs in PGPASSWORD or
 NEXUS_MIGRATION_DATABASE_URL are not accepted.
 
 --check-only             read-only connection/ledger preflight; exit 10 for a
@@ -55,12 +55,44 @@ if [ "${NEXUS_MIGRATION_DATABASE_URL+x}" = x ]; then
 fi
 unset PGPASSWORD PGSERVICE PGSERVICEFILE PGHOSTADDR PGOPTIONS
 
+is_valid_ipv4_octet() {
+  case "$1" in
+    0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_local_host() {
+  local_candidate=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$local_candidate" in
+    localhost|localhost.|*.localhost|*.localhost.|::1|/*) return 0 ;;
+    127.*) loopback_tail=${local_candidate#127.} ;;
+    *) return 1 ;;
+  esac
+
+  loopback_octet1=${loopback_tail%%.*}
+  case "$loopback_tail" in *.*) loopback_tail=${loopback_tail#*.} ;; *) return 1 ;; esac
+  loopback_octet2=${loopback_tail%%.*}
+  case "$loopback_tail" in *.*) loopback_tail=${loopback_tail#*.} ;; *) return 1 ;; esac
+  case "$loopback_tail" in *.*) return 1 ;; esac
+  loopback_octet3=$loopback_tail
+
+  is_valid_ipv4_octet "$loopback_octet1" \
+    && is_valid_ipv4_octet "$loopback_octet2" \
+    && is_valid_ipv4_octet "$loopback_octet3"
+}
+
 : "${PGHOST:?PGHOST is required}"
 : "${PGPORT:?PGPORT is required}"
 : "${PGDATABASE:?PGDATABASE is required}"
 : "${PGUSER:?PGUSER is required}"
 : "${PGPASSFILE:?PGPASSFILE must point to a protected libpq passfile}"
-[ -r "$PGPASSFILE" ] || { echo "PGPASSFILE is not readable." >&2; exit 2; }
+[ -f "$PGPASSFILE" ] && [ -r "$PGPASSFILE" ] || { echo "PGPASSFILE must be a readable regular file." >&2; exit 2; }
+passfile_mode=$(stat -c '%a' "$PGPASSFILE" 2>/dev/null || stat -f '%Lp' "$PGPASSFILE" 2>/dev/null || true)
+case "$passfile_mode" in
+  600|400) ;;
+  *) echo "PGPASSFILE must have private permissions (0600 or 0400)." >&2; exit 2 ;;
+esac
 case "$PGHOST" in
   *://*|*@*|*'?'*|*'#'*|*' '*|*'\t'*) echo "PGHOST must be a host name/address, not a URL or credential string." >&2; exit 2 ;;
 esac
@@ -78,10 +110,10 @@ ssl_mode=${PGSSLMODE:-require}
 case "$ssl_mode" in
   require|verify-ca|verify-full) ;;
   disable)
-    case "$PGHOST" in
-      localhost|127.*|::1|/tmp/*) ;;
-      *) echo "TLS is required for non-local migration targets (PGSSLMODE=disable is local-test-only)." >&2; exit 2 ;;
-    esac
+    if ! is_local_host "$PGHOST"; then
+      echo "TLS is required for non-local migration targets (PGSSLMODE=disable is local-test-only)." >&2
+      exit 2
+    fi
     ;;
   *) echo "PGSSLMODE must be require, verify-ca or verify-full (disable is limited to local tests)." >&2; exit 2 ;;
 esac

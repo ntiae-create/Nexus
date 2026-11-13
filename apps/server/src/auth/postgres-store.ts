@@ -1,11 +1,53 @@
 import pg from "pg";
+import { requirePostgresTls } from "@nexus/database";
 import type { AuthStore } from "./store.js";
 const { Pool } = pg;
+
+/**
+ * Authentication has its own pool because its SQL is intentionally separate
+ * from the repository-only database API. Keep it to one connection so the
+ * serverless runtime's combined data + auth ceiling remains bounded.
+ */
+export const AUTH_POOL_OPTIONS = {
+  max: 1,
+  idleTimeoutMillis: 5_000,
+  connectionTimeoutMillis: 10_000,
+} as const;
+
+export function createPostgresAuthPool(connectionString: string): pg.Pool {
+  return new Pool({
+    connectionString: requirePostgresTls(connectionString),
+    ...AUTH_POOL_OPTIONS,
+    application_name: "nexus-auth",
+  });
+}
+
 let singleton: pg.Pool | undefined;
+let closeInFlight: Promise<void> | undefined;
 function getPool(): pg.Pool {
   const url = process.env.NEXUS_DATABASE_URL?.trim();
   if (!url) throw new Error("NEXUS_DATABASE_URL is required for authentication state");
-  return singleton ??= new Pool({ connectionString: url, max: 3, application_name: "nexus-auth" });
+  return singleton ??= createPostgresAuthPool(url);
+}
+
+/** Drain the lazy singleton pool during graceful server shutdown. */
+export async function closePostgresAuthPool(): Promise<void> {
+  if (closeInFlight) return closeInFlight;
+  if (!singleton) return;
+
+  const pool = singleton;
+  singleton = undefined;
+  closeInFlight = (async () => {
+    try {
+      await pool.end();
+    } catch (error) {
+      singleton ??= pool;
+      throw error;
+    } finally {
+      closeInFlight = undefined;
+    }
+  })();
+  return closeInFlight;
 }
 
 /** Build independently pooled stores; PostgreSQL is the shared authority across processes. */
