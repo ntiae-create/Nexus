@@ -1,4 +1,7 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyLoggerOptions,
+} from "fastify";
 import { healthResponseSchema } from "@nexus/shared";
 import { authPlugin, type AuthPluginOptions } from "./auth/plugin.js";
 import {
@@ -22,6 +25,113 @@ export interface BuildAppOptions {
   core?: CoreRoutesOptions;
   assistants?: AssistantRoutesOptions;
   logger?: boolean;
+  /** Optional destination for capturing Fastify log records in tests. */
+  loggerStream?: FastifyLoggerOptions["stream"];
+}
+
+const SAFE_ERROR_TYPES = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "URIError",
+  "EvalError",
+  "AggregateError",
+  "AbortError",
+  "TimeoutError",
+  "DatabaseError",
+  "PostgresError",
+  "ConnectionError",
+  "TLSError",
+]);
+
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EADDRNOTAVAIL",
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+const TLS_ERROR_CODES = new Set([
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "ERR_SSL_CERTIFICATE_VERIFY_FAILED",
+  "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE",
+  "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "ERR_TLS_HANDSHAKE_TIMEOUT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+]);
+
+const POSTGRES_SQLSTATE_PATTERN = /^[0-9A-Z]{5}$/;
+
+function readErrorProperty(error: unknown, property: "name" | "code"): unknown {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+    return undefined;
+  }
+  try {
+    return Reflect.get(error, property);
+  } catch {
+    return undefined;
+  }
+}
+
+function readinessErrorCategory(code: string | undefined): string {
+  if (!code) return "unknown";
+  if (TLS_ERROR_CODES.has(code)) return "tls";
+  if (NETWORK_ERROR_CODES.has(code)) return "network";
+  if (POSTGRES_SQLSTATE_PATTERN.test(code)) {
+    if (code.startsWith("08")) return "database_connection";
+    if (code.startsWith("28")) return "database_authentication";
+    if (["57P01", "57P02", "57P03"].includes(code)) return "database_unavailable";
+    return "postgresql";
+  }
+  return "unknown";
+}
+
+function safeReadinessErrorFields(error: unknown): {
+  errorType: string;
+  errorCode?: string;
+  category: string;
+} {
+  let isError = false;
+  try {
+    isError = error instanceof Error;
+  } catch {
+    // A hostile thrown value must not prevent the readiness route from returning 503.
+  }
+
+  const rawName = readErrorProperty(error, "name");
+  const errorType = isError
+    ? typeof rawName === "string" && SAFE_ERROR_TYPES.has(rawName)
+      ? rawName
+      : "Error"
+    : "NonError";
+
+  const rawCode = readErrorProperty(error, "code");
+  const errorCode =
+    typeof rawCode === "string" &&
+    (NETWORK_ERROR_CODES.has(rawCode) ||
+      TLS_ERROR_CODES.has(rawCode) ||
+      POSTGRES_SQLSTATE_PATTERN.test(rawCode))
+      ? rawCode
+      : undefined;
+
+  return {
+    errorType,
+    ...(errorCode ? { errorCode } : {}),
+    category: readinessErrorCategory(errorCode),
+  };
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -29,6 +139,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({
     logger: enableLogger
       ? {
+          ...(options.loggerStream ? { stream: options.loggerStream } : {}),
           redact: {
             paths: [
               "req.headers.authorization",
@@ -53,15 +164,23 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     healthResponseSchema.parse({ status: "ok" }),
   );
 
-  app.get("/v1/ready", async (_request, reply) => {
+  app.get("/v1/ready", async (request, reply) => {
     if (!options.checkDatabase) {
       return reply.code(503).send({ status: "not_ready" });
     }
     try {
       await options.checkDatabase();
       return { status: "ready" };
-    } catch {
-      // Do not expose underlying driver errors or connection details to clients.
+    } catch (error) {
+      // Log only an allowlisted type/code summary; never serialize the error itself.
+      try {
+        request.log.error(
+          safeReadinessErrorFields(error),
+          "Database readiness check failed",
+        );
+      } catch {
+        // A failing log sink must not change the established 503 response.
+      }
       return reply.code(503).send({ status: "not_ready" });
     }
   });
