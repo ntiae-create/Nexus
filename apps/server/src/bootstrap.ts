@@ -36,6 +36,8 @@ export class BootstrapError extends Error {
 
 export interface BootstrapEnv extends ProviderRuntimeEnv {
   NEXUS_DATABASE_URL?: string;
+  NEXUS_DATABASE_SSL_CA?: string;
+  NEXUS_DATABASE_SSL_SERVERNAME?: string;
   PORT?: string;
 }
 
@@ -135,6 +137,11 @@ export function createServerlessApp(
     checkDatabase: async () => {
       await getOrCreateDb().checkConnectivity();
     },
+    readinessConnectionEnvironment: () => ({
+      NEXUS_DATABASE_URL: env.NEXUS_DATABASE_URL,
+      NEXUS_DATABASE_SSL_CA: env.NEXUS_DATABASE_SSL_CA,
+      NEXUS_DATABASE_SSL_SERVERNAME: env.NEXUS_DATABASE_SSL_SERVERNAME,
+    }),
     providers: {
       runtime: providerRuntime,
       env,

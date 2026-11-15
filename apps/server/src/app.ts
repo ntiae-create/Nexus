@@ -3,6 +3,11 @@ import Fastify, {
   type FastifyLoggerOptions,
 } from "fastify";
 import { healthResponseSchema } from "@nexus/shared";
+import {
+  getSafeReadinessDatabaseMetadata,
+  type ReadinessConnectionEnvironment,
+  type SafeReadinessDatabaseMetadata,
+} from "./readiness-diagnostics.js";
 import { authPlugin, type AuthPluginOptions } from "./auth/plugin.js";
 import {
   registerProviderRoutes,
@@ -20,6 +25,8 @@ export interface BuildAppOptions {
    * Must not leak connection strings, ledger data, or credentials to clients.
    */
   checkDatabase?: DatabaseReadinessProbe;
+  /** Raw connection settings are sampled and sanitized only after readiness fails. */
+  readinessConnectionEnvironment?: () => ReadinessConnectionEnvironment;
   auth?: AuthPluginOptions;
   providers?: ProviderRoutesOptions;
   core?: CoreRoutesOptions;
@@ -134,6 +141,19 @@ function safeReadinessErrorFields(error: unknown): {
   };
 }
 
+function safeReadinessDatabaseMetadata(
+  readEnvironment?: () => ReadinessConnectionEnvironment,
+): SafeReadinessDatabaseMetadata | undefined {
+  if (!readEnvironment) return undefined;
+
+  try {
+    return getSafeReadinessDatabaseMetadata(readEnvironment());
+  } catch {
+    // A diagnostic failure must never mask the readiness failure or leak details.
+    return { databaseUrlStatus: "unavailable" };
+  }
+}
+
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const enableLogger = options.logger ?? true;
   const app = Fastify({
@@ -175,7 +195,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // Log only an allowlisted type/code summary; never serialize the error itself.
       try {
         request.log.error(
-          safeReadinessErrorFields(error),
+          {
+            ...safeReadinessErrorFields(error),
+            ...(safeReadinessDatabaseMetadata(
+              options.readinessConnectionEnvironment,
+            ) ?? {}),
+          },
           "Database readiness check failed",
         );
       } catch {

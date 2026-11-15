@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import Fastify from "fastify";
+import { buildApp } from "./app.js";
 import {
   bootstrapServer,
   BootstrapError,
@@ -244,6 +245,68 @@ describe("createServerlessApp", () => {
       const health = await app.inject({ method: "GET", url: "/v1/health" });
       expect(health.statusCode).toBe(200);
       expect(createDatabase).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("logs sanitized connection metadata on a failed serverless readiness probe", async () => {
+    const records: string[] = [];
+    const connectionString =
+      "postgresql://nexus_app:serverless-password-secret@db.serverless.example:6432/nexus?token=serverless-query-secret";
+    const caContent = "serverless-private-ca-secret";
+    const checkConnectivity = vi.fn(async () => {
+      throw new Error(`${connectionString} ${caContent} serverless-query-secret`);
+    });
+    const db = makeMockDb({ checkConnectivity });
+    const app = createServerlessApp(
+      {
+        NEXUS_DATABASE_URL: connectionString,
+        NEXUS_DATABASE_SSL_CA: caContent,
+        NEXUS_DATABASE_SSL_SERVERNAME: "postgres.serverless.example",
+      },
+      {
+        createDatabase: () => db,
+        buildApp: (options) =>
+          buildApp({
+            ...(options ?? {}),
+            loggerStream: {
+              write: (record) => {
+                records.push(record);
+              },
+            },
+          }),
+      },
+    );
+
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/ready" });
+      const failureLog = records
+        .map((record) => JSON.parse(record) as Record<string, unknown>)
+        .find((record) => record.msg === "Database readiness check failed");
+      const loggedOutput = records.join("");
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({ status: "not_ready" });
+      expect(failureLog).toMatchObject({
+        databaseUrlStatus: "parsed",
+        databaseHost: "db.serverless.example",
+        databasePort: 6432,
+        databaseName: "nexus",
+        databaseUser: "nexus_app",
+        databaseSni: "postgres.serverless.example",
+        databaseSslCaPresent: true,
+        databaseSslServernamePresent: true,
+      });
+      expect(failureLog).not.toHaveProperty("err");
+      for (const forbidden of [
+        connectionString,
+        "serverless-password-secret",
+        "serverless-query-secret",
+        caContent,
+      ]) {
+        expect(loggedOutput).not.toContain(forbidden);
+      }
     } finally {
       await app.close();
     }
