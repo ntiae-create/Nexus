@@ -39,6 +39,46 @@ describe("safe readiness database metadata", () => {
     }
   });
 
+  it("uses effective node-postgres host and port query values without logging other query data", () => {
+    const connectionString =
+      "postgresql://nexus_app:connection-password-secret@url-target.example:5433/nexus_core?host=ignored-query-host.example&port=6432&host=effective-query-host.example&port=6543&sslmode=verify-full&sslpassword=query-password-secret&application_name=query-app-secret&token=query-token-secret";
+    const metadata = getSafeReadinessDatabaseMetadata({
+      NEXUS_DATABASE_URL: connectionString,
+    });
+    const serialized = JSON.stringify(metadata);
+
+    expect(metadata).toEqual({
+      databaseUrlStatus: "parsed",
+      databaseHost: "effective-query-host.example",
+      databasePort: 6543,
+      databaseName: "nexus_core",
+      databaseUser: "nexus_app",
+      databaseSni: "unset",
+      databaseSslCaPresent: false,
+      databaseSslServernamePresent: false,
+    });
+    for (const forbidden of [
+      connectionString,
+      "postgresql://",
+      "connection-password-secret",
+      "url-target.example",
+      "ignored-query-host.example",
+      "6432",
+      "host=",
+      "port=",
+      "sslmode",
+      "verify-full",
+      "sslpassword",
+      "query-password-secret",
+      "application_name",
+      "query-app-secret",
+      "token=",
+      "query-token-secret",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
   it("returns only a sanitized missing state when the URL is absent or blank", () => {
     for (const connectionString of [undefined, "  "]) {
       const metadata = getSafeReadinessDatabaseMetadata({

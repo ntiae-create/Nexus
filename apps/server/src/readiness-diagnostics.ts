@@ -83,6 +83,16 @@ function safeDatabaseIdentifier(encodedValue: string): string | undefined {
 }
 
 /**
+ * pg-connection-string overwrites query parameters as it reads them, so the
+ * last occurrence is the effective value. Keep this scoped to the two
+ * connection fields needed by the diagnostic; never serialize the query.
+ */
+function lastQueryValue(connectionUrl: URL, key: string): string | undefined {
+  const values = connectionUrl.searchParams.getAll(key);
+  return values.length > 0 ? values[values.length - 1] : undefined;
+}
+
+/**
  * Builds the temporary, allowlisted metadata attached only to a failed
  * readiness log. Raw URLs, credentials, query strings, CA contents, and
  * unvalidated SNI strings are never returned.
@@ -109,9 +119,16 @@ export function getSafeReadinessDatabaseMetadata(
       return { databaseUrlStatus: "invalid" };
     }
 
-    const databaseHost = safeHostname(connectionUrl.hostname);
-    const databasePort = connectionUrl.port.length > 0
-      ? Number(connectionUrl.port)
+    // Match node-postgres URL parsing: non-empty `host` and `port` query
+    // parameters override the authority, and duplicate parameters use the last
+    // value. Only the validated host and numeric port are retained below.
+    const effectiveHost =
+      lastQueryValue(connectionUrl, "host") || connectionUrl.hostname;
+    const effectivePort =
+      lastQueryValue(connectionUrl, "port") || connectionUrl.port;
+    const databaseHost = safeHostname(effectiveHost);
+    const databasePort = effectivePort.length > 0
+      ? Number.parseInt(effectivePort, 10)
       : 5432;
     const databasePath = connectionUrl.pathname.startsWith("/")
       ? connectionUrl.pathname.slice(1)
