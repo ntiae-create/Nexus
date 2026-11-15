@@ -35,6 +35,12 @@ A senha nunca é persistida em nenhum backend, e o token nunca é renderizado, r
 
 A precedência é: preferência `nexus.apiBaseUrl` (definida em "Configurar endereço da API", dentro do aplicativo) → chave legada `nexus.apiBaseUrl` do `localStorage` (gravada por versões anteriores) → `VITE_NEXUS_API_URL` → padrão de desenvolvimento apenas no navegador. No Android, o valor legado é migrado para `Preferences` na inicialização, sem nunca sobrescrever uma preferência mais nova; no navegador, ele é lido diretamente, e só contém endereço — nunca credencial. Em Android não há padrão: sem endereço configurado, o aplicativo pede o endereço em vez de assumir `localhost`, que no dispositivo aponta para o próprio aparelho. A URL precisa ser absoluta `http`/`https` e não pode conter credenciais.
 
+## CORS no APK
+
+`capacitor.config.ts` não define `server.url`, `hostname` ou `androidScheme`. Com os padrões do Capacitor Android, a origem do WebView é `https://localhost`. Como o cliente móvel usa `fetch` para a URL absoluta da API, as chamadas são cross-origin; um `GET /v1/ready` aberto diretamente no navegador não testa o preflight do APK.
+
+O Fastify permite somente a origem exata `https://localhost`, os métodos `GET` e `POST`, e os cabeçalhos `Authorization` e `Content-Type` necessários ao cliente. `Accept` é um cabeçalho CORS-safelisted e não precisa ser liberado no preflight. O backend não habilita credenciais/cookies nem reflete origens arbitrárias.
+
 ## Testes
 
 `apps/mobile/src/**/*.test.ts{,x}` cobre o contrato do cliente HTTP, do serviço, do armazenamento, do gerenciador de sessão, das invariantes de segurança e das telas. Nenhum teste faz chamadas reais: `fetchImpl` é sempre injetado, exceto nos testes de integração que exigem `NEXUS_DATABASE_URL` e continuam restritos ao backend.
