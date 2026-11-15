@@ -1,3 +1,4 @@
+import cors from "@fastify/cors";
 import Fastify, {
   type FastifyInstance,
   type FastifyLoggerOptions,
@@ -17,6 +18,11 @@ import { registerCoreRoutes, type CoreRoutesOptions } from "./routes/core.js";
 import { registerAssistantRoutes, type AssistantRoutesOptions } from "./routes/assistants.js";
 
 export type DatabaseReadinessProbe = () => Promise<void>;
+
+// Capacitor Android's default hostname/scheme produce the exact origin https://localhost.
+const ANDROID_CORS_ORIGIN = "https://localhost";
+const CORS_ALLOWED_METHODS = ["GET", "POST"];
+const CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type"];
 
 export interface BuildAppOptions {
   /**
@@ -173,6 +179,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           },
         }
       : false,
+  });
+  void app.register(cors, {
+    origin: (origin, callback) =>
+      callback(null, origin === ANDROID_CORS_ORIGIN ? origin : false),
+    methods: CORS_ALLOWED_METHODS,
+    allowedHeaders: CORS_ALLOWED_HEADERS,
+    credentials: false,
   });
   void app.register(authPlugin, options.auth ?? {});
   void registerProviderRoutes(app, options.providers ?? {});

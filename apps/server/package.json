@@ -9,6 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@fastify/cors": "^11.4.3",
     "@nexus/assistant-profiles": "0.1.0",
     "@nexus/database": "0.1.0",
     "@nexus/shared": "0.1.0",
