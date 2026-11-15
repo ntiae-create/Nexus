@@ -1,7 +1,12 @@
+import type { PeerCertificate } from "node:tls";
 import pg from "pg";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SYNTHETIC_TEST_CA_PEM } from "../../tests/fixtures/private-ca.js";
-import { requirePostgresTls } from "./connection-string.js";
+import {
+  requirePostgresTls,
+  resolvePostgresTlsConfiguration,
+  type PostgresPrivateCaOptions,
+} from "./connection-string.js";
 import { closePool, createPool } from "./pool.js";
 
 const remoteUrl = "postgresql://nexus_app:do-not-print@db.example.com:5432/nexus";
@@ -10,6 +15,13 @@ const railwayUrl =
 const syntheticCa = SYNTHETIC_TEST_CA_PEM;
 const privateCaEnvName = "NEXUS_DATABASE_SSL_CA";
 const servernameEnvName = "NEXUS_DATABASE_SSL_SERVERNAME";
+
+function peerCertificateForDnsName(hostname: string): PeerCertificate {
+  return {
+    subject: { CN: hostname },
+    subjectaltname: `DNS:${hostname}`,
+  } as PeerCertificate;
+}
 
 describe("requirePostgresTls", () => {
   let originalPrivateCa: string | undefined;
@@ -57,7 +69,7 @@ describe("requirePostgresTls", () => {
       const options = (pool as unknown as {
         options: {
           connectionString: string;
-          ssl?: { ca?: string; servername?: string; rejectUnauthorized?: boolean };
+          ssl?: PostgresPrivateCaOptions;
         };
       }).options;
       const target = new URL(options.connectionString);
@@ -66,10 +78,11 @@ describe("requirePostgresTls", () => {
       expect(target.port).toBe("20087");
       expect(target.searchParams.get("application_name")).toBe("nexus-test");
       expect(target.searchParams.has("sslmode")).toBe(false);
-      expect(options.ssl).toEqual({
+      expect(options.ssl).toMatchObject({
         ca: syntheticCa,
         servername: "postgres.railway.internal",
         rejectUnauthorized: true,
+        checkServerIdentity: expect.any(Function),
       });
 
       // Check the options node-postgres will actually use. Its URL parser would
@@ -78,14 +91,48 @@ describe("requirePostgresTls", () => {
         connectionString: options.connectionString,
         ssl: options.ssl,
       });
-      expect(client.connectionParameters.ssl).toMatchObject({
+      const clientSsl = (client as unknown as {
+        connectionParameters: { ssl: PostgresPrivateCaOptions };
+      }).connectionParameters.ssl;
+      expect(clientSsl).toMatchObject({
         ca: syntheticCa,
         servername: "postgres.railway.internal",
         rejectUnauthorized: true,
+        checkServerIdentity: expect.any(Function),
       });
     } finally {
       await closePool(pool);
     }
+  });
+
+  it("accepts an internal-host certificate even when node-postgres supplies the proxy hostname", () => {
+    process.env[privateCaEnvName] = syntheticCa;
+    process.env[servernameEnvName] = "postgres.railway.internal";
+
+    const checkServerIdentity = resolvePostgresTlsConfiguration(railwayUrl).ssl
+      ?.checkServerIdentity;
+    expect(checkServerIdentity).toBeTypeOf("function");
+    expect(
+      checkServerIdentity?.(
+        "crossover.proxy.rlwy.net",
+        peerCertificateForDnsName("postgres.railway.internal"),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("rejects a certificate with the wrong internal hostname", () => {
+    process.env[privateCaEnvName] = syntheticCa;
+    process.env[servernameEnvName] = "postgres.railway.internal";
+
+    const checkServerIdentity = resolvePostgresTlsConfiguration(railwayUrl).ssl
+      ?.checkServerIdentity;
+    expect(checkServerIdentity).toBeTypeOf("function");
+    const error = checkServerIdentity?.(
+      "crossover.proxy.rlwy.net",
+      peerCertificateForDnsName("wrong.example.com"),
+    );
+
+    expect(error).toMatchObject({ code: "ERR_TLS_CERT_ALTNAME_INVALID" });
   });
 
   it.each([
@@ -125,7 +172,9 @@ describe("requirePostgresTls", () => {
       expect(options.ssl).toBeUndefined();
 
       const client = new pg.Client({ connectionString: options.connectionString });
-      const ssl = client.connectionParameters.ssl;
+      const ssl = (client as unknown as {
+        connectionParameters: { ssl: false | { rejectUnauthorized?: boolean } };
+      }).connectionParameters.ssl;
       expect(ssl).not.toBe(false);
       if (typeof ssl === "object") expect(ssl.rejectUnauthorized).not.toBe(false);
     } finally {

@@ -1,4 +1,5 @@
 import pg from "pg";
+import type { PostgresPrivateCaOptions } from "@nexus/database";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SYNTHETIC_TEST_CA_PEM } from "./test-fixtures/private-ca.js";
 import { buildApp } from "../app.js";
@@ -66,17 +67,18 @@ describe("PostgreSQL auth pool", () => {
       const options = (pool as unknown as {
         options: {
           connectionString: string;
-          ssl?: { ca?: string; servername?: string; rejectUnauthorized?: boolean };
+          ssl?: PostgresPrivateCaOptions;
         };
       }).options;
       const target = new URL(options.connectionString);
 
       expect(target.hostname).toBe("crossover.proxy.rlwy.net");
       expect(target.port).toBe("20087");
-      expect(options.ssl).toEqual({
+      expect(options.ssl).toMatchObject({
         ca: syntheticCa,
         servername: "postgres.railway.internal",
         rejectUnauthorized: true,
+        checkServerIdentity: expect.any(Function),
       });
       const client = new pg.Client({
         connectionString: options.connectionString,
@@ -86,6 +88,7 @@ describe("PostgreSQL auth pool", () => {
         ca: syntheticCa,
         servername: "postgres.railway.internal",
         rejectUnauthorized: true,
+        checkServerIdentity: expect.any(Function),
       });
     } finally {
       if (previousCa === undefined) delete process.env.NEXUS_DATABASE_SSL_CA;

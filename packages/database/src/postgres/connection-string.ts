@@ -1,6 +1,9 @@
 import { X509Certificate } from "node:crypto";
 import { isIP } from "node:net";
-import type { ConnectionOptions } from "node:tls";
+import {
+  checkServerIdentity as verifyTlsHostname,
+  type ConnectionOptions,
+} from "node:tls";
 
 const SUPPORTED_SSL_MODES = new Set([
   "disable",
@@ -96,6 +99,10 @@ function readPrivateCaOptions(): PostgresPrivateCaOptions | undefined {
     ca,
     servername,
     rejectUnauthorized: true,
+    // pg replaces TLS servername with the TCP host; validate against the
+    // configured certificate hostname instead, while retaining CA validation.
+    checkServerIdentity: (_hostname, cert) =>
+      verifyTlsHostname(servername, cert),
   };
 }
 
